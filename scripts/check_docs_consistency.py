@@ -76,6 +76,8 @@ CHECK_ONLY_CODES = {
     "CREDENTIAL_VALIDITY_UNVERIFIED",
     "NO_EXECUTION_CORRELATION",
     "UNATTENDED_EXECUTION",
+    "API_VERSION_UNVERIFIED",
+    "TRIGGER_INCOMPATIBLE",
 }
 
 # The phase-0 spelling superseded by ADR-011. Permitted only where the supersession is

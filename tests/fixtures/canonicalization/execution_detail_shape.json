@@ -1,0 +1,434 @@
+{
+  "binaryDataSizeBytes": 0,
+  "createdAt": "2026-08-26T19:25:16.744Z",
+  "customData": {},
+  "data": {
+    "executionData": {
+      "contextData": {},
+      "metadata": {},
+      "nodeExecutionStack": [],
+      "runtimeData": {
+        "establishedAt": 1787772316744,
+        "redaction": {
+          "manual": false,
+          "production": false,
+          "version": 2
+        },
+        "source": "webhook",
+        "triggerNode": {
+          "name": "Webhook",
+          "type": "n8n-nodes-base.webhook"
+        },
+        "version": 1
+      },
+      "waitingExecution": {},
+      "waitingExecutionSource": {}
+    },
+    "resultData": {
+      "lastNodeExecuted": "Respond Success",
+      "runData": {
+        "Process": [
+          {
+            "data": {
+              "main": [
+                [
+                  {
+                    "json": {
+                      "REDACTED": true,
+                      "note": "raw payload stripped for the fixture; shape only, see docs/N8N_COMPATIBILITY.md"
+                    },
+                    "pairedItem": {
+                      "item": 0
+                    }
+                  }
+                ]
+              ]
+            },
+            "executionIndex": 3,
+            "executionStatus": "success",
+            "executionTime": 5,
+            "hints": [],
+            "source": [
+              {
+                "previousNode": "Route",
+                "previousNodeOutput": 0,
+                "previousNodeRun": 0
+              }
+            ],
+            "startTime": 1787772316755
+          }
+        ],
+        "Respond Success": [
+          {
+            "data": {
+              "main": [
+                [
+                  {
+                    "json": {
+                      "REDACTED": true,
+                      "note": "raw payload stripped for the fixture; shape only, see docs/N8N_COMPATIBILITY.md"
+                    },
+                    "pairedItem": {
+                      "item": 0
+                    }
+                  }
+                ]
+              ]
+            },
+            "executionIndex": 4,
+            "executionStatus": "success",
+            "executionTime": 1,
+            "hints": [],
+            "source": [
+              {
+                "previousNode": "Process",
+                "previousNodeOutput": 0,
+                "previousNodeRun": 0
+              }
+            ],
+            "startTime": 1787772316760
+          }
+        ],
+        "Route": [
+          {
+            "data": {
+              "main": [
+                [
+                  {
+                    "json": {
+                      "REDACTED": true,
+                      "note": "raw payload stripped for the fixture; shape only, see docs/N8N_COMPATIBILITY.md"
+                    },
+                    "pairedItem": {
+                      "item": 0
+                    }
+                  }
+                ],
+                []
+              ]
+            },
+            "executionIndex": 2,
+            "executionStatus": "success",
+            "executionTime": 0,
+            "hints": [],
+            "source": [
+              {
+                "previousNode": "Validate Input",
+                "previousNodeOutput": 0,
+                "previousNodeRun": 0
+              }
+            ],
+            "startTime": 1787772316755
+          }
+        ],
+        "Validate Input": [
+          {
+            "data": {
+              "main": [
+                [
+                  {
+                    "json": {
+                      "REDACTED": true,
+                      "note": "raw payload stripped for the fixture; shape only, see docs/N8N_COMPATIBILITY.md"
+                    },
+                    "pairedItem": {
+                      "item": 0
+                    }
+                  }
+                ]
+              ]
+            },
+            "executionIndex": 1,
+            "executionStatus": "success",
+            "executionTime": 4,
+            "hints": [],
+            "source": [
+              {
+                "previousNode": "Webhook",
+                "previousNodeOutput": 0,
+                "previousNodeRun": 0
+              }
+            ],
+            "startTime": 1787772316751
+          }
+        ],
+        "Webhook": [
+          {
+            "data": {
+              "main": [
+                [
+                  {
+                    "json": {
+                      "REDACTED": true,
+                      "note": "raw payload stripped for the fixture; shape only, see docs/N8N_COMPATIBILITY.md"
+                    },
+                    "pairedItem": {
+                      "item": 0
+                    }
+                  }
+                ]
+              ]
+            },
+            "executionIndex": 0,
+            "executionStatus": "success",
+            "executionTime": 0,
+            "hints": [],
+            "source": [],
+            "startTime": 1787772316751
+          }
+        ]
+      }
+    },
+    "resumeToken": "0a92c98860508fceaff2cd239802b4e630cde51525ec5d90667831e03fa47597",
+    "startData": {},
+    "version": 1
+  },
+  "deduplicationKey": null,
+  "deletedAt": null,
+  "finished": true,
+  "id": "wf_sanitized_id",
+  "jsonSizeBytes": 5558,
+  "mode": "webhook",
+  "retryOf": null,
+  "retrySuccessId": null,
+  "startedAt": "2026-08-26T19:25:16.747Z",
+  "status": "success",
+  "stoppedAt": "2026-08-26T19:25:16.761Z",
+  "storedAt": "db",
+  "tracingContext": null,
+  "usedPrivateCredentials": false,
+  "waitTill": null,
+  "workflowData": {
+    "connections": {
+      "Process": {
+        "main": [
+          [
+            {
+              "index": 0,
+              "node": "Respond Success",
+              "type": "main"
+            }
+          ]
+        ]
+      },
+      "Route": {
+        "main": [
+          [
+            {
+              "index": 0,
+              "node": "Process",
+              "type": "main"
+            }
+          ],
+          [
+            {
+              "index": 0,
+              "node": "Respond Error",
+              "type": "main"
+            }
+          ]
+        ]
+      },
+      "Validate Input": {
+        "main": [
+          [
+            {
+              "index": 0,
+              "node": "Route",
+              "type": "main"
+            }
+          ]
+        ]
+      },
+      "Webhook": {
+        "main": [
+          [
+            {
+              "index": 0,
+              "node": "Validate Input",
+              "type": "main"
+            }
+          ]
+        ]
+      }
+    },
+    "id": "fHRQhrjTTclMebrD",
+    "name": "n8n-operator-spike-synthetic-RENAMED",
+    "nodeGroups": [],
+    "nodes": [
+      {
+        "id": "webhook-node-1",
+        "name": "Webhook",
+        "parameters": {
+          "authentication": "none",
+          "httpMethod": "POST",
+          "multipleMethods": false,
+          "options": {},
+          "path": "spike-test-NEWPATH",
+          "responseMode": "responseNode",
+          "webhookNotice": ""
+        },
+        "position": [
+          300,
+          500
+        ],
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "webhookId": "spike-webhook-id-1"
+      },
+      {
+        "id": "validate-node-1",
+        "name": "Validate Input",
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "assign-1",
+                "name": "valid",
+                "type": "boolean",
+                "value": "={{ typeof $json.body.value === 'number' }}"
+              },
+              {
+                "id": "assign-2",
+                "name": "value",
+                "type": "number",
+                "value": "={{ $json.body.value }}"
+              }
+            ]
+          },
+          "duplicateItem": false,
+          "includeOtherFields": false,
+          "mode": "manual",
+          "options": {}
+        },
+        "position": [
+          20,
+          0
+        ],
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4
+      },
+      {
+        "id": "route-node-1",
+        "name": "Route",
+        "parameters": {
+          "conditions": {
+            "combinator": "and",
+            "conditions": [
+              {
+                "id": "cond-1",
+                "leftValue": "={{ $json.valid }}",
+                "operator": {
+                  "operation": "true",
+                  "singleValue": true,
+                  "type": "boolean"
+                },
+                "rightValue": true
+              }
+            ],
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 1
+            }
+          },
+          "looseTypeValidation": false,
+          "options": {}
+        },
+        "position": [
+          240,
+          0
+        ],
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2
+      },
+      {
+        "id": "process-node-1",
+        "name": "Process",
+        "parameters": {
+          "jsCode": "return [{ json: { result: $input.first().json.value * 3 } }];",
+          "language": "javaScript",
+          "mode": "runOnceForAllItems",
+          "notice": ""
+        },
+        "position": [
+          460,
+          -80
+        ],
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2
+      },
+      {
+        "id": "respond-success-1",
+        "name": "Respond Success",
+        "parameters": {
+          "enableResponseOutput": false,
+          "generalNotice": "",
+          "options": {},
+          "respondWith": "json",
+          "responseBody": "={{ { \"n8n_operator\": { \"execution_id\": $execution.id }, \"data\": { \"result\": $json.result } } }}",
+          "webhookNotice": ""
+        },
+        "position": [
+          680,
+          -80
+        ],
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.4
+      },
+      {
+        "id": "respond-error-1",
+        "name": "Respond Error",
+        "parameters": {
+          "enableResponseOutput": false,
+          "generalNotice": "",
+          "options": {},
+          "respondWith": "json",
+          "responseBody": "={{ { \"n8n_operator\": { \"execution_id\": $execution.id }, \"error\": \"invalid input\" } }}",
+          "webhookNotice": ""
+        },
+        "position": [
+          460,
+          80
+        ],
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.4
+      },
+      {
+        "credentials": {
+          "httpBasicAuth": {
+            "id": "sanitized-credential-id",
+            "name": "sanitized-credential-name"
+          }
+        },
+        "id": "http-node-1",
+        "name": "HTTP Call",
+        "parameters": {
+          "authentication": "predefinedCredentialType",
+          "curlImport": "",
+          "infoMessage": "",
+          "method": "GET",
+          "nodeCredentialType": "httpBasicAuth",
+          "options": {},
+          "provideSslCertificates": false,
+          "sendBody": false,
+          "sendHeaders": false,
+          "sendQuery": false,
+          "url": "https://example.invalid/spike"
+        },
+        "position": [
+          20,
+          300
+        ],
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2
+      }
+    ],
+    "settings": {
+      "executionOrder": "v1"
+    }
+  },
+  "workflowId": "fHRQhrjTTclMebrD",
+  "workflowVersionId": "c1fdd285-6468-413c-b191-ba764d740a76"
+}

@@ -204,6 +204,7 @@ n8n-operator/
 │   ├── THREAT_MODEL.md             # assets, trust boundaries, threats, mitigations
 │   ├── WORKFLOW_REGISTRY.md        # registry authoring reference
 │   ├── MCP_TOOLS.md                # tool contracts — normative for tool I/O
+│   ├── N8N_COMPATIBILITY.md        # phase 4 empirical findings (ADR-008, ADR-009)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -245,6 +246,7 @@ n8n-operator/
 │       ├── n8n/                    # the only module that talks to n8n
 │       │   ├── __init__.py
 │       │   ├── client.py           # httpx client, timeouts, no retries (ADR-005)
+│       │   ├── canonicalization.py # versioned, evidence-driven hashing (ADR-008)
 │       │   ├── preflight.py        # liveness, active, drift, credential checks
 │       │   └── types.py            # n8n API response models
 │       ├── storage/                # section 8 — persistence
@@ -1137,7 +1139,7 @@ it touches are updated in the same change.
       invalid-registry failure paths — 456 tests, ≥93% coverage on every module in
       `core/` and `registry/` this phase touches (95% combined), against a 90% gate
 
-### Phase 3 — Core domain *(this phase)*
+### Phase 3 — Core domain
 
 - [x] `core/models.py`: domain types — `Principal`, `Environment`, `Operation`,
       `OperationEvent`, `Approval`, `ExecutionResult`, `AuditEvent`, `PreflightCheck`,
@@ -1219,20 +1221,81 @@ it touches are updated in the same change.
       `core` imports none of `mcp`/`cli`/`approval`/`fastapi`/`typer`). 619 tests total,
       97% coverage on `core/` and `registry/` against the 90% gate.
 
-### Phase 4 — n8n integration
+### Phase 4 — n8n integration *(this phase)*
 
-- [ ] `n8n/client.py`: httpx client, explicit timeouts, **no retry logic** (ADR-005)
-- [ ] `n8n/types.py`: response models
-- [ ] `n8n/preflight.py`: reachability, active, definition hash, credential *bindings*,
-      correlation warning; `warn` and `unverifiable` statuses (ADR-009)
-- [ ] Definition canonicalization per CAN-01 - CAN-07, shipping with an **empty** exclusion
-      allowlist (ADR-008)
-- [ ] Empirical compatibility harness (`live_n8n`), version matrix, and the exclusion
-      allowlist table with per-entry evidence
-- [ ] Sanitized fixtures saved to `tests/fixtures/canonicalization/`
-- [ ] Response-envelope parsing for `trigger.correlation: response_envelope`
-- [ ] Mock n8n transport fixture for integration tests
-- [ ] Tests: AC-05, AC-06, AC-07, AC-17, AC-26, AC-27, AC-28, AC-30
+- [x] **Empirical spike first, against a real running n8n** — Docker was unavailable on
+      the build machine (no `docker`/`podman`/`colima`/`lima`); with explicit user
+      approval, n8n 2.35.7 ran standalone via Node 22 (installed via `nvm` — the system
+      Node 25 fails to build n8n's native `isolated-vm` dependency), bound to
+      `127.0.0.1` only, isolated data directory, never pointed at production. Findings,
+      every request/response pair, and their consequences for the implementation are in
+      [N8N_COMPATIBILITY.md](N8N_COMPATIBILITY.md). Nothing found contradicts ADR-008 or
+      ADR-009 — both are empirically confirmed, plus new version-specific implementation
+      facts neither anticipated (n8n's publish/version model, `activeVersion`'s
+      nullability when inactive, the absence of a release-version API endpoint, the
+      unreliability of n8n's own credential-test endpoint).
+- [x] `n8n/client.py`: httpx client, explicit connect/read timeouts, **no retry logic**
+      (ADR-005) — a control-plane endpoint allowlist checked before every call, a
+      bounded response size, pagination-loop protection on `list_executions`, and the
+      server-owned API key (ADR-006) sent as a header, never logged and never present
+      in a raised exception's message or details.
+- [x] `n8n/types.py`: response models. `WorkflowDefinition` validates structurally only
+      (`extra="allow"`) — canonicalization operates on the raw parsed dict, never a
+      reconstructed model, so CAN-01 does not depend on a model's round-trip fidelity.
+      `ExecutionSummary` deliberately never carries full per-node `runData` — the client
+      never even requests it, so there is nothing for an adapter-side model to leak.
+- [x] `n8n/canonicalization.py`: added to the repository tree (BUILD_PLAN section 4) as
+      its own module, consistent with ADR-008's dedicated treatment of this concern.
+      CAN-01 through CAN-07 implemented over the raw API response; structural scope
+      (`nodes`/`connections`/`settings` only — everything else, including the entire
+      `activeVersion` object, is row metadata that was never a candidate for inclusion)
+      decided before CAN-01 is even applied, per the `activeVersion`-nullability finding
+      above. Two exclusion-allowlist entries (`nodes[].position`, `pinData`), each
+      evidence-scoped to n8n 2.35.7 — not shipped empty, since phase 4 is exactly where
+      the harness described below ran and produced that evidence.
+- [x] `n8n/preflight.py`: `instance_reachable`, `compatible_version` (new — no n8n
+      release-version endpoint exists, so this compares the public API's own spec
+      version against a configured set, `unverifiable`/`warn`, never `fail`),
+      `workflow_exists`, `workflow_active`, `trigger_compatibility` (new — registry
+      `trigger.path`/`method` vs. the live webhook node), `definition_unchanged`,
+      `credential_bindings` (presence only), `credential_validity` (always
+      `unverifiable` — tested against n8n's own credential-test endpoint and found
+      unreliable, not merely assumed unusable), `correlation`, and `unattended_execution`
+      (ADR-009 section 5). Every check downstream of a failed prerequisite is `skipped`,
+      never `pass`. Satisfies `core.service.PreflightPort` structurally (a local
+      `WorkflowLike` Protocol and local `PreflightCheck`/`PreflightResult` dataclasses,
+      not imports from `core/` or `registry/` — capability packages must not depend on
+      each other).
+- [x] Empirical compatibility harness: one seed workflow, nine isolated single-field
+      comparisons (position, name, pin data, active state, a node parameter, connection
+      topology, credential binding, webhook path, plus the node-name/connections-address-by-name
+      structural argument), each with the live production webhook called before and
+      after to observe actual behavior, not just the diff. One n8n version (2.35.7), one
+      corpus item per field — not yet a version matrix or a multi-input corpus; both are
+      named as explicit follow-up work in N8N_COMPATIBILITY.md section 13.
+- [x] Sanitized fixtures saved to `tests/fixtures/canonicalization/` (16 files: 8
+      before/after pairs, an unchanged-read pair, and a redacted execution-detail shape)
+      — instance URLs, the real API key, credential secrets, the test account's
+      email/user ID, and raw webhook payload data all stripped.
+- [x] Response-envelope parsing for `trigger.correlation: response_envelope`
+      (`n8n/types.py`'s `ResponseEnvelope`) — confirmed working against the live
+      instance with a real `$execution.id`; a malformed or absent envelope never fails
+      the dispatch itself (`n8n/client.py`'s `dispatch_webhook` treats it as "no
+      correlation available", not an error).
+- [x] Mock n8n transport fixture for integration tests: `tests/integration/mock_n8n.py`,
+      an `httpx.MockTransport`-backed simulator of `/healthz`, the workflow/execution
+      control-plane endpoints, and webhook dispatch (including injectable timeouts and
+      connection errors), with request bookkeeping for assertions like "dispatched
+      exactly once".
+- [x] Tests: AC-05, AC-06, AC-07 (preflight against the mock transport), AC-17
+      (grep-based no-retry contract), AC-26, AC-27, AC-28 (canonicalization against the
+      real fixtures and a Hypothesis fuzz), AC-29, AC-30, timeout/connection-error to
+      `"indeterminate"`, malformed provider responses, an execution status outside the
+      known enum, missing credential binding reported distinctly from unverifiable
+      validity, a definition change observed between two reads, and API key redaction
+      (never in a raised exception, sent only as the documented header, never in a URL).
+      86 new tests (705 total), 97% coverage on `core/` and `registry/` against the 90%
+      gate (`n8n/` itself, not gated, at 95%).
 
 ### Phase 5 — MCP adapter
 

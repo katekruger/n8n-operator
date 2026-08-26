@@ -204,18 +204,20 @@ same checks `prepare_operation` runs, so a model can look before it commits.
 {
   "ready": false,
   "checks": [
-    { "check": "instance_reachable",   "status": "pass" },
-    { "check": "workflow_exists",      "status": "pass" },
-    { "check": "workflow_active",      "status": "pass" },
-    { "check": "definition_unchanged", "status": "fail",
+    { "check": "instance_reachable",    "status": "pass" },
+    { "check": "compatible_version",    "status": "pass" },
+    { "check": "workflow_exists",       "status": "pass" },
+    { "check": "workflow_active",       "status": "pass" },
+    { "check": "trigger_compatibility", "status": "pass" },
+    { "check": "definition_unchanged",  "status": "fail",
       "code": "DEFINITION_DRIFT",
       "detail": { "registered": "sha256:1a2b…", "live": "sha256:9f8e…" } },
-    { "check": "credential_bindings",  "status": "skipped",
+    { "check": "credential_bindings",   "status": "skipped",
       "detail": "Not evaluated after a prior failure." },
-    { "check": "credential_validity",  "status": "unverifiable",
+    { "check": "credential_validity",   "status": "unverifiable",
       "code": "CREDENTIAL_VALIDITY_UNVERIFIED",
       "detail": "Operator verifies that credentials are bound, not that they work." },
-    { "check": "correlation",          "status": "warn",
+    { "check": "correlation",           "status": "warn",
       "code": "NO_EXECUTION_CORRELATION",
       "detail": "This workflow returns no execution ID. Reconciliation after an indeterminate dispatch will be manual." }
   ],
@@ -228,14 +230,30 @@ same checks `prepare_operation` runs, so a model can look before it commits.
 `unverifiable` (a condition Operator has no supported mechanism to test). **Only `fail`
 sets `ready: false` and only `fail` produces `BLOCKED`.**
 
-Check codes: `INSTANCE_UNREACHABLE`, `WORKFLOW_MISSING_ON_INSTANCE`, `WORKFLOW_INACTIVE`,
-`DEFINITION_DRIFT`, `MISSING_NODE_CREDENTIALS`, `CREDENTIAL_VALIDITY_UNVERIFIED`,
-`NO_EXECUTION_CORRELATION`, `UNATTENDED_EXECUTION`.
+Check codes: `INSTANCE_UNREACHABLE`, `API_VERSION_UNVERIFIED`, `WORKFLOW_MISSING_ON_INSTANCE`,
+`WORKFLOW_INACTIVE`, `TRIGGER_INCOMPATIBLE`, `DEFINITION_DRIFT`, `MISSING_NODE_CREDENTIALS`,
+`CREDENTIAL_VALIDITY_UNVERIFIED`, `NO_EXECUTION_CORRELATION`, `UNATTENDED_EXECUTION`.
+
+`compatible_version` compares the n8n public API's own spec version (there is no endpoint
+that returns the n8n release version itself — see
+[N8N_COMPATIBILITY.md](N8N_COMPATIBILITY.md) section 10) against a configured supported
+set. No configured set, or a version that could not be determined, is `unverifiable`; a
+determined version outside the configured set is `warn`, never `fail` — it is not a
+precise enough signal to block on.
+
+`trigger_compatibility` compares the registry's `trigger.path`/`trigger.method` against
+the live workflow's own trigger node configuration, independent of the definition-hash
+check — a mismatch here points a caller directly at "the trigger changed" rather than an
+opaque hash difference.
 
 `MISSING_NODE_CREDENTIALS` reports that a node has no credential **bound**. It is not a
 statement that a bound credential is valid — Operator never makes that claim without a
 supported n8n mechanism that tests it, and reports `CREDENTIAL_VALIDITY_UNVERIFIED` instead.
-A bound-but-expired credential passes preflight and fails at execution.
+A bound-but-expired credential passes preflight and fails at execution. n8n exposes a
+credential-test endpoint (`POST /credentials/{id}/test`); Operator does not call it — tried
+against a live instance, it proved unreliable even for a common credential type (see
+N8N_COMPATIBILITY.md section 9), which is direct evidence for staying with `unverifiable`
+rather than a reason to build around the unreliability.
 
 `UNATTENDED_EXECUTION` is a `warn` emitted for a workflow eligible for T05
 (`side_effects: read_only` **and** `approval: none`): it will run with no human in the loop,
