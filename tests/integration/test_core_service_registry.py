@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
-from n8n_operator.core.service import get_active_snapshot, reload_registry
+from n8n_operator.core.service import get_active_snapshot, reload_registry, validate_registry
 from n8n_operator.registry.loader import RegistryValidationError
-from n8n_operator.storage.repository import WorkflowBindingRepository
+from n8n_operator.storage.repository import AuditLogRepository, WorkflowBindingRepository
 from n8n_operator.storage.session import session_scope
 
 VALID_DOCUMENT = """apiVersion: n8n-operator/v1
@@ -48,6 +48,16 @@ def _write(tmp_path: Path, text: str, name: str = "workflows.yaml") -> Path:
     path = tmp_path / name
     path.write_text(text)
     return path
+
+
+@pytest.mark.integration
+def test_validate_registry_does_not_touch_storage(tmp_path: Path) -> None:
+    """A thin pass-through to ``registry.loader.load_registry`` — no session, no
+    database at all, which is the point: validation never needs one."""
+    path = _write(tmp_path, VALID_DOCUMENT)
+    loaded = validate_registry(path, server_max_argument_bytes=262_144)
+    assert loaded.content_hash.startswith("sha256:")
+    assert len(loaded.entries) == 1
 
 
 @pytest.mark.integration
@@ -154,53 +164,45 @@ def test_disabled_entries_get_no_workflow_binding(
 
 
 @pytest.mark.integration
-def test_audit_hook_is_called_when_provided(
+def test_reload_writes_a_real_audit_entry(
     session_factory: sessionmaker[Session], tmp_path: Path
 ) -> None:
-    calls: list[dict[str, object]] = []
-
-    class _RecordingAuditHook:
-        def record_registry_reload(
-            self,
-            session: Session,
-            *,
-            previous_snapshot_id: str | None,
-            new_snapshot_id: str,
-            content_hash: str,
-            reused_existing: bool,
-        ) -> None:
-            calls.append(
-                {
-                    "previous_snapshot_id": previous_snapshot_id,
-                    "new_snapshot_id": new_snapshot_id,
-                    "content_hash": content_hash,
-                    "reused_existing": reused_existing,
-                }
-            )
-
+    """Phase 2 deferred audit recording behind a hook nothing implemented yet ("otherwise
+    define the hook used in phase 3"). Phase 3 delivers ``audit/writer.py``, so
+    ``reload_registry`` now writes a real, hash-chained ``audit_log`` entry directly —
+    the hook indirection is gone."""
     path = _write(tmp_path, VALID_DOCUMENT)
     with session_scope(session_factory) as session:
-        snapshot, _ = reload_registry(
-            session, path, server_max_argument_bytes=262_144, audit_hook=_RecordingAuditHook()
-        )
+        snapshot, _ = reload_registry(session, path, server_max_argument_bytes=262_144)
 
-    assert len(calls) == 1
-    assert calls[0]["previous_snapshot_id"] is None
-    assert calls[0]["new_snapshot_id"] == snapshot.id
-    assert calls[0]["reused_existing"] is False
+    with session_scope(session_factory) as session:
+        entries = AuditLogRepository(session).list_range()
+
+    assert len(entries) == 1
+    assert entries[0].action == "registry.reloaded"
+    assert entries[0].subject_type == "registry_snapshot"
+    assert entries[0].subject_id == snapshot.id
+    assert entries[0].outcome == "allowed"
+    assert entries[0].detail["reused_existing"] is False
+    assert entries[0].detail["previous_snapshot_id"] is None
 
 
 @pytest.mark.integration
-def test_audit_hook_is_not_called_when_none_is_provided(
+def test_reload_audit_entry_records_reuse_and_the_actor(
     session_factory: sessionmaker[Session], tmp_path: Path
 ) -> None:
-    """The phase-2 default: no audit support exists yet, so nothing is called — this is
-    the "otherwise define the hook used in phase 3" behavior."""
     path = _write(tmp_path, VALID_DOCUMENT)
     with session_scope(session_factory) as session:
-        reload_registry(
-            session, path, server_max_argument_bytes=262_144
-        )  # audit_hook=None, no raise
+        reload_registry(session, path, server_max_argument_bytes=262_144, actor="operator-cli")
+    with session_scope(session_factory) as session:
+        reload_registry(session, path, server_max_argument_bytes=262_144, actor="operator-cli")
+
+    with session_scope(session_factory) as session:
+        entries = AuditLogRepository(session).list_range()
+
+    assert len(entries) == 2
+    assert entries[1].detail["reused_existing"] is True
+    assert entries[1].actor == "operator-cli"
 
 
 @pytest.mark.integration

@@ -236,6 +236,36 @@ class OperationRepository:
         )
         return self._session.scalars(stmt).one_or_none()
 
+    def list(
+        self,
+        *,
+        principal_id: str,
+        environment: str | None = None,
+        workflow_id: str | None = None,
+        states: list[str] | None = None,
+        since: datetime | None = None,
+        limit: int = 20,
+    ) -> list[Operation]:
+        """Filtered, most-recent-first history for one principal (MCP_TOOLS.md 2.10).
+
+        Applies no policy of its own (per the module docstring) — including no lazy
+        expiry, which is a state-machine concern; a caller that needs every returned row
+        current must apply it itself, per row, after this query returns.
+        """
+        stmt: Select[tuple[Operation]] = select(Operation).where(
+            Operation.principal_id == principal_id
+        )
+        if environment is not None:
+            stmt = stmt.where(Operation.environment == environment)
+        if workflow_id is not None:
+            stmt = stmt.where(Operation.workflow_id == workflow_id)
+        if states:
+            stmt = stmt.where(Operation.state.in_(states))
+        if since is not None:
+            stmt = stmt.where(Operation.created_at >= since)
+        stmt = stmt.order_by(Operation.created_at.desc()).limit(limit)
+        return list(self._session.scalars(stmt))
+
     def compare_and_set_state(
         self,
         *,
@@ -409,6 +439,14 @@ class ApprovalRepository:
         stmt: Select[tuple[Approval]] = select(Approval).where(Approval.token_hash == token_hash)
         return self._session.scalars(stmt).one_or_none()
 
+    def get_by_operation_id(self, operation_id: str) -> Approval | None:
+        """The approval row minted for ``operation_id`` at T04, if this operation ever
+        entered ``PENDING_APPROVAL`` (an auto-approved T05 operation has none)."""
+        stmt: Select[tuple[Approval]] = select(Approval).where(
+            Approval.operation_id == operation_id
+        )
+        return self._session.scalars(stmt).one_or_none()
+
     def record_decision(
         self,
         *,
@@ -487,7 +525,18 @@ class AuditLogRepository:
         subject_id: str,
         outcome: str,
         detail: dict[str, Any] | None = None,
+        occurred_at: datetime | None = None,
     ) -> AuditLogEntry:
+        """Insert one row. ``entry_hash`` is trusted as given — this class has no
+        opinion on the hashing algorithm (see the class docstring).
+
+        ``occurred_at`` defaults to the model's own ``utc_now()`` default when omitted,
+        but a caller that already hashed a specific timestamp (``audit/writer.py``,
+        always) must pass that exact value: the model's default is computed fresh at
+        instantiation, a moment later than whatever the caller hashed, and the two would
+        silently disagree — breaking chain verification on every single entry — if the
+        stored value were left to default independently of what was hashed.
+        """
         entry = AuditLogEntry(
             prev_hash=prev_hash,
             entry_hash=entry_hash,
@@ -498,6 +547,8 @@ class AuditLogRepository:
             outcome=outcome,
             detail=detail or {},
         )
+        if occurred_at is not None:
+            entry.occurred_at = occurred_at
         self._session.add(entry)
         self._session.flush()
         return entry

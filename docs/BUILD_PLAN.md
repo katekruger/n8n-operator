@@ -1090,7 +1090,7 @@ it touches are updated in the same change.
       `typer.testing.CliRunner` — 319 tests, 96% coverage on the modules this phase
       implements (100% on `storage/models.py`, `storage/repository.py`, `errors.py`)
 
-### Phase 2 — Registry *(this phase)*
+### Phase 2 — Registry
 
 - [x] `registry/schema.py`: Pydantic v2 models for sections 6.1 through 6.5, plus the
       response-shaping projections (`WorkflowSummary`, `WorkflowDetail`) a later phase's
@@ -1137,19 +1137,87 @@ it touches are updated in the same change.
       invalid-registry failure paths — 456 tests, ≥93% coverage on every module in
       `core/` and `registry/` this phase touches (95% combined), against a 90% gate
 
-### Phase 3 — Core domain
+### Phase 3 — Core domain *(this phase)*
 
-- [ ] `core/models.py`: domain types
-- [ ] `core/state_machine.py`: section 5.2 as data; transitions applied nowhere else
-- [ ] `core/idempotency.py`: canonical JSON, argument fingerprints, namespace resolution,
-      and the core-enforced argument size check (ADR-011, I10)
-- [ ] `core/handles.py`: mint, bind, verify, burn (ADR-003)
-- [ ] `core/redaction.py`: JSONPath redaction, size capping, truncation markers
-- [ ] `core/state_machine.py`: lazy transactional expiry applied before every read and
-      action (ADR-010, I9)
-- [ ] `audit/chain.py` and `audit/writer.py`: hash chain, single writer, verification
-- [ ] `core/service.py`: use cases, transport-agnostic (ADR-001)
-- [ ] Tests: every property in section 10.2; invariants I1 through I12
+- [x] `core/models.py`: domain types — `Principal`, `Environment`, `Operation`,
+      `OperationEvent`, `Approval`, `ExecutionResult`, `AuditEvent`, `PreflightCheck`,
+      `PreflightResult`. `WorkflowContract` is `registry.schema.WorkflowEntry`
+      re-exported under the domain-facing name, not a duplicate model. Structured errors
+      are the `errors.py` taxonomy Phase 1 already implements in full — nothing new
+      there. Every `core/service.py` use case returns one of these detached Pydantic
+      objects, never a live SQLAlchemy row.
+- [x] `core/state_machine.py`: the fifteen T01-T15 edges as a plain data table;
+      `TERMINAL_STATES` is derived from the table itself (a state is terminal iff no
+      transition ever leaves it), not separately asserted. `validate_transition` is the
+      single gate every state change passes through — `core/service.py` calls it before
+      every `OperationRepository.apply_transition`, and that repository method has no
+      notion of legality of its own. Every undocumented `(transition, from_state)` pair
+      raises `InvalidStateTransitionError`. `UNKNOWN` is terminal simply by never
+      appearing as a `from_state` — no special case.
+- [x] `core/idempotency.py` (pulled forward into phase 2, wired into `prepare_operation`
+      here): canonical JSON, argument fingerprints, the four-part idempotency namespace,
+      and the core-enforced argument size check (ADR-011, I10) — checked before the
+      workflow's own resolved `limits.max_argument_bytes` (or the server ceiling) is
+      exceeded, before any operation row is written. `ARGUMENTS_TOO_LARGE` is still
+      audited despite no operation row existing: `prepare_operation` explicitly commits
+      just that audit entry before raising, since the caller's `session_scope` would
+      otherwise roll it back along with the exception it propagates.
+- [x] `core/handles.py`: `mint_operation_handle` (a fresh `op_<ULID>`, CSPRNG-backed via
+      `python-ulid`) and `mint_approval_token` (a separate, hashed-at-rest bearer secret
+      for the future approval-page channel). ADR-003 is explicit that the operation
+      handle *is* the operation ID, not a second secret — `execute_operation` accepts a
+      `handle` parameter matching the MCP tool's documented shape (MCP_TOOLS.md 2.8) and
+      raises `ARGUMENT_MISMATCH` if it differs from `operation_id`, but never treats it
+      as an independent credential. Burn is `OperationRepository.burn_handle`'s
+      conditional `UPDATE ... WHERE handle_burned_at IS NULL` (already built in phase 1);
+      a burned handle is never re-minted — no code path clears `handle_burned_at`.
+- [x] `core/redaction.py`: `redact` (JSONPath, via `jsonpath_ng`'s `.update()`, reaching
+      nested objects and every array position), `scrub_secrets` (literal-value scrubbing
+      of a caller-supplied list of known secrets — the operator's own configured n8n
+      credential, not a generic pattern heuristic), and `cap_output` (an explicit
+      `truncated: true` envelope with a bounded text preview, always valid JSON, always
+      within `max_bytes` down to a one-byte floor).
+- [x] Lazy transactional expiry (ADR-010, I9): `state_machine.overdue_expiry_transition`
+      is applied by `core/service.py` at the top of every operation read or mutation
+      (`get_operation`, `list_operations`, `cancel_operation`, `execute_operation`,
+      `approve_operation`, `reject_operation`), in the same transaction, before state is
+      evaluated for any other purpose.
+- [x] `audit/chain.py` and `audit/writer.py`: canonical entry serialization, sha256
+      hash-chaining with a 64-zero genesis, and `verify_chain`, which reports the first
+      broken sequence number. `write()` is the single writer abstraction — every
+      audit-worthy event in the codebase goes through it. Neither module imports
+      `storage/`, `registry/`, `n8n/`, or `core/` (capability packages must not depend on
+      each other) — `audit/writer.py` is typed against a small structural
+      `AuditLogSink` protocol that `storage.repository.AuditLogRepository` already
+      satisfies, so `core/service.py` (which may depend on both) is the only place the
+      two ever meet.
+- [x] `core/service.py`: use cases, transport-agnostic (ADR-001) — registry discovery
+      (`list_workflows`, `describe_workflow`, `validate_input`, `preflight_workflow`,
+      pulled forward from their MCP_TOOLS.md contracts since they need no n8n call), and
+      the full operation lifecycle: `prepare_operation` (T01-T05, with an injected
+      `PreflightPort` Phase 4's real adapter will implement), `approve_operation` (T06),
+      `reject_operation` (T07), `cancel_operation` (T09/T12), `execute_operation` (T10 —
+      burns the handle and re-checks the *registered* definition hash against the
+      current active snapshot; the *live n8n* half of that check is phase 4's, layered on
+      top), `record_execution_outcome` (T13/T14/T15 — the seam a future n8n adapter
+      calls after dispatch; core never imports `httpx` or reasons about a timeout, so
+      there is no code path that could infer non-execution from one, per ADR-009),
+      `get_operation`, `list_operations`, and `get_execution_result`. `registry
+      reload`'s audit entry, deferred behind an unimplemented `AuditHook` in phase 2, is
+      now written directly through the real `audit/writer.py`.
+- [x] Tests: 163 new tests across every layer — every one of T01 through T15 exercised
+      directly against a real database, invariants I1 through I11 (I12's *caller-locality*
+      half belongs to the not-yet-built MCP adapter; this phase only guarantees core never
+      hands out a URL or raw token for that adapter to leak), concurrent handle burn
+      under real thread contention (exactly one success across 8 competing threads),
+      scoped idempotency (same/different namespace, same/different fingerprint), lazy
+      expiry (both PENDING_APPROVAL and APPROVED, recorded exactly once), audit-chain
+      tampering (content mutation, reordering, and bad genesis, each reported at the
+      correct sequence number), redaction totality and secret non-leakage as Hypothesis
+      properties, oversized arguments never reaching storage, and the import-graph
+      contract (`registry`/`storage`/`audit`/`n8n` import neither each other nor `core`;
+      `core` imports none of `mcp`/`cli`/`approval`/`fastapi`/`typer`). 619 tests total,
+      97% coverage on `core/` and `registry/` against the 90% gate.
 
 ### Phase 4 — n8n integration
 
