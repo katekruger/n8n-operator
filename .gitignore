@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# n8n Operator — .gitignore
+# This repository may become public. Treat every commit as permanently public.
+# ---------------------------------------------------------------------------
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Node, if present now or added later
+node_modules/
+.next/
+out/
+.npm/
+.pnpm-store/
+.yarn/
+.vercel/
+
+# Local databases and application state
+*.db
+*.sqlite
+*.sqlite3
+data/
+.local/
+.cache/
+tmp/
+temp/
+
+# n8n-specific local state
+.n8n/
+n8n-data/
+n8n_data/
+execution-data/
+binary-data/
+
+# Logs and telemetry
+*.log
+logs/
+otel-data/
+telemetry-data/
+
+# IDE and operating system
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated reports and test artifacts
+test-results/
+playwright-report/
+junit.xml
+reports/
+artifacts/
+
+# Claude/Codex local state where applicable
+.claude/settings.local.json
+.codex/
