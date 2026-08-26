@@ -1059,7 +1059,7 @@ it touches are updated in the same change.
 - [x] BUILD_PLAN, ARCHITECTURE, THREAT_MODEL, WORKFLOW_REGISTRY, MCP_TOOLS updated
 - [x] Doc-consistency checker extended (D10 - D12) and contract tests added
 
-### Phase 1 — Configuration and storage foundation *(this phase)*
+### Phase 1 — Configuration and storage foundation
 
 - [x] `config.py`: settings model, env loading, secret indirection (`env:`/`keyring:`,
       mirroring registry `secret_ref`), startup validation, `max_argument_bytes` ceiling
@@ -1090,15 +1090,52 @@ it touches are updated in the same change.
       `typer.testing.CliRunner` — 319 tests, 96% coverage on the modules this phase
       implements (100% on `storage/models.py`, `storage/repository.py`, `errors.py`)
 
-### Phase 2 — Registry
+### Phase 2 — Registry *(this phase)*
 
-- [ ] `registry/schema.py`: Pydantic v2 models for sections 6.1 through 6.5
-- [ ] `registry/loader.py`: parse, canonicalize, hash, snapshot, persist
-- [ ] All load-time rules R1 through R12 (section 6.6) with a named error per rule
-- [ ] `registry/validation.py`: JSON Schema 2020-12 argument validation with pointer paths
-- [ ] `cli registry validate | list | show | hash | reload`
-- [ ] `examples/registry/workflows.example.yaml` loads clean
-- [ ] Tests: one failing fixture per rule; round-trip and hash-stability properties
+- [x] `registry/schema.py`: Pydantic v2 models for sections 6.1 through 6.5, plus the
+      response-shaping projections (`WorkflowSummary`, `WorkflowDetail`) a later phase's
+      `list_workflows`/`describe_workflow` will build from — their field sets structurally
+      exclude `n8n_workflow_id`, `trigger` (and therefore `secret_ref`), and any URL
+      (ADR-006, boundary B5)
+- [x] `registry/loader.py`: strict/safe YAML parsing (duplicate-key rejection, a
+      2 MiB file-size limit, no arbitrary object construction via a `SafeLoader`
+      subclass), the one canonical-JSON implementation this codebase uses everywhere,
+      content hashing, and orchestration (`load_registry`). Persisting the loaded result
+      into a snapshot is `core/service.py`'s job, not this module's — `registry/` must
+      not depend on `storage/` (ARCHITECTURE.md section 2.1)
+- [x] All load-time rules R1 through R12 (section 6.6) with a named error per rule,
+      reported all at once, not just the first (no partially-live allowlist, AC-02)
+- [x] `registry/validation.py`: JSON Schema 2020-12 argument validation with RFC 6901
+      JSON-Pointer error paths, matching MCP_TOOLS.md section 2.4's documented codes
+- [x] `core/idempotency.py`: canonical argument fingerprints, the core-enforced maximum
+      argument size applied before persistence (ADR-011, invariant I10), and the
+      four-part idempotency namespace (`principal_id`, `environment`, `workflow_id`,
+      `idempotency_key`) — pulled forward from phase 3 because this phase's rules need it
+- [x] `core/service.py` (phase-2 slice): `reload_registry` — fully validates before
+      touching storage, reuses an existing snapshot by content hash rather than
+      duplicating, and leaves the previously-active snapshot in place on any failure.
+      "Active" is the snapshot with the greatest `loaded_at`; there is no separate
+      mutable pointer to move (section 6.7). Accepts an `AuditHook` protocol and calls it
+      when provided; no implementation exists until phase 3, so `reload_registry` simply
+      skips the call when `audit_hook` is `None`
+- [x] `cli registry validate | list | show | hash | reload`. `hash` computes the
+      registry document's own canonical content hash; the `--n8n-workflow-id` mode
+      WORKFLOW_REGISTRY.md section 5 also describes (fetching a live definition hash from
+      n8n) reports itself as not yet implemented rather than being silently ignored —
+      it arrives with n8n integration in phase 4
+- [x] `examples/registry/workflows.example.yaml` loads clean under the new validator
+- [x] Tests: one failing fixture per rule R1 through R11, plus a direct-call test proving
+      R12's check logic works even though it is unreachable via YAML in v1 (`trigger.type`
+      is `Literal["webhook"]` only until a second trigger type exists); ten Hypothesis
+      properties (hash stability under key-order/whitespace variation, hash sensitivity to
+      a semantic change, YAML round-trip fidelity, literal secrets always rejected,
+      absolute webhook URLs always rejected, `approval: none` requires `read_only`, high
+      risk always requires approval, oversized canonical arguments always fail, and both
+      idempotency-resolution properties); repository append-only contract tests for
+      `RegistrySnapshotRepository`/`WorkflowBindingRepository`; CLI end-to-end tests via
+      `typer.testing.CliRunner` covering every subcommand and the pre-`db init` and
+      invalid-registry failure paths — 456 tests, ≥93% coverage on every module in
+      `core/` and `registry/` this phase touches (95% combined), against a 90% gate
 
 ### Phase 3 — Core domain
 

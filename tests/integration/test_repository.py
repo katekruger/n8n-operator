@@ -825,3 +825,18 @@ def test_no_update_or_delete_method_exists_on_audit_log_repository() -> None:
 def test_no_update_or_delete_method_exists_on_operation_event_repository() -> None:
     public_methods = {name for name in dir(OperationEventRepository) if not name.startswith("_")}
     assert public_methods == {"append", "list_for_operation"}
+
+
+@pytest.mark.integration
+def test_no_update_or_delete_method_exists_on_registry_snapshot_repository() -> None:
+    """BUILD_PLAN section 6.7: snapshots are content-addressed, append-only, and never
+    mutated — checked directly against the class's own public interface, the same way
+    ``AuditLogRepository``'s append-only contract is checked above."""
+    public_methods = {name for name in dir(RegistrySnapshotRepository) if not name.startswith("_")}
+    assert public_methods == {"create", "get", "get_by_content_hash", "get_latest"}
+
+
+@pytest.mark.integration
+def test_no_update_or_delete_method_exists_on_workflow_binding_repository() -> None:
+    public_methods = {name for name in dir(WorkflowBindingRepository) if not name.startswith("_")}
+    assert public_methods == {"create", "get_by_snapshot_and_workflow_id"}

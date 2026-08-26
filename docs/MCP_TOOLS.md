@@ -112,7 +112,8 @@ and to understand what approving it would mean.
     "approval_ttl_seconds": 900,
     "execution_ttl_seconds": 300,
     "max_concurrent": 1,
-    "rate_limit_per_minute": null
+    "rate_limit_per_minute": null,
+    "max_argument_bytes": null
   },
   "registry_snapshot": "sha256:1a2b…"
 }
@@ -120,6 +121,9 @@ and to understand what approving it would mean.
 
 `output.redacted_paths` is a **count**, not the paths themselves — publishing the paths
 would tell an attacker exactly which fields are worth attacking.
+
+`limits.max_argument_bytes` is `null` unless this workflow lowers the server's own
+argument-size ceiling (ADR-011); a workflow may only lower the ceiling, never raise it.
 
 **Errors:** `WORKFLOW_NOT_FOUND`, `REGISTRY_UNAVAILABLE`.
 

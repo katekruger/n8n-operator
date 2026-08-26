@@ -42,6 +42,7 @@ DEFAULT_DATABASE_URL = "sqlite+pysqlite:///./n8n-operator.db"
 DEFAULT_REGISTRY_PATH = "./workflows.yaml"
 DEFAULT_APPROVAL_BIND = "127.0.0.1:8765"
 DEFAULT_HTTP_BIND = "127.0.0.1:8000"
+DEFAULT_MAX_ARGUMENT_BYTES = 262_144  # 256 KiB — ADR-011's server ceiling
 
 _SUPPORTED_DB_DRIVERS = frozenset({"sqlite", "sqlite+pysqlite", "postgresql", "postgresql+psycopg"})
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
@@ -128,6 +129,35 @@ def resolve_database_url(explicit: str | None = None) -> str:
     return _check_database_url(raw)
 
 
+def resolve_registry_path(explicit: str | None = None) -> Path:
+    """The registry file path, resolved *without* requiring the rest of
+    :class:`Settings` — the same "schema/registry management is orthogonal to the rest
+    of configuration" reasoning as :func:`resolve_database_url`. Precedence: an explicit
+    value, then ``N8N_OPERATOR_REGISTRY_PATH``, then :data:`DEFAULT_REGISTRY_PATH`.
+    """
+    raw = explicit or os.environ.get("N8N_OPERATOR_REGISTRY_PATH", DEFAULT_REGISTRY_PATH)
+    return Path(raw)
+
+
+def resolve_max_argument_bytes(explicit: int | None = None) -> int:
+    """The server argument-size ceiling (ADR-011), resolved *without* requiring the
+    rest of :class:`Settings`. Precedence: an explicit value, then
+    ``N8N_OPERATOR_MAX_ARGUMENT_BYTES``, then :data:`DEFAULT_MAX_ARGUMENT_BYTES`.
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("N8N_OPERATOR_MAX_ARGUMENT_BYTES")
+    if raw is None:
+        return DEFAULT_MAX_ARGUMENT_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"N8N_OPERATOR_MAX_ARGUMENT_BYTES={raw!r} is not an integer") from exc
+    if value <= 0:
+        raise ValueError(f"N8N_OPERATOR_MAX_ARGUMENT_BYTES must be positive, got {value}")
+    return value
+
+
 class Settings(BaseSettings):
     """Validated process configuration (ARCHITECTURE section 7).
 
@@ -170,7 +200,7 @@ class Settings(BaseSettings):
 
     # --- behavior --------------------------------------------------------------------------
     request_timeout_seconds: int = Field(default=60, gt=0)
-    max_argument_bytes: int = Field(default=262_144, gt=0)  # ADR-011, boundary B12
+    max_argument_bytes: int = Field(default=DEFAULT_MAX_ARGUMENT_BYTES, gt=0)  # ADR-011, B12
     approval_url_exposure: Literal["auto", "never"] = Field(default="auto")  # ADR-010, I12
     log_level: str = Field(default="INFO")
 
@@ -277,8 +307,12 @@ __all__ = [
     "DEFAULT_APPROVAL_BIND",
     "DEFAULT_DATABASE_URL",
     "DEFAULT_HTTP_BIND",
+    "DEFAULT_MAX_ARGUMENT_BYTES",
     "DEFAULT_REGISTRY_PATH",
     "Settings",
     "load_settings",
+    "resolve_database_url",
+    "resolve_max_argument_bytes",
+    "resolve_registry_path",
     "resolve_secret_reference",
 ]

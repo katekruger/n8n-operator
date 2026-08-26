@@ -178,6 +178,14 @@ every number, and `format` where one applies. An unbounded string field is an in
 
 ## 5. Computing `definition_hash`
 
+> `registry hash` has two modes. Called with no arguments, it prints the registry
+> **document's** own canonical content hash (BUILD_PLAN section 6.7) — the hash
+> `registry validate` and `registry reload` use to detect whether the file changed, and
+> the one shipped in phase 2. Called with `--n8n-workflow-id` (below), it computes one
+> *workflow's* `definition_hash` by fetching its live definition from n8n — this mode
+> requires n8n integration and is not yet implemented; it arrives in phase 4. Passing
+> `--n8n-workflow-id` before then reports that plainly rather than silently doing nothing.
+
 The hash pins the n8n workflow definition you reviewed. Operator canonicalizes the
 definition and takes `sha256` over the canonical form.
 

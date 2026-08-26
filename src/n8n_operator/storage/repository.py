@@ -106,6 +106,19 @@ class RegistrySnapshotRepository:
         )
         return self._session.scalars(stmt).one_or_none()
 
+    def get_latest(self) -> RegistrySnapshot | None:
+        """The "active" snapshot: whichever was loaded most recently.
+
+        There is no separate mutable "active" pointer to manage (BUILD_PLAN section
+        8.1 has no such column) — snapshots are immutable and append-only, so "active"
+        is simply "the one with the greatest ``loaded_at``". ``None`` only before the
+        first successful ``registry reload``.
+        """
+        stmt: Select[tuple[RegistrySnapshot]] = (
+            select(RegistrySnapshot).order_by(RegistrySnapshot.loaded_at.desc()).limit(1)
+        )
+        return self._session.scalars(stmt).one_or_none()
+
 
 class WorkflowBindingRepository:
     """The ``workflow_bindings`` table: one resolved entry within one snapshot."""
