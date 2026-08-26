@@ -263,7 +263,7 @@ n8n-operator/
 │           ├── main.py
 │           └── commands/
 │               ├── __init__.py
-│               ├── registry.py     # validate, list, show
+│               ├── registry.py     # validate, list, show, hash, reload
 │               ├── serve.py        # serve stdio | serve http | serve approval
 │               ├── operations.py   # list, show, cancel
 │               ├── audit.py        # verify, export
@@ -932,7 +932,7 @@ it touches are updated in the same change.
 - [ ] `registry/loader.py`: parse, canonicalize, hash, snapshot, persist
 - [ ] All load-time rules R1 through R10 (section 6.6) with a named error per rule
 - [ ] `registry/validation.py`: JSON Schema 2020-12 argument validation with pointer paths
-- [ ] `cli registry validate | list | show`
+- [ ] `cli registry validate | list | show | hash | reload`
 - [ ] `examples/registry/workflows.example.yaml` loads clean
 - [ ] Tests: one failing fixture per rule; round-trip and hash-stability properties
 

@@ -101,6 +101,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "T20"]
 "src/n8n_operator/cli/**" = ["T20"]
+"scripts/**" = ["T20"]   # the doc checker reports through stdout
 
 [tool.ruff.lint.isort]
 known-first-party = ["n8n_operator"]

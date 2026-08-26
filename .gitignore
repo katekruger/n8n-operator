@@ -1,82 +1,36 @@
-# ---------------------------------------------------------------------------
-# n8n Operator — .gitignore
-# This repository may become public. Treat every commit as permanently public.
-# ---------------------------------------------------------------------------
-
-# Secrets and environment files
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.p12
-*.pfx
-credentials.json
-secrets.json
-
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
 .coverage
-coverage.xml
+.coverage.*
 htmlcov/
-.venv/
-venv/
-dist/
-build/
-*.egg-info/
+coverage.xml
 
-# Node, if present now or added later
-node_modules/
-.next/
-out/
-.npm/
-.pnpm-store/
-.yarn/
-.vercel/
-
-# Local databases and application state
+# Operator state — never commit a database or a live registry
 *.db
-*.sqlite
+*.db-shm
+*.db-wal
 *.sqlite3
-data/
-.local/
-.cache/
-tmp/
-temp/
+/workflows.yaml
 
-# n8n-specific local state
-.n8n/
-n8n-data/
-n8n_data/
-execution-data/
-binary-data/
-
-# Logs and telemetry
-*.log
-logs/
-otel-data/
-telemetry-data/
-
-# IDE and operating system
+# OS / editor
 .DS_Store
-Thumbs.db
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# Generated reports and test artifacts
-test-results/
-playwright-report/
-junit.xml
-reports/
-artifacts/
-
-# Claude/Codex local state where applicable
-.claude/settings.local.json
-.codex/

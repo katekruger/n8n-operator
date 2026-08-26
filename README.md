@@ -1,173 +1,105 @@
 # n8n Operator
 
 **A governed MCP control plane for discovering, validating, executing, and debugging
-approved n8n workflows from Claude, ChatGPT/OpenAI, Codex, and compatible MCP clients.**
+approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-n8n is an excellent workflow engine and a poor agent surface. Pointing a model at a raw
+> **Status: architecture and bootstrap (phase 0).** The documentation set and the
+> repository skeleton are complete. No product functionality is implemented yet.
+> See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist.
+
+---
+
+## The problem
+
+n8n is an excellent workflow engine and a poor agent surface. Pointing an LLM at a raw
 n8n instance hands it an unbounded, unversioned, credential-bearing remote-execution
-primitive. n8n Operator is the policy enforcement point that sits between MCP clients
-and one or more n8n instances: it exposes a small, stable, well-typed tool surface and
-refuses to do anything that is not explicitly approved in advance.
+primitive: the workflow list is discovered at runtime, the input contract is implicit in
+the node graph, failures surface as raw execution JSON, and every webhook is a live
+production side effect.
 
-n8n executes. Operator governs.
+n8n Operator is the place to stand between "the model decided to do a thing" and "the
+thing happened."
 
----
+## What it does
 
-## Status
-
-**Phase 0 — architecture and bootstrap. No product functionality is implemented yet.**
-
-What exists today in this repository is the normative design:
-
-| Document | Contents |
+| | |
 |---|---|
-| [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) | **Normative.** Product definition, version boundaries, operation state machine, registry schema, tool inventory, storage model, security boundaries, test strategy, acceptance criteria, phase checklist. |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component map, layering rules, request flows, data/trust flow, configuration, processes. |
-| [`docs/MCP_TOOLS.md`](docs/MCP_TOOLS.md) | **Normative for tool I/O.** Contracts for the 12 v1 tools, the v1 resources, and the error taxonomy. |
-| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Assets, trust boundaries, threats, mitigations, accepted residual risk. |
+| **Discover** | Only workflows an operator explicitly registered, with human-authored descriptions, risk classes, and input schemas. |
+| **Validate** | Arguments checked against a declared JSON Schema before anything reaches n8n. |
+| **Preflight** | Target verified live, active, and unmodified since registration, before approval is sought. |
+| **Execute** | An explicit `prepare → approve → execute` lifecycle with single-use handles, idempotency, and a durable audit trail. |
+| **Debug** | Redacted, structured execution traces — enough to diagnose, not enough to exfiltrate. |
 
-There is no installable package, no CLI, and no MCP server yet. Source directories
-under `src/n8n_operator/` and `tests/` are empty scaffolding. Where `BUILD_PLAN.md`
-section 4 describes files that do not exist yet, the document is describing the
-intended structure, not the current state.
+## What it refuses to do
 
----
+- Expose a workflow that is not in the registry, however live it is on the instance.
+- Accept a raw n8n workflow ID, URL, or payload in any tool argument.
+- Return a credential, token, n8n ID, or instance URL in any tool result.
+- Let an MCP client approve its own operation — approval is out-of-band, always.
+- Retry anything automatically. Ambiguous outcomes surface as `UNKNOWN` for a human.
+- Edit workflows (v1 and v2). Authoring stays in the n8n UI.
 
-## Safety model
+## Documentation
 
-The design rests on six controls. All of them are specified; none of them are
-implemented yet.
+| Document | What it covers |
+|---|---|
+| [BUILD_PLAN.md](docs/BUILD_PLAN.md) | **Normative.** Product definition, version boundaries, state machine, registry schema, tool inventory, storage model, security boundaries, tests, acceptance criteria, phase checklist. |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, layering, request flows, data trust, persistence, configuration. |
+| [THREAT_MODEL.md](docs/THREAT_MODEL.md) | Assets, trust boundaries, STRIDE analysis, LLM-specific threats, residual risks. |
+| [WORKFLOW_REGISTRY.md](docs/WORKFLOW_REGISTRY.md) | How to register a workflow, and how to classify it correctly. |
+| [MCP_TOOLS.md](docs/MCP_TOOLS.md) | **Normative** for tool arguments, results, and the error taxonomy. |
 
-**1. Approved workflow registry (default deny).**
-Only workflows an operator has explicitly registered in a YAML registry are visible or
-runnable. A workflow that is live on the n8n instance but absent from the registry does
-not exist as far as any client is concerned. The registry carries human-authored
-titles, descriptions, risk classifications, and input schemas.
+### Decision records
 
-**2. Typed input contracts.**
-Every registered workflow declares a JSON Schema for its arguments. Caller-supplied
-arguments are validated against it *before* anything reaches n8n, and failures return
-structured, model-actionable errors with JSON-Pointer paths.
+| ADR | Decision |
+|---|---|
+| [001](docs/adr/ADR-001-portable-mcp-core.md) | Portable, transport-agnostic core; MCP is an adapter |
+| [002](docs/adr/ADR-002-default-deny-registry.md) | Default-deny YAML workflow registry |
+| [003](docs/adr/ADR-003-operation-handles.md) | Operation handles as single-use capabilities |
+| [004](docs/adr/ADR-004-sqlite-to-postgres.md) | SQLite in v1, PostgreSQL in v2, one schema throughout |
+| [005](docs/adr/ADR-005-no-automatic-retry-v1.md) | No automatic retries in v1 |
+| [006](docs/adr/ADR-006-server-owned-n8n-credentials.md) | Server-owned n8n credentials |
+| [007](docs/adr/ADR-007-deterministic-before-llm.md) | Deterministic enforcement before LLM judgment |
 
-**3. Prepare → approve → execute lifecycle.**
-Running a workflow is not a single call. `prepare` resolves the workflow, validates
-arguments, preflights the live instance (reachable, active, definition unchanged since
-registration), and produces an operation. Approval happens **out of band** — a human
-acts on a loopback-bound browser page, never through an MCP tool a compromised client
-could call. `execute` then requires a single-use, server-issued operation handle bound
-to the exact principal, workflow, and argument fingerprint.
+## Version boundaries
 
-**4. Idempotency.**
-Operations are keyed by `(principal, idempotency_key)` with an argument fingerprint. A
-retried client call returns the existing operation rather than creating a second one,
-and a key reused with different arguments is a conflict error. Handles are burned via a
-compare-and-set, so an approved operation executes at most once. v1 never retries
-automatically; ambiguous outcomes surface as `UNKNOWN` for a human to reconcile.
+**v1** — single user, one n8n instance, SQLite, stdio and remote Streamable HTTP MCP,
+CLI, YAML registry, read-only inspection, input validation, preflight,
+prepare/approve/execute, local approval page, idempotency, audit log. No retries, no
+workflow editing.
 
-**5. Audit logs.**
-Every state transition and every decision is an append-only, hash-chained audit record.
-A transition, its event row, and its audit row commit in one transaction — if the audit
-write fails, the transition did not happen. The chain is tamper-*evident*, not
-tamper-proof.
+**v2** — PostgreSQL, multiple users and organizations, OAuth/OIDC, RBAC, multiple n8n
+environments, team approvals, monitoring, governed retries, workflow definition diffs.
 
-**6. Server-owned n8n credentials.**
-n8n API keys and webhook secrets are owned by the server, resolved at startup, held in
-memory, and scrubbed from logs. They are never returned by any tool, never placed in
-the registry file, and never sent to a client. Neither are the n8n instance URL nor the
-underlying `n8n_workflow_id` — clients only ever see registry IDs.
+**v3** — declarative workflow compiler, evaluation lab, governed workflow changes,
+remediation assistant, template library, enterprise controls.
 
-There will never be a generic `n8n_request` passthrough tool, in any version.
+Full boundary table: [BUILD_PLAN.md](docs/BUILD_PLAN.md) section 3.
 
----
+## Development
 
-## Planned versions
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
-**v1 — local-first governed operator.**
-A single operator points an MCP client at their own n8n instance and safely runs a
-curated set of workflows, with every side effect gated by an explicit human approval
-and recorded in a tamper-evident audit log. SQLite, stdio + loopback Streamable HTTP,
-12 tools. Explicit non-goals: multi-user, multi-instance, RBAC, retries, workflow
-editing, scheduling, dashboards, notifications.
+```bash
+uv sync
+```
 
-**v2 — hosted team operations.**
-PostgreSQL, OAuth/OIDC identity carried into every audit record, roles
-(`viewer`/`operator`/`approver`/`admin`), multiple named n8n environments with
-per-environment approval policy, N-of-M approvals, explicitly audited governed retries,
-structural definition diffs, and operational metrics.
+```bash
+uv run pytest
+```
 
-**v3 — AI-native workflow engineering.**
-Workflows become governed artifacts: a declarative source format that compiles
-deterministically to n8n workflow JSON, an evaluation lab that scores a workflow
-against fixture suites before promotion, `plan → review → apply` changes with rollback,
-a remediation assistant that proposes but never applies fixes, a vetted template
-library, and enterprise controls (SSO enforcement, data residency, retention,
-break-glass, exportable compliance evidence).
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run mypy
+```
 
----
+```bash
+uv run python scripts/check_docs_consistency.py
+```
 
-## Local development
-
-**There is nothing to run yet.** No verified setup, build, test, or serve commands
-exist at this stage, and none are documented here for that reason. This section will be
-filled in as Phase 1 lands.
-
-The *planned* toolchain, per `BUILD_PLAN.md` section 4, is Python 3.12 with `uv`, an
-`src` layout, Alembic migrations, and pytest + Hypothesis — but `pyproject.toml`,
-`alembic.ini`, and the package modules do not exist in the repository yet.
-
-To read the design, start with [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md).
-
-### Configuration
-
-When the package exists, configuration will be read from `N8N_OPERATOR_`-prefixed
-environment variables and validated at process start; a malformed configuration is a
-startup failure, not a runtime surprise. See [`.env.example`](.env.example) for the
-variable names and `docs/ARCHITECTURE.md` section 7 for defaults and notes.
-
----
-
-## ⚠️ Never commit credentials
-
-**Do not commit n8n API keys, n8n credential exports, webhook secrets, bearer tokens,
-`.env` files, local SQLite databases, or real workflow execution data to this
-repository.**
-
-This repository may be made public in the future. Treat every commit as permanently
-public from the moment it is written — deleting a file in a later commit does not
-remove it from history, and a leaked key must be rotated, not merely deleted.
-
-- Secrets belong in the environment or a keyring, never in the registry file, never in
-  source, never in docs.
-- `.env.example` contains variable **names and placeholders only**.
-- Registry files, fixtures, and examples must use synthetic data. Real customer records
-  and real execution payloads do not belong here.
-- `.gitignore` covers the common cases, but it is a safety net, not a control. Check
-  what you are staging.
-
----
+The last command enforces that the documentation set agrees with itself and with the
+repository tree — state names, transition IDs, tool inventory, acceptance criteria,
+cross-document links, and the published file tree. It runs in CI and as a contract test.
 
 ## License
 
-**Apache-2.0**, as declared in `pyproject.toml`.
-
-Note that the `LICENSE` file anticipated by `BUILD_PLAN.md` section 4 has not been added
-to the repository yet, so the full license text is not present. That gap must be closed
-before this repository is made public.
-
----
-
-## Current limitations
-
-- Phase 0: design only. No implementation, no tests, no CI runs.
-- Apache-2.0 is declared in `pyproject.toml`, but the `LICENSE` file itself is missing.
-- v1 is single-operator and single-instance by design: no multi-user, no RBAC, no
-  multi-environment support.
-- v1 never retries automatically; `UNKNOWN` outcomes require a human to check the
-  downstream system.
-- Accepted residual risks (`BUILD_PLAN.md` section 9.5): a compromised operator machine
-  defeats every control below it; n8n itself is trusted and Operator does not sandbox
-  what a dispatched workflow does; a human who approves without reading the approval
-  page defeats the human gate.
-- n8n output is untrusted input. Results are structurally shaped, redacted, and
-  size-capped, and are delivered as data — but semantic sanitization is not possible,
-  and every subsequent side effect requires its own prepare, approval, and handle.
+Apache-2.0. See [LICENSE](LICENSE).
