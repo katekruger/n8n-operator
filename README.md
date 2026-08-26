@@ -148,16 +148,18 @@ remove it from history, and a leaked key must be rotated, not merely deleted.
 
 ## License
 
-**Not yet selected.** No `LICENSE` file has been added, so no license is currently
-granted for this code. `BUILD_PLAN.md` section 4 anticipates a `LICENSE` file; the
-choice has not been made. This must be resolved before the repository is made public.
+**Apache-2.0**, as declared in `pyproject.toml`.
+
+Note that the `LICENSE` file anticipated by `BUILD_PLAN.md` section 4 has not been added
+to the repository yet, so the full license text is not present. That gap must be closed
+before this repository is made public.
 
 ---
 
 ## Current limitations
 
 - Phase 0: design only. No implementation, no tests, no CI runs.
-- No license has been chosen (see above).
+- Apache-2.0 is declared in `pyproject.toml`, but the `LICENSE` file itself is missing.
 - v1 is single-operator and single-instance by design: no multi-user, no RBAC, no
   multi-environment support.
 - v1 never retries automatically; `UNKNOWN` outcomes require a human to check the

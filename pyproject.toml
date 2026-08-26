@@ -1,0 +1,143 @@
+[project]
+name = "n8n-operator"
+version = "0.1.0"
+description = "A governed MCP control plane for discovering, validating, executing, and debugging approved n8n workflows."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "n8n Operator maintainers" }]
+keywords = ["mcp", "n8n", "workflow", "governance", "automation"]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
+]
+
+dependencies = [
+  # MCP — official Python SDK, v2 line (mcp.server.MCPServer; stdio + Streamable HTTP)
+  "mcp>=2.1.1,<3",
+  # Domain models, settings, and tool argument schemas
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.7,<3",
+  # Local approval app (loopback-bound) — ADR-001 keeps this out of core/
+  "fastapi>=0.141,<1",
+  "uvicorn[standard]>=0.38,<1",
+  "jinja2>=3.1,<4",
+  # Persistence — portable constructs only (ADR-004)
+  "sqlalchemy>=2.0.52,<3",
+  "alembic>=1.19,<2",
+  # n8n client — explicit timeouts, no retries (ADR-005)
+  "httpx>=0.28,<1",
+  # CLI
+  "typer>=0.27,<1",
+  # Registry: YAML parsing, JSON Schema 2020-12 validation, JSONPath redaction
+  "pyyaml>=6.0,<7",
+  "jsonschema>=4.23,<5",
+  "jsonpath-ng>=1.7,<2",
+  # Operation handles and event ordering
+  "python-ulid>=3.0,<4",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]   # v2 (ADR-004); unused in v1
+
+[project.urls]
+Homepage = "https://github.com/n8n-operator/n8n-operator"
+Documentation = "https://github.com/n8n-operator/n8n-operator/tree/main/docs"
+
+[project.scripts]
+n8n-operator = "n8n_operator.cli.main:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1,<10",
+  "pytest-asyncio>=1.0,<2",
+  "pytest-cov>=7.0,<8",
+  "hypothesis>=6.165,<7",
+  "ruff>=0.14,<1",
+  "mypy>=1.14,<2",
+  "types-pyyaml>=6.0,<7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/n8n_operator"]
+
+# ---------------------------------------------------------------------------
+# Lint / format
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",    # pycodestyle
+  "F",         # pyflakes
+  "I",         # isort
+  "N",         # pep8-naming
+  "UP",        # pyupgrade
+  "B",         # bugbear
+  "A",         # builtins shadowing
+  "C4",        # comprehensions
+  "DTZ",       # naive datetimes — load-bearing for ADR-004 rule D2
+  "S",         # bandit
+  "T20",       # no print() outside the CLI
+  "SIM",       # simplify
+  "PTH",       # pathlib
+  "RUF",
+]
+ignore = [
+  "S101",  # assert — used throughout the test suite
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "T20"]
+"src/n8n_operator/cli/**" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["n8n_operator"]
+
+# ---------------------------------------------------------------------------
+# Type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["jsonpath_ng.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+markers = [
+  "unit: pure logic, no I/O",
+  "property: Hypothesis invariants (BUILD_PLAN section 10.2)",
+  "contract: MCP tool schema, error taxonomy, and layering contracts",
+  "integration: real SQLite and a mock n8n transport",
+  "live_n8n: requires a real n8n instance; opt-in, not run in CI",
+]
+
+[tool.coverage.run]
+source = ["src/n8n_operator"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
