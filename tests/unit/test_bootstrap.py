@@ -65,6 +65,11 @@ REQUIRED_DOCS = [
     "docs/adr/ADR-005-no-automatic-retry-v1.md",
     "docs/adr/ADR-006-server-owned-n8n-credentials.md",
     "docs/adr/ADR-007-deterministic-before-llm.md",
+    "docs/adr/ADR-008-conservative-definition-canonicalization.md",
+    "docs/adr/ADR-009-dispatch-correlation.md",
+    "docs/adr/ADR-010-approval-delivery-and-expiry.md",
+    "docs/adr/ADR-011-argument-limits-and-idempotency.md",
+    "docs/adr/ADR-012-governed-retry-and-audit-anchoring.md",
 ]
 
 

@@ -7,6 +7,11 @@ can be enumerated by property tests; no other module changes ``operations.state`
 Each transition emits exactly one ``operation_events`` row and one ``audit_log`` row in
 the same transaction as the state change (invariant I6).
 
+Lazy transactional expiry is authoritative: every read of, and action on, an operation
+applies any overdue T08 or T11 here, in the same transaction, before state is evaluated.
+Sweepers and ``operations expire`` improve audit-timeline fidelity, never safety
+(invariant I9, ADR-010).
+
 Phase 3 (BUILD_PLAN section 12).
 """
 

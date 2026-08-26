@@ -3,9 +3,11 @@
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: architecture and bootstrap (phase 0).** The documentation set and the
-> repository skeleton are complete. No product functionality is implemented yet.
-> See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist.
+> **Status: architecture-decision closure (phase 0.1).** The documentation set and the
+> repository skeleton are complete, and the architecture decisions left open at the end of
+> phase 0 are now closed in ADR-008 through ADR-012. No product functionality is
+> implemented yet. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
+> checklist.
 
 ---
 
@@ -60,6 +62,11 @@ thing happened."
 | [005](docs/adr/ADR-005-no-automatic-retry-v1.md) | No automatic retries in v1 |
 | [006](docs/adr/ADR-006-server-owned-n8n-credentials.md) | Server-owned n8n credentials |
 | [007](docs/adr/ADR-007-deterministic-before-llm.md) | Deterministic enforcement before LLM judgment |
+| [008](docs/adr/ADR-008-conservative-definition-canonicalization.md) | Conservative workflow-definition canonicalization |
+| [009](docs/adr/ADR-009-dispatch-correlation.md) | Dispatch correlation and indeterminate outcomes |
+| [010](docs/adr/ADR-010-approval-delivery-and-expiry.md) | Approval delivery and expiry semantics |
+| [011](docs/adr/ADR-011-argument-limits-and-idempotency.md) | Core argument limits and idempotency namespaces |
+| [012](docs/adr/ADR-012-governed-retry-and-audit-anchoring.md) | Governed retry and external audit anchoring |
 
 ## Version boundaries
 

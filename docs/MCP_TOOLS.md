@@ -24,9 +24,18 @@
   with the literal string `"[REDACTED]"`. Truncated payloads carry `"truncated": true`.
 - **No credentials, ever.** No result field in any version contains an API key, webhook
   secret, bearer token, n8n workflow ID, or n8n instance URL.
-- **Side effects.** Exactly two v1 tools change state: `prepare_operation` (creates an
-  operation) and `execute_operation` (runs the workflow). `cancel_operation` terminates
-  an operation but touches nothing outside Operator. All others are pure reads.
+- **Side effects.** Exactly two v1 tools change state in the outside world:
+  `prepare_operation` (creates an operation) and `execute_operation` (runs the workflow).
+  `cancel_operation` terminates an operation but touches nothing outside Operator. All
+  others are pure reads of Operator state — with one caveat below.
+- **Lazy expiry.** Every tool that reads or acts on an operation first applies any overdue
+  T08 or T11 transition in the same transaction, so an operation past its deadline always
+  reads as `EXPIRED` regardless of whether a sweeper is running (invariant I9,
+  [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)). "Pure read" therefore means
+  "changes nothing but an already-overdue deadline".
+- **Approval reachability.** An `approval_url` is returned only to callers the transport
+  proves are local. Remote callers get `approval_required`, the operation ID, and
+  human-readable instructions instead (invariant I12, boundary B13).
 
 ---
 
@@ -191,21 +200,42 @@ same checks `prepare_operation` runs, so a model can look before it commits.
 {
   "ready": false,
   "checks": [
-    { "check": "instance_reachable",  "status": "pass" },
-    { "check": "workflow_exists",     "status": "pass" },
-    { "check": "workflow_active",     "status": "pass" },
-    { "check": "definition_unchanged","status": "fail",
+    { "check": "instance_reachable",   "status": "pass" },
+    { "check": "workflow_exists",      "status": "pass" },
+    { "check": "workflow_active",      "status": "pass" },
+    { "check": "definition_unchanged", "status": "fail",
       "code": "DEFINITION_DRIFT",
       "detail": { "registered": "sha256:1a2b…", "live": "sha256:9f8e…" } },
-    { "check": "node_credentials",    "status": "skipped",
-      "detail": "Not evaluated after a prior failure." }
+    { "check": "credential_bindings",  "status": "skipped",
+      "detail": "Not evaluated after a prior failure." },
+    { "check": "credential_validity",  "status": "unverifiable",
+      "code": "CREDENTIAL_VALIDITY_UNVERIFIED",
+      "detail": "Operator verifies that credentials are bound, not that they work." },
+    { "check": "correlation",          "status": "warn",
+      "code": "NO_EXECUTION_CORRELATION",
+      "detail": "This workflow returns no execution ID. Reconciliation after an indeterminate dispatch will be manual." }
   ],
   "checked_at": "2026-08-25T14:03:11Z"
 }
 ```
 
+**Statuses.** `pass`, `fail`, `skipped`, and two non-blocking statuses introduced by
+[ADR-009](adr/ADR-009-dispatch-correlation.md): `warn` (a real capability limitation) and
+`unverifiable` (a condition Operator has no supported mechanism to test). **Only `fail`
+sets `ready: false` and only `fail` produces `BLOCKED`.**
+
 Check codes: `INSTANCE_UNREACHABLE`, `WORKFLOW_MISSING_ON_INSTANCE`, `WORKFLOW_INACTIVE`,
-`DEFINITION_DRIFT`, `MISSING_NODE_CREDENTIALS`.
+`DEFINITION_DRIFT`, `MISSING_NODE_CREDENTIALS`, `CREDENTIAL_VALIDITY_UNVERIFIED`,
+`NO_EXECUTION_CORRELATION`, `UNATTENDED_EXECUTION`.
+
+`MISSING_NODE_CREDENTIALS` reports that a node has no credential **bound**. It is not a
+statement that a bound credential is valid — Operator never makes that claim without a
+supported n8n mechanism that tests it, and reports `CREDENTIAL_VALIDITY_UNVERIFIED` instead.
+A bound-but-expired credential passes preflight and fails at execution.
+
+`UNATTENDED_EXECUTION` is a `warn` emitted for a workflow eligible for T05
+(`side_effects: read_only` **and** `approval: none`): it will run with no human in the loop,
+on the strength of the registry's own classification.
 
 **Errors:** `WORKFLOW_NOT_FOUND`.
 
@@ -226,13 +256,15 @@ nothing. This is the only way to obtain the authority to execute
 | `idempotency_key` | string | no | Client-supplied. Replaying the same key with the same arguments returns the same operation. |
 | `reason` | string | no | Free text shown to the human approver. Advisory only; never affects policy ([ADR-007](adr/ADR-007-deterministic-before-llm.md)). |
 
-**Result — approval required**
+**Result — approval required, local caller** (stdio, or Streamable HTTP on loopback)
 
 ```json
 {
   "operation_id": "op_01JQ…",
   "state": "PENDING_APPROVAL",
   "workflow_id": "crm.sync_contact",
+  "approval_required": true,
+  "approval_instructions": "A human must approve this operation on the Operator machine: run `n8n-operator operations approve op_01JQ…`. You cannot approve it yourself.",
   "approval_url": "http://127.0.0.1:8765/approve/6f3c…",
   "approval_expires_at": "2026-08-25T14:18:11Z",
   "created_at": "2026-08-25T14:03:11Z",
@@ -240,13 +272,34 @@ nothing. This is the only way to obtain the authority to execute
 }
 ```
 
-**Result — auto-approved** (`approval: none`, only legal for `read_only`, registry rule R5)
+**Result — approval required, remote caller** (Streamable HTTP on a non-loopback bind)
+
+```json
+{
+  "operation_id": "op_01JQ…",
+  "state": "PENDING_APPROVAL",
+  "workflow_id": "crm.sync_contact",
+  "approval_required": true,
+  "approval_instructions": "A human must approve this operation on the Operator machine: run `n8n-operator operations approve op_01JQ…`. You cannot approve it yourself.",
+  "approval_expires_at": "2026-08-25T14:18:11Z",
+  "created_at": "2026-08-25T14:03:11Z",
+  "idempotent_replay": false
+}
+```
+
+`approval_url` is **absent** for a remote caller — a loopback address means nothing on the
+caller's machine, and returning one invites a model to report that it "sent the approval
+link" while the operation quietly expires (invariant I12, boundary B13, threat T-38).
+`approval_required` is the field to branch on; the URL is never the signal.
+
+**Result — auto-approved** (T05: `approval: none` **and** `side_effects: read_only`, rule R5)
 
 ```json
 {
   "operation_id": "op_01JQ…",
   "state": "APPROVED",
   "workflow_id": "reports.pipeline_summary",
+  "approval_required": false,
   "execution_deadline": "2026-08-25T14:08:11Z",
   "created_at": "2026-08-25T14:03:11Z",
   "idempotent_replay": false
@@ -277,13 +330,25 @@ nothing. This is the only way to obtain the authority to execute
 
 `INVALID` and `BLOCKED` are **results, not errors** — the call succeeded and produced a
 governed, audited outcome. Only failures to *interpret the request at all*
-(`WORKFLOW_NOT_FOUND`, `IDEMPOTENCY_KEY_CONFLICT`) are errors.
+(`WORKFLOW_NOT_FOUND`, `IDEMPOTENCY_CONFLICT`) and refusals to record it
+(`ARGUMENTS_TOO_LARGE`) are errors.
 
-The approval URL is a convenience for the human, not a capability for the model:
-the client cannot approve by fetching it (boundary B4).
+`ARGUMENTS_TOO_LARGE` is deliberately an error rather than an `INVALID` operation: recording
+the request is the thing being refused, so no operation row is written
+([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md), invariant I10). The limit is
+enforced in the core over the canonical serialization, so it is identical over stdio,
+Streamable HTTP, and the CLI (boundary B12).
 
-**Errors:** `WORKFLOW_NOT_FOUND`, `WORKFLOW_DISABLED`, `IDEMPOTENCY_KEY_CONFLICT`,
-`RATE_LIMITED`, `CONCURRENCY_LIMIT_REACHED`, `REGISTRY_UNAVAILABLE`.
+**Idempotency namespace.** A key is scoped to
+`(principal, environment, workflow_id, idempotency_key)`. The same key under a different
+workflow is a different namespace and yields an independent operation; the same namespace
+and key with different arguments is `IDEMPOTENCY_CONFLICT`.
+
+The approval URL, where present, is a convenience for the human, not a capability for the
+model: the client cannot approve by fetching it (boundary B4).
+
+**Errors:** `WORKFLOW_NOT_FOUND`, `WORKFLOW_DISABLED`, `IDEMPOTENCY_CONFLICT`,
+`ARGUMENTS_TOO_LARGE`, `RATE_LIMITED`, `CONCURRENCY_LIMIT_REACHED`, `REGISTRY_UNAVAILABLE`.
 
 ---
 
@@ -315,8 +380,9 @@ Current state of one operation. The intended polling tool while awaiting approva
 }
 ```
 
-Arguments are echoed **post-redaction**. An expired operation reads as `EXPIRED` even if
-no sweeper has run yet (ARCHITECTURE section 8).
+Arguments are echoed **post-redaction**. An expired operation reads as `EXPIRED` even if no
+sweeper has ever run: this call applies any overdue T08 or T11 transition in the same
+transaction before evaluating state (invariant I9, ARCHITECTURE section 8).
 
 **Errors:** `OPERATION_NOT_FOUND`.
 
@@ -355,7 +421,8 @@ external side effect.**
   "state": "UNKNOWN",
   "code": "DISPATCH_INDETERMINATE",
   "message": "The request was sent but the outcome could not be confirmed. It may or may not have taken effect. Do not retry: verify the downstream system, then prepare a new operation if needed.",
-  "started_at": "2026-08-25T14:05:40Z"
+  "started_at": "2026-08-25T14:05:40Z",
+  "correlation": { "available": false, "reason": "NO_EXECUTION_CORRELATION" }
 }
 ```
 
@@ -363,6 +430,16 @@ external side effect.**
 retries it, and no transition leads out of it ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md)).
 The message is written to tell a model plainly not to retry, because the model's
 instinct will be to retry.
+
+**Operator never infers that a timed-out dispatch did not run**
+([ADR-009](adr/ADR-009-dispatch-correlation.md)). A timeout means no response arrived inside
+the window — not that nothing happened. There is no error-class check or elapsed-time rule
+that turns this into `FAILED`.
+
+The `correlation` block says whether an n8n execution ID is available for reconciliation.
+For a workflow registered with `trigger.correlation: response_envelope` that returned one,
+it reads `{"available": true, "execution_id": "1042"}`. `execution_id` is an n8n *execution*
+identifier, not a workflow identifier, and does not breach boundary B5.
 
 **Errors:** `OPERATION_NOT_FOUND`, `APPROVAL_REQUIRED`, `OPERATION_EXPIRED`,
 `OPERATION_CANCELED`, `HANDLE_INVALID`, `HANDLE_ALREADY_USED`, `ARGUMENT_MISMATCH`,
@@ -507,12 +584,19 @@ No prompts are exposed in v1 (BUILD_PLAN section 7.1).
 Normative. Implemented once in `errors.py`; adapters map these to MCP tool errors, CLI
 exit codes, or HTTP status without inventing new codes.
 
+> **Superseded spelling.** Phase 0 spelled the idempotency error
+> `IDEMPOTENCY_KEY_CONFLICT`. The normative code is `IDEMPOTENCY_CONFLICT` — the conflict is
+> between requests within a namespace, not between keys
+> ([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)). The old spelling must not
+> appear in code, tests, or documentation; check D11 enforces its absence.
+
 | Code | Meaning | Model's correct next move |
 |---|---|---|
 | `WORKFLOW_NOT_FOUND` | No such registry ID (also returned for workflows that exist on n8n but are unregistered). | Call `list_workflows`. |
 | `WORKFLOW_DISABLED` | Registered but `enabled: false`. | Ask the operator; do not retry. |
 | `INVALID_ARGUMENTS` | Tool arguments failed the tool's own schema. | Fix the call shape. |
-| `IDEMPOTENCY_KEY_CONFLICT` | Key reused with different arguments. | Use a new key, or reuse the original arguments. |
+| `IDEMPOTENCY_CONFLICT` | Key reused **within the same namespace** (principal, environment, workflow) with different arguments. | Use a new key, or reuse the original arguments. |
+| `ARGUMENTS_TOO_LARGE` | Canonical argument size exceeds the effective limit. No operation was created. | Send less data; the limit is reported in `details`. Do not split a side-effecting call to evade it. |
 | `OPERATION_NOT_FOUND` | Unknown operation ID. | Call `list_operations`. |
 | `APPROVAL_REQUIRED` | Execute attempted while `PENDING_APPROVAL`. | Wait; poll `get_operation`. Do not retry in a tight loop. |
 | `OPERATION_EXPIRED` | Approval or execution window elapsed. | Prepare a new operation. |
@@ -524,7 +608,7 @@ exit codes, or HTTP status without inventing new codes.
 | `DEFINITION_DRIFT` | Live definition differs from the registered hash. | Stop. This needs an operator, not a retry. |
 | `WORKFLOW_INACTIVE` | Workflow is deactivated in n8n. | Ask the operator. |
 | `WORKFLOW_MISSING_ON_INSTANCE` | Registered, but absent from n8n. | Ask the operator. |
-| `MISSING_NODE_CREDENTIALS` | A node lacks credentials on the instance. | Ask the operator. |
+| `MISSING_NODE_CREDENTIALS` | A node has no credential **bound** on the instance. Says nothing about whether a bound credential is valid. | Ask the operator. |
 | `INSTANCE_UNREACHABLE` | n8n did not respond. | Retry later at human pace; do not loop. |
 | `DISPATCH_INDETERMINATE` | Sent, outcome unconfirmed; operation is `UNKNOWN`. | **Never retry.** Verify downstream, then decide. |
 | `RATE_LIMITED` | Registry rate limit exceeded. | Back off; the limit is per-workflow. |
@@ -563,8 +647,12 @@ Contract changes to v1 tools in v2:
 - Results are filtered by the caller's RBAC scope. An unauthorized workflow returns
   `WORKFLOW_NOT_FOUND`, never `FORBIDDEN` — authorization must not be an enumeration
   oracle.
-- `retry_operation` returns a **new** `operation_id` with `parent_operation_id` set.
-  It never revives the original ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md)).
+- `retry_operation` returns a **new** `operation_id` with `parent_operation_id` set. It
+  never revives the original, and it never reuses the original's approval: validation,
+  preflight, and approval are all recalculated against the snapshot in force at retry time
+  ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md),
+  [ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md), invariant I11). A
+  `read_only` retry reaching `APPROVED` via T05 is recalculation, not reuse.
 
 ---
 

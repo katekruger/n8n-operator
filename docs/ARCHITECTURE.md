@@ -21,6 +21,10 @@ Three commitments shape every structural decision:
 3. **Every decision leaves a record before it takes effect.** State transition,
    event row, and audit row commit in one transaction. If the audit write fails, the
    transition did not happen.
+4. **Correctness does not depend on a process being up.** Expiry is applied lazily inside
+   the transaction that reads or acts on an operation, so no deployment topology can make
+   an expired approval executable ([ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
+   Sweepers and maintenance commands improve audit-timeline fidelity, never safety.
 
 ---
 
@@ -142,45 +146,76 @@ client → mcp/tools.prepare_operation
        → core.service.prepare_operation
            1. resolve workflow_id in the active registry snapshot   ─ ADR-002
               └ miss → WORKFLOW_NOT_FOUND (no operation created)
-           2. idempotency lookup on (principal, idempotency_key)     ─ I8
+           2. canonicalize arguments; size check vs effective limit  ─ ADR-011 · I10 · B12
+              └ over  → ARGUMENTS_TOO_LARGE (nothing persisted)
+           3. idempotency lookup on the namespace                    ─ I8
+              (principal, environment, workflow_id, idempotency_key)
               └ hit + same fingerprint  → return existing operation
-              └ hit + other fingerprint → IDEMPOTENCY_KEY_CONFLICT
-           3. T01 → PREPARING  (operation row + event + audit, one txn)
-           4. registry.validation: args vs JSON Schema 2020-12
+              └ hit + other fingerprint → IDEMPOTENCY_CONFLICT
+           4. T01 → PREPARING  (operation row + event + audit, one txn)
+           5. registry.validation: args vs JSON Schema 2020-12
               └ fail → T02 INVALID (errors carry JSON-Pointer paths)
-           5. n8n.preflight: reachable · active · definition hash · credentials
-              └ fail → T03 BLOCKED (finding recorded)
-           6. approval policy from the registry entry
-              ├ required          → T04 PENDING_APPROVAL + approval token + URL
+           6. n8n.preflight: reachable · active · definition hash ·
+              credential bindings · correlation                      ─ ADR-009
+              └ fail  → T03 BLOCKED (finding recorded)
+              └ warn / unverifiable → recorded, does not block
+           7. approval policy from the registry entry
+              ├ required          → T04 PENDING_APPROVAL + approval token
               └ none + read_only  → T05 APPROVED + execution deadline
-       → shaped result: {operation_id, state, approval_url?, deadlines}
+           8. caller locality decides approval delivery              ─ ADR-010 · I12 · B13
+              ├ local  → approval_required + instructions + approval_url
+              └ remote → approval_required + instructions (no URL)
+       → shaped result: {operation_id, state, approval_required,
+                         approval_instructions, approval_url?, deadlines}
 ```
 
-Steps 4 and 5 are the point of the product: nothing reaches n8n until the arguments
-are provably schema-valid, and nothing is offered for approval until the target is
-provably the workflow that was registered.
+Steps 5 and 6 are the point of the product: nothing reaches n8n until the arguments are
+provably schema-valid, and nothing is offered for approval until the target is provably the
+workflow that was registered. Step 2 precedes the write deliberately — an oversized payload
+is refused before it can be persisted, which is what makes threat T-12 a real mitigation
+rather than a transport-dependent one.
 
 ### 4.2 Approve (out-of-band, never MCP)
 
+Two channels, one core use case ([ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
+
+**Canonical — the CLI, on the Operator machine:**
+
+```
+human → n8n-operator operations show op_01JQ…      render: workflow, title, risk,
+                                                   side-effect class, full arguments,
+                                                   drift status, deadline
+      → n8n-operator operations approve op_01JQ…   T06 → APPROVED
+      → n8n-operator operations reject  op_01JQ…   T07 → REJECTED
+```
+
+**Convenience — the loopback approval page, when one is running:**
+
 ```
 human → browser → 127.0.0.1 approval app
-       GET  /approve/{token}   render: workflow, title, risk, side-effect class,
-                                       full arguments, drift status, deadline
+       GET  /approve/{token}   render: the same decision surface
        POST /approve/{token}   T06 → APPROVED   (token verified, burned, TTL checked)
        POST /reject/{token}    T07 → REJECTED
 ```
 
-The token is delivered in the `prepare` result as a URL, but possessing the URL is not
-authority — a human must act on the page. No MCP tool can reach these routes
-(boundary B4). The page shows the arguments verbatim, so a human sees exactly what a
-manipulated model asked for.
+Both call `core.service`, so neither is a second implementation of policy, and both are
+outside the MCP channel — there is still no tool that approves (boundary B4). The CLI is
+canonical because it works in every v1 topology, including headless and remote-HTTP
+deployments where no browser can reach loopback.
+
+Where a URL is issued, possessing it is not authority: a human must act. `GET` renders and
+grants nothing; approval is a `POST` with a CSRF token. Both surfaces show the arguments
+verbatim, so a human sees exactly what a manipulated model asked for.
 
 ### 4.3 Execute
 
 ```
 client → mcp/tools.execute_operation(operation_id, handle)
        → core.service.execute_operation
-           1. load operation; state must be APPROVED         else APPROVAL_REQUIRED
+           0. apply any overdue T08/T11 in this transaction   ─ ADR-010 · I9
+           1. load operation; state must be APPROVED          else APPROVAL_REQUIRED
+                                                              (EXPIRED after step 0 →
+                                                               OPERATION_EXPIRED)
            2. verify handle binding: principal + workflow + argument fingerprint  ─ I5
            3. now <= execution_deadline                       else OPERATION_EXPIRED
            4. re-check definition hash against live n8n       else DEFINITION_DRIFT  ─ B8
@@ -190,8 +225,11 @@ client → mcp/tools.execute_operation(operation_id, handle)
            7. dispatch to n8n with the registry timeout, no retry  ─ ADR-005
            8. outcome →  success       T13 SUCCEEDED
                          error         T14 FAILED
-                         indeterminate T15 UNKNOWN
-           9. persist redacted, size-capped result
+                         indeterminate T15 UNKNOWN            ─ ADR-009
+                         (never inferred to be a non-event)
+           9. unwrap the response envelope, if declared;
+              record n8n execution ID where present           ─ ADR-009
+          10. persist redacted, size-capped result
        → shaped result
 ```
 
@@ -201,6 +239,13 @@ workflow *X* does not authorize running whatever now sits at *X*'s ID.
 Step 6 commits `EXECUTING` **before** the network call. If the process dies mid-flight,
 recovery finds an operation stuck in `EXECUTING` and resolves it to `UNKNOWN` — it never
 finds an approved operation of undetermined disposition.
+
+Step 8 is where the temptation lives. A timeout means no response arrived inside the
+window; it does not mean nothing happened. There is no code path that reads an exception
+class or an elapsed time and concludes the workflow did not run
+([ADR-009](adr/ADR-009-dispatch-correlation.md)). Step 9 is what makes an `UNKNOWN`
+reconcilable *when the workflow was authored to support it* — and its absence costs
+reconciliation, never safety.
 
 ---
 
@@ -214,7 +259,8 @@ finds an approved operation of undetermined disposition.
 | API key / webhook secret | Env or keyring | **never** | Resolved at startup, held in memory, scrubbed from logs (ADR-006). |
 | Tool arguments | Client (untrusted) | echoed back | Schema-validated, fingerprinted, redacted before persistence. |
 | Operation handle | Server | yes | Opaque `op_<ULID>`; carries no authority by itself until bound and approved (ADR-003). |
-| Approval token | Server | yes, as a URL | Single-use, TTL-bounded, stored only as a hash. |
+| Approval token | Server | as a URL, **local callers only** | Single-use, TTL-bounded, stored only as a hash. Withheld from remote callers (I12, B13). |
+| n8n execution ID | n8n, via the response envelope | yes, in `correlation` | An *execution* identifier, not a workflow identifier; used for reconciliation and debugging (ADR-009). |
 | Execution result | n8n (untrusted) | yes | Redacted, size-capped, structurally shaped. |
 | Audit record | Server | only via `audit://` and CLI export | Append-only, hash-chained. |
 
@@ -241,6 +287,12 @@ Table definitions are in BUILD_PLAN section 8.1.
   compare-and-set, not a read-then-write (I4).
 - Every mutation of `operations` carries `state_version` as an optimistic-concurrency
   guard; a stale version aborts the transaction rather than overwriting.
+- Every read of, and action on, an operation applies any overdue T08 or T11 first, in the
+  same transaction, and writes its event and audit rows like any other transition — lazy
+  expiry is a real transition, not a display convention (I9). It is idempotent and
+  race-safe under the `state_version` guard.
+- The canonical argument size is checked before the `operations` row is written, so an
+  oversized payload never reaches the database (I10).
 - SQLite runs in WAL mode with a busy timeout; concurrency correctness never relies on
   SQLite's single-writer behavior, because Postgres will not provide it.
 
@@ -269,6 +321,8 @@ malformed or incomplete configuration is a startup failure, never a runtime surp
 | `N8N_OPERATOR_HTTP_BEARER_TOKEN` | unset | Required for non-loopback HTTP. |
 | `N8N_OPERATOR_HTTP_ALLOWED_ORIGINS` | unset | Required for non-loopback HTTP. |
 | `N8N_OPERATOR_REQUEST_TIMEOUT_SECONDS` | `60` | Ceiling; per-workflow `limits` may lower it. |
+| `N8N_OPERATOR_MAX_ARGUMENT_BYTES` | `262144` | Server ceiling on canonical argument size. `limits.max_argument_bytes` may lower it per workflow, never raise it (rule R11, ADR-011). |
+| `N8N_OPERATOR_APPROVAL_URL_EXPOSURE` | `auto` | `auto` includes an approval URL for local callers only; `never` suppresses it everywhere. It can never force exposure to a remote caller (I12). |
 | `N8N_OPERATOR_LOG_LEVEL` | `INFO` | Structured JSON logs with secret scrubbing. |
 
 ---
@@ -281,12 +335,31 @@ v1 runs as one to three processes over one SQLite database:
 |---|---|---|
 | MCP stdio server | `n8n-operator serve stdio` | Spawned per client session by the MCP host. |
 | MCP HTTP server | `n8n-operator serve http` | Long-running, optional. |
-| Approval app | `n8n-operator serve approval` | Long-running whenever approvals are in use. |
+| Approval app | `n8n-operator serve approval` | Long-running, **optional** — the CLI is the canonical approval channel (ADR-010). |
 
-Expiry (T08, T11) is handled by a sweeper that runs inside the approval app and,
-defensively, as a lazy check on every operation read — so an expired operation reads as
-`EXPIRED` even when no sweeper has run. Deployment topology is intentionally boring in
-v1: no queue, no worker pool, no scheduler.
+### 8.1 Expiry
+
+**Lazy transactional expiry is authoritative.** Every read of, and action on, an operation
+applies any overdue T08 or T11 before evaluating state, in the same transaction (invariant
+I9). No expired operation can be executed in any topology, because the act of executing it
+expires it first.
+
+Two optional mechanisms improve the *timing* of the audit record, never the safety:
+
+| Mechanism | Role |
+|---|---|
+| Sweeper inside the approval app | Best-effort. Writes `EXPIRED` near the wall-clock deadline instead of at next touch. Nothing depends on it. |
+| `n8n-operator operations expire` | Explicit maintenance, for cron or a systemd timer in deployments that run no approval app. |
+
+**The stdio-only consequence.** With no approval app and no scheduled maintenance command,
+an operation that expires is still *treated* as expired the instant anything touches it,
+but its `EXPIRED` audit event carries the timestamp of that touch rather than of the
+deadline — and an operation nobody touches again may never receive one. This is a fidelity
+limitation of the audit timeline, not of safety, and it is recorded in BUILD_PLAN section
+9.5 so it is never discovered as a surprise gap in an audit export.
+
+Deployment topology is otherwise intentionally boring in v1: no queue, no worker pool, no
+scheduler.
 
 ---
 
@@ -316,6 +389,9 @@ Designed in now, unimplemented until their version:
 | Approval as a policy object, not a boolean | N-of-M quorum | v2 |
 | Registry snapshots as content-addressed documents | Compiled workflow sources | v3 |
 | `definition_hash` canonicalization | Structural diffs and the evaluation lab | v2 / v3 |
+| `AuditAnchor` interface (`publish` / `verify`, content-free anchors) | External audit anchoring: signed local file and authenticated HTTPS webhook in v2; KMS, transparency log, WORM in v3 ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md)) | v2 / v3 |
+| `trigger.correlation` on registry entries | Exact-ID reconciliation of `UNKNOWN` operations, as audit annotations only ([ADR-009](adr/ADR-009-dispatch-correlation.md)) | v2 |
+| Canonicalization exclusion allowlist (versioned, evidence-backed) | Narrowing false drift as the compatibility harness proves fields cosmetic ([ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)) | v1 phase 4 onward |
 
 ---
 

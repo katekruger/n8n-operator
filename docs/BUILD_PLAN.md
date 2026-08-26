@@ -59,15 +59,17 @@ Five capabilities, in order of the lifecycle:
 | P2 | **Deterministic before LLM** | Every gate that can be a schema check, a hash comparison, or a state transition is one. The model is never the enforcement mechanism. See [ADR-007](adr/ADR-007-deterministic-before-llm.md). |
 | P3 | **The client never holds credentials** | n8n API keys and webhook secrets are server-owned, never returned by a tool, never in the registry file. See [ADR-006](adr/ADR-006-server-owned-n8n-credentials.md). |
 | P4 | **Side effects are capability-gated** | Execution requires a single-use, server-issued operation handle bound to exact arguments. See [ADR-003](adr/ADR-003-operation-handles.md). |
-| P5 | **Approval is out-of-band** | Humans approve in a local browser page, not through an MCP tool a compromised client could call. |
+| P5 | **Approval is out-of-band** | Humans approve through the CLI (canonical) or the local approval page (convenience), never through an MCP tool a compromised client could call. See [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md). |
 | P6 | **No silent repetition** | v1 never retries automatically. Ambiguous outcomes are surfaced as `UNKNOWN`. See [ADR-005](adr/ADR-005-no-automatic-retry-v1.md). |
 | P7 | **Everything is auditable** | Every state transition and every decision is an append-only, hash-chained audit record. |
 | P8 | **Portable core** | Protocol and transport are adapters around a transport-agnostic domain core. See [ADR-001](adr/ADR-001-portable-mcp-core.md). |
+| P9 | **Never claim more than is known** | Unverifiable conditions are reported as unverifiable, indeterminate outcomes stay indeterminate, and no gate is weakened by an assumption that has not been demonstrated. See [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md), [ADR-009](adr/ADR-009-dispatch-correlation.md). |
 
 ### 1.5 Primary users
 
 - **The operator** — the person who owns the n8n instance, curates the registry,
-  and approves side-effecting runs. Interacts via CLI and the local approval page.
+  and approves side-effecting runs. Interacts via the CLI, which is the canonical
+  approval channel, and optionally the local approval page (ADR-010).
 - **The agent** — an MCP client (Claude, ChatGPT, Codex, or any compatible host)
   acting on behalf of the operator. Interacts only via MCP tools.
 - **The auditor** (v2+) — reviews what ran, on whose authority, with what arguments.
@@ -89,7 +91,8 @@ v1 is done when a solo operator can, without writing code:
   over Streamable HTTP;
 - have malformed arguments rejected with actionable errors before n8n is touched;
 - be told, before approving, that a workflow has drifted from its registered definition;
-- approve or reject a pending operation in a local browser page;
+- approve or reject a pending operation from the CLI on the Operator machine, or in the
+  local approval page when one is running;
 - execute the approved operation exactly once, even if the client retries;
 - read a redacted failure trace good enough to diagnose the failing node;
 - export a complete audit log of everything that happened.
@@ -149,10 +152,15 @@ The table is normative. An em dash means the capability does not exist in that v
 | Registry | YAML file, hand-authored | YAML + per-environment overlays | YAML + compiled sources |
 | Workflow inspection | Read-only | Read-only + definition diffs | Read-only + diffs + evaluations |
 | Input validation | JSON Schema 2020-12 | Same + policy predicates | Same + compiler-derived schemas |
-| Preflight | Reachability, active, drift, credentials | Same + environment policy | Same + evaluation freshness |
-| Approval | Single human, local page | N-of-M team approvals, routed | Same + policy-driven quorum |
-| Idempotency | Client key + argument fingerprint | Same, scoped per organization | Same |
-| Retries | **None, ever** (ADR-005) | Governed, explicit, new operation | Same |
+| Preflight | Reachability, active, drift, credential *bindings*, correlation warning | Same + environment policy | Same + evaluation freshness |
+| Approval | Single human; CLI canonical, local page optional | N-of-M team approvals, routed | Same + policy-driven quorum |
+| Approval delivery | `approval_required` + operation ID + instructions; URL only to local callers | Routed notification (`request_approval`) | Same |
+| Idempotency | Namespaced by principal + environment + workflow + key | Same, with real principals and environments | Same |
+| Argument limits | Core-enforced canonical size cap | Same + per-principal quotas | Same |
+| Dispatch correlation | Opt-in response envelope; absence degrades reconciliation only | Same + exact-ID reconciliation | Same |
+| Expiry | Lazy transactional (authoritative) + best-effort sweeper | Same | Same |
+| Retries | **None, ever** (ADR-005) | Governed, explicit, new operation, recalculated (ADR-012) | Same |
+| Audit anchoring | — | `AuditAnchor`: signed local file, HTTPS webhook | + KMS, transparency log, WORM |
 | Audit | Append-only hash chain, local | Same + export, retention | Same + compliance evidence packs |
 | Monitoring | Health tool + structured logs | Metrics, alerting hooks | Same + SLOs |
 | Workflow editing | **None** | **None** | Governed compile/plan/apply |
@@ -203,7 +211,12 @@ n8n-operator/
 │       ├── ADR-004-sqlite-to-postgres.md
 │       ├── ADR-005-no-automatic-retry-v1.md
 │       ├── ADR-006-server-owned-n8n-credentials.md
-│       └── ADR-007-deterministic-before-llm.md
+│       ├── ADR-007-deterministic-before-llm.md
+│       ├── ADR-008-conservative-definition-canonicalization.md
+│       ├── ADR-009-dispatch-correlation.md
+│       ├── ADR-010-approval-delivery-and-expiry.md
+│       ├── ADR-011-argument-limits-and-idempotency.md
+│       └── ADR-012-governed-retry-and-audit-anchoring.md
 ├── examples/
 │   └── registry/
 │       └── workflows.example.yaml  # annotated sample registry
@@ -265,11 +278,13 @@ n8n-operator/
 │               ├── __init__.py
 │               ├── registry.py     # validate, list, show, hash, reload
 │               ├── serve.py        # serve stdio | serve http | serve approval
-│               ├── operations.py   # list, show, cancel
+│               ├── operations.py   # list, show, cancel, expire
 │               ├── audit.py        # verify, export
 │               └── db.py           # init, migrate, status
 └── tests/
     ├── conftest.py
+    ├── fixtures/
+    │   └── canonicalization/       # sanitized harness fixtures (ADR-008)
     ├── unit/                       # pure logic, no I/O
     ├── property/                   # Hypothesis invariants (section 10.2)
     ├── contract/                   # MCP tool schema + error taxonomy contracts
@@ -319,17 +334,17 @@ emits exactly one `operation_events` row and one `audit_log` row.
 | T02 | `PREPARING` | `INVALID` | Argument validation fails | — |
 | T03 | `PREPARING` | `BLOCKED` | Preflight fails | — |
 | T04 | `PREPARING` | `PENDING_APPROVAL` | Validation + preflight pass | Registry `approval` is `required`. Sets `approval_expires_at`. |
-| T05 | `PREPARING` | `APPROVED` | Validation + preflight pass | Registry `approval` is `none` **and** `side_effects` is `read_only`. Sets `execution_deadline`. |
+| T05 | `PREPARING` | `APPROVED` | Validation + preflight pass | Registry `approval` is `none` **and** `side_effects` is `read_only` — both required, evaluated against the snapshot in force now. Sets `execution_deadline`. Preflight emits an `UNATTENDED_EXECUTION` warning (ADR-009). |
 | T06 | `PENDING_APPROVAL` | `APPROVED` | Human approves in the approval app | Approval token valid, unexpired, single-use. Sets `execution_deadline`. |
 | T07 | `PENDING_APPROVAL` | `REJECTED` | Human rejects | Approval token valid and unexpired. |
-| T08 | `PENDING_APPROVAL` | `EXPIRED` | Clock | `now > approval_expires_at`. |
+| T08 | `PENDING_APPROVAL` | `EXPIRED` | Lazy transactional expiry on any read or action; best-effort sweeper; `operations expire` | `now > approval_expires_at`. Applied before state is evaluated (invariant I9, [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)). |
 | T09 | `PENDING_APPROVAL` | `CANCELED` | `cancel_operation` | Caller is the originating principal. |
 | T10 | `APPROVED` | `EXECUTING` | `execute_operation` | Handle valid, unburned, argument fingerprint matches, `now <= execution_deadline`, definition hash still matches. Burns the handle. |
-| T11 | `APPROVED` | `EXPIRED` | Clock | `now > execution_deadline`. |
+| T11 | `APPROVED` | `EXPIRED` | Lazy transactional expiry on any read or action; best-effort sweeper; `operations expire` | `now > execution_deadline`. Applied before state is evaluated (invariant I9, [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)). |
 | T12 | `APPROVED` | `CANCELED` | `cancel_operation` | Caller is the originating principal. |
 | T13 | `EXECUTING` | `SUCCEEDED` | n8n reports success | — |
 | T14 | `EXECUTING` | `FAILED` | n8n reports error | — |
-| T15 | `EXECUTING` | `UNKNOWN` | Timeout, connection loss, or ambiguous response after dispatch | **No retry.** Recorded for human resolution. |
+| T15 | `EXECUTING` | `UNKNOWN` | Timeout, connection loss, or ambiguous response after dispatch | **No retry**, and never inferred to be a non-event ([ADR-009](adr/ADR-009-dispatch-correlation.md)). Recorded for human resolution. |
 
 There are no other transitions. In particular there is no edge out of any terminal
 state, no `FAILED -> EXECUTING`, and no edge out of `UNKNOWN` (a v2 governed retry
@@ -383,8 +398,20 @@ Enforced in code and verified by property tests (section 10.2):
 - **I6** — Every state change appends one `operation_events` row and one `audit_log`
   row, in the same database transaction as the state change.
 - **I7** — An operation in `UNKNOWN` is never automatically acted upon.
-- **I8** — Two `prepare_operation` calls with the same `(principal, idempotency_key)`
-  return the same operation, never two.
+- **I8** — Two `prepare_operation` calls sharing an idempotency namespace
+  `(principal, environment, workflow_id, idempotency_key)` return the same operation,
+  never two ([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)).
+- **I9** — No operation is read or acted upon in a state whose deadline has already
+  passed: any overdue T08 or T11 is applied first, in the same transaction
+  ([ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
+- **I10** — No operation is persisted whose canonical arguments exceed the effective
+  size limit; the check precedes the write
+  ([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)).
+- **I11** — An approval decision authorizes exactly one operation. No operation inherits,
+  extends, or reuses another operation's approval
+  ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md)).
+- **I12** — An approval URL is never returned to a caller that cannot reach it
+  ([ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
 
 ---
 
@@ -440,6 +467,7 @@ workflows:                         # required; list, may be empty
 | `path` | string | yes | Path component only, e.g. `/webhook/abc123`. Base URL comes from server config, never the registry. |
 | `auth` | enum | yes | `none` / `header` / `basic`. |
 | `secret_ref` | string | conditional | Required when `auth` is not `none`. An **indirect reference** to a secret (e.g. `env:N8N_WEBHOOK_TOKEN_CRM`). A literal secret in this field is a load-time error (ADR-006). |
+| `correlation` | enum | no | `none` (default) / `response_envelope`. Declares whether the workflow returns the Operator response envelope carrying an n8n execution ID. `none` is fully executable but has reduced reconciliation and debugging capability, reported by preflight as `NO_EXECUTION_CORRELATION` ([ADR-009](adr/ADR-009-dispatch-correlation.md)). |
 
 ### 6.4 `output`
 
@@ -458,6 +486,7 @@ workflows:                         # required; list, may be empty
 | `execution_ttl_seconds` | integer | `defaults.execution_ttl_seconds` | `APPROVED` lifetime before `EXPIRED`. |
 | `max_concurrent` | integer | `1` | Concurrent `EXECUTING` operations for this workflow. |
 | `rate_limit_per_minute` | integer | `null` | Optional ceiling on executions per minute. |
+| `max_argument_bytes` | integer | server ceiling | Per-workflow cap on the canonical argument size. May lower the server ceiling `N8N_OPERATOR_MAX_ARGUMENT_BYTES`, never raise it (rule R11, [ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)). |
 
 ### 6.6 Load-time validation rules
 
@@ -477,6 +506,8 @@ a bad registry never degrades into a partially-live allowlist.
 | R8 | `trigger.path` is a path, not an absolute URL, and contains no host component. |
 | R9 | Every JSONPath in `output.redact` parses. |
 | R10 | `risk: high` requires `approval: required`, which `defaults` may not weaken. |
+| R11 | `limits.max_argument_bytes`, when present, is a positive integer not greater than the server ceiling `N8N_OPERATOR_MAX_ARGUMENT_BYTES`. |
+| R12 | `trigger.correlation` is one of `none` / `response_envelope`, and `response_envelope` is only valid for `trigger.type: webhook`. |
 
 ### 6.7 Snapshots
 
@@ -486,6 +517,30 @@ Every operation records the snapshot it was prepared against, so an audit reader
 reconstruct exactly which contract was in force. Reloading is explicit
 (`n8n-operator registry reload` or process restart); the registry is never re-read
 mid-operation.
+
+### 6.8 Definition canonicalization
+
+`definition_hash` is taken over a canonicalized form of the n8n workflow definition. The
+canonicalization is deliberately **conservative**: it drops only what has been proven not
+to matter, because over-exclusion produces a silent false negative — a semantic change the
+drift check does not notice. Rationale and the compatibility harness are in
+[ADR-008](adr/ADR-008-conservative-definition-canonicalization.md); these seven rules are
+normative.
+
+| Rule | Statement |
+|---|---|
+| CAN-01 | **Inclusion by default.** Every field of the definition contributes to the canonical form unless it appears on the exclusion allowlist. Unrecognized and newly-introduced fields are included. |
+| CAN-02 | **Exclusion requires proof.** A field joins the allowlist only after the phase-4 compatibility harness shows that varying it, all else equal, does not alter observable workflow behavior. |
+| CAN-03 | **The allowlist is explicit.** An enumerated, versioned table in code; each entry records the field path, the justifying harness run, and the n8n version range covered. No wildcards or pattern families. |
+| CAN-04 | **Deterministic serialization.** Keys sorted by code point, array order significant, strings NFC-normalized, one canonical number form, UTF-8, no insignificant whitespace. Canonicalization is idempotent. |
+| CAN-05 | **Semantic changes must change the hash.** Node type, node parameters, credential bindings, connections, workflow settings, trigger configuration, and error-handling configuration are never excludable. |
+| CAN-06 | **Only proven-cosmetic changes may preserve the hash.** Hash preservation requires a CAN-02-justified allowlist entry. There is no third category. |
+| CAN-07 | **Canonicalization is versioned.** The algorithm version is part of the hash preimage. Changing it requires a new registry `apiVersion` and a deliberate re-hash, never a silent revaluation of existing entries. |
+
+Phase 4 ships with an **empty exclusion allowlist**; entries are added one at a time as the
+harness justifies them. Every harness run saves a sanitized fixture under
+`tests/fixtures/canonicalization/` (instance URLs, credential identifiers, real workflow
+IDs, and payload data stripped).
 
 ---
 
@@ -503,8 +558,8 @@ tools exist in which version.
 | `describe_workflow` | Discover | none | Full contract for one workflow: description, input schema, limits, approval policy, output shape. |
 | `get_instance_health` | Discover | none | Reachability and version of the configured n8n instance. No credentials returned. |
 | `validate_input` | Validate | none | Check arguments against a workflow's input schema; returns structured, path-anchored errors. |
-| `preflight_workflow` | Validate | none | Liveness, active status, definition-drift, and node-credential checks, without creating an operation. |
-| `prepare_operation` | Lifecycle | creates an operation | Validate + preflight + mint an operation handle. Returns `PENDING_APPROVAL` (with an approval URL) or `APPROVED`, `INVALID`, or `BLOCKED`. |
+| `preflight_workflow` | Validate | none | Liveness, active status, definition-drift, credential-*binding* and correlation checks, without creating an operation. Non-blocking `warn` and `unverifiable` statuses report reduced capability without refusing ([ADR-009](adr/ADR-009-dispatch-correlation.md)). |
+| `prepare_operation` | Lifecycle | creates an operation | Validate + preflight + mint an operation handle. Returns `PENDING_APPROVAL` (with `approval_required`, the operation ID, and human instructions; an approval URL only for local callers — invariant I12) or `APPROVED`, `INVALID`, or `BLOCKED`. |
 | `get_operation` | Lifecycle | none | Current state, timestamps, deadlines, and approval status of one operation. |
 | `execute_operation` | Lifecycle | **runs the workflow** | Burn the handle and dispatch to n8n. The only side-effecting tool in the product. |
 | `cancel_operation` | Lifecycle | cancels | Move a `PENDING_APPROVAL` or `APPROVED` operation to `CANCELED`. |
@@ -595,7 +650,8 @@ portability rules that make the v2 migration mechanical are in
 | Column | Type | Notes |
 |---|---|---|
 | `id` | text PK | `op_<ULID>` — the operation handle (ADR-003). |
-| `principal_id` | text FK | |
+| `principal_id` | text FK | Explicit in v1, where it is always the single `local` principal. |
+| `environment` | text | Explicit in v1, where it is always `default`. Part of the idempotency namespace (ADR-011). |
 | `snapshot_id` | text FK | Registry contract in force. |
 | `workflow_id` | text | |
 | `definition_hash` | text | Hash observed at prepare time. |
@@ -603,7 +659,8 @@ portability rules that make the v2 migration mechanical are in
 | `state_version` | integer | Optimistic-concurrency guard; incremented on every transition. |
 | `arguments` | json | Redacted per `output.redact` before persistence. |
 | `argument_fingerprint` | text | sha256 over canonical JSON of the *unredacted* arguments. |
-| `idempotency_key` | text null | Client-supplied. |
+| `argument_bytes` | integer | Size of the canonical argument serialization, checked against the effective limit before this row is written (I10). |
+| `idempotency_key` | text null | Client-supplied. Namespaced by `(principal_id, environment, workflow_id, idempotency_key)`. |
 | `handle_burned_at` | timestamptz null | Non-null exactly once (I4). |
 | `approval_expires_at` | timestamptz null | |
 | `execution_deadline` | timestamptz null | |
@@ -611,9 +668,12 @@ portability rules that make the v2 migration mechanical are in
 | `parent_operation_id` | text null FK | v2 governed retries link here. |
 | `created_at`, `updated_at` | timestamptz | |
 
-Constraints: a unique index on `(principal_id, idempotency_key)` where
-`idempotency_key IS NOT NULL` enforces I8. The handle burn is a conditional update
-(`... WHERE handle_burned_at IS NULL`) whose affected-row count is checked, enforcing I4.
+Constraints: a unique index on
+`(principal_id, environment, workflow_id, idempotency_key)` where
+`idempotency_key IS NOT NULL` enforces I8 over the namespace defined in
+[ADR-011](adr/ADR-011-argument-limits-and-idempotency.md). The handle burn is a conditional
+update (`... WHERE handle_burned_at IS NULL`) whose affected-row count is checked,
+enforcing I4.
 
 **`operation_events`** — append-only transition log.
 
@@ -718,6 +778,8 @@ operator and a potentially-manipulated agent.
 | B9 | B: transport | stdio is the default. The Streamable HTTP transport binds to loopback by default; a non-loopback bind requires an explicit bearer token and `Origin` allowlist (DNS-rebinding defense) and refuses to start otherwise. |
 | B10 | B: approval app | Bound to `127.0.0.1` only, never configurable to a public interface in v1. Approval tokens are single-use, TTL-bounded, and stored only as hashes. |
 | B11 | B: audit | Append-only. No update or delete statement against `audit_log` exists in the codebase; a contract test greps for one. |
+| B12 | A to B: argument volume | A core-enforced cap on the canonical argument size, applied identically for every adapter and **before** persistence. Transport limits remain as defense in depth ([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)). |
+| B13 | B to A: approval reachability | An approval URL is returned only to callers the transport proves are local. Remote callers receive `approval_required`, the operation ID, and instructions instead of an address they cannot reach (invariant I12, [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)). |
 
 ### 9.3 The confused-deputy problem
 
@@ -741,9 +803,21 @@ Accepted, documented, not mitigated in v1:
 
 - A compromised operator machine defeats everything below it.
 - n8n itself is trusted; Operator does not sandbox what a workflow does once dispatched.
-- A human who approves without reading the approval page defeats the human gate.
+- A human who approves without reading the arguments defeats the human gate, whichever
+  approval channel they use.
 - `UNKNOWN` outcomes require a human to check the downstream system. There is no
-  automatic reconciliation.
+  automatic reconciliation, and Operator never infers that a timed-out dispatch did not
+  run ([ADR-009](adr/ADR-009-dispatch-correlation.md)).
+- A workflow registered with `trigger.correlation: none` cannot be reconciled by execution
+  ID. It remains executable; preflight reports the limitation before approval.
+- Preflight reports credential **bindings**, not credential validity. A bound but expired
+  or revoked credential passes preflight and fails at execution.
+- In a stdio-only deployment with no approval app and no scheduled
+  `n8n-operator operations expire`, an `EXPIRED` audit event is written when the operation
+  is next touched rather than at its deadline, and an operation nobody touches again may
+  never get one. No expired operation is ever executed — lazy transactional expiry is
+  authoritative (invariant I9) — so this is a limitation of audit *timeline fidelity*,
+  not of safety.
 
 ---
 
@@ -773,8 +847,19 @@ The invariants worth generating inputs for:
   key reordering or insignificant whitespace does not change the fingerprint (I5).
 - **Fingerprint sensitivity** — for any two structurally different JSON values, the
   fingerprints differ.
-- **Idempotency** — for any pair of `prepare` calls sharing `(principal, key)`, one
-  operation exists afterwards (I8).
+- **Idempotency** — for any pair of `prepare` calls sharing a namespace
+  `(principal, environment, workflow_id, key)`, one operation exists afterwards; differing
+  in any namespace component yields two (I8).
+- **Argument limits** — for any payload whose canonical serialization exceeds the effective
+  limit, no operation row is written and the error is `ARGUMENTS_TOO_LARGE` (I10).
+- **Lazy expiry** — for any operation and any clock position past its deadline, every read
+  and every action observes `EXPIRED`, and the transition is recorded exactly once (I9).
+- **Canonicalization conservatism** — for any definition and any field *not* on the
+  exclusion allowlist, changing that field changes the hash (CAN-01, CAN-05); for any
+  allowlisted field, changing it does not (CAN-06).
+- **Canonicalization idempotence** — canonicalizing a canonical form is a no-op (CAN-04).
+- **Approval-URL reachability** — for any result produced for a non-local caller, no
+  loopback URL appears anywhere in the serialization (I12).
 - **Redaction totality** — for any payload and any registered redaction path, no
   redacted value appears anywhere in the serialized output, including nested and
   array positions.
@@ -794,9 +879,17 @@ The invariants worth generating inputs for:
 - Every error returned by a tool belongs to the documented taxonomy in MCP_TOOLS.md.
 - `core/` imports nothing from `mcp/`, `cli/`, `approval/`, `fastapi`, or `typer`.
 - No SQL `UPDATE` or `DELETE` targets `audit_log`.
+- No code path transitions out of `UNKNOWN`, and none infers non-execution from a timeout
+  (ADR-009).
+- No code path reuses, transfers, or extends another operation's approval (I11).
+- The argument-size check is enforced in `core/`, not in an adapter (B12).
+- The canonicalization exclusion allowlist is an explicit enumerated table; no wildcard or
+  regex entry exists (CAN-03).
+- Every ADR from ADR-001 to ADR-012 exists, carries a Status and a Decision, and is
+  referenced by at least one normative document.
 - `scripts/check_docs_consistency.py` passes: state names, transition IDs, tool
-  inventory, and the repository tree in section 4 agree across all documents and the
-  actual filesystem.
+  inventory, canonicalization rules, the error taxonomy, ADR wiring, and the repository
+  tree in section 4 agree across all documents and the actual filesystem.
 
 ### 10.4 Gates
 
@@ -843,22 +936,26 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
 ### 11.3 Lifecycle
 
 - **AC-08** — `prepare_operation` on a `side_effects: external_write` workflow returns
-  `PENDING_APPROVAL`, an operation handle, and a loopback approval URL.
+  `PENDING_APPROVAL`, an operation handle, `approval_required: true`, and human-readable
+  approval instructions. A loopback approval URL is included only for a local caller
+  (AC-31).
 - **AC-09** — `execute_operation` on a `PENDING_APPROVAL` operation is refused with
   `APPROVAL_REQUIRED`, and the operation stays in `PENDING_APPROVAL`.
-- **AC-10** — After approval in the local page, `execute_operation` dispatches exactly
-  once; a second call with the same handle returns `HANDLE_ALREADY_USED` and dispatches
-  nothing (verified by the mock n8n request count).
-- **AC-11** — Two `prepare_operation` calls with the same `idempotency_key` and the same
-  arguments return the same operation ID. The same key with *different* arguments
-  returns `IDEMPOTENCY_KEY_CONFLICT`.
-- **AC-12** — An operation left unapproved past `approval_ttl_seconds` is `EXPIRED`,
-  and `execute_operation` on it returns `OPERATION_EXPIRED`.
+- **AC-10** — After approval through the CLI (and, separately, through the local page),
+  `execute_operation` dispatches exactly once; a second call with the same handle returns
+  `HANDLE_ALREADY_USED` and dispatches nothing (verified by the mock n8n request count).
+- **AC-11** — Two `prepare_operation` calls in the same idempotency namespace with the same
+  key and the same arguments return the same operation ID. The same namespace and key with
+  *different* arguments returns `IDEMPOTENCY_CONFLICT` (ADR-011).
+- **AC-12** — An operation left unapproved past `approval_ttl_seconds` is `EXPIRED` on the
+  next read or action even with no sweeper running, and `execute_operation` on it returns
+  `OPERATION_EXPIRED` (invariant I9).
 - **AC-13** — A workflow whose definition changes between approval and execution is
   refused at execute with `DEFINITION_DRIFT`; nothing is dispatched.
 - **AC-14** — A `read_only` workflow with `approval: none` goes `PREPARING -> APPROVED`
-  and executes without human interaction. A non-`read_only` workflow with
-  `approval: none` fails registry load (R5).
+  (T05) and executes without human interaction, with preflight reporting
+  `UNATTENDED_EXECUTION`. A non-`read_only` workflow with `approval: none` fails registry
+  load (R5). Both conditions are required for T05; neither alone suffices.
 
 ### 11.4 Failure handling
 
@@ -878,8 +975,9 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
   and `get_execution_log`, including in nested and array positions.
 - **AC-20** — The Streamable HTTP transport refuses to start on a non-loopback bind
   without a bearer token and `Origin` allowlist.
-- **AC-21** — The approval endpoint rejects a reused token, an expired token, and a
-  token for an operation not in `PENDING_APPROVAL`.
+- **AC-21** — Both approval channels reject a reused token, an expired token, and a
+  decision on an operation not in `PENDING_APPROVAL`; the CLI and the approval page write
+  the identical transition through the same core use case.
 - **AC-22** — `audit verify` passes on a clean database and identifies the exact
   sequence number after a single row is mutated.
 
@@ -891,6 +989,37 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
   resulting schema matches the ORM metadata (autogenerate produces an empty diff).
 - **AC-25** — `n8n-operator audit export` produces a complete, chain-verifiable record
   of every operation.
+
+### 11.7 Canonicalization (ADR-008)
+
+- **AC-26** — Changing any field not on the exclusion allowlist changes `definition_hash`;
+  changing an allowlisted field does not. Verified against the sanitized fixtures in
+  `tests/fixtures/canonicalization/` (CAN-01, CAN-05, CAN-06).
+- **AC-27** — A definition carrying a field the canonicalizer has never seen still
+  contributes to the hash — unknown fields are included, not dropped (CAN-01).
+- **AC-28** — Every exclusion-allowlist entry names a field path, a justifying harness run,
+  and an n8n version range; a contract test rejects wildcard entries (CAN-03).
+
+### 11.8 Correlation, approval delivery, and limits
+
+- **AC-29** — A workflow with `trigger.correlation: response_envelope` records the returned
+  execution ID; a malformed or absent envelope does not by itself fail the dispatch, and the
+  missing correlation is recorded as a finding (ADR-009).
+- **AC-30** — `preflight_workflow` on a `correlation: none` workflow returns a `warn` with
+  `NO_EXECUTION_CORRELATION`, `ready` remains `true`, and `prepare_operation` does not yield
+  `BLOCKED`. Credential checks report bindings only, never validity, and report
+  `unverifiable` where no n8n validation mechanism exists (ADR-009).
+- **AC-31** — `prepare_operation` over a non-loopback Streamable HTTP bind returns
+  `approval_required`, the operation ID, and instructions, and no loopback URL appears
+  anywhere in the response; over stdio the same call includes `approval_url` (I12, B13).
+- **AC-32** — An operation past its deadline reads as `EXPIRED` from every entry point with
+  no sweeper running, the transition is written exactly once, and
+  `n8n-operator operations expire` is idempotent (I9, ADR-010).
+- **AC-33** — Arguments whose canonical serialization exceeds the effective limit return
+  `ARGUMENTS_TOO_LARGE` and write no operation row, identically over stdio, Streamable HTTP,
+  and the CLI. The same idempotency key under two different workflows produces two
+  independent operations; the same namespace and key with different arguments returns
+  `IDEMPOTENCY_CONFLICT` (I10, I8, B12).
 
 ---
 
@@ -916,21 +1045,40 @@ it touches are updated in the same change.
 - [x] Doc-consistency checker
 - [ ] Repository published to a remote *(deliberately deferred)*
 
+### Phase 0.1 — Architecture-decision closure *(this phase)*
+
+- [x] ADR-008 conservative definition canonicalization (CAN-01 - CAN-07)
+- [x] ADR-009 dispatch correlation, indeterminate outcomes, credential-binding semantics
+- [x] ADR-010 approval delivery (CLI canonical) and lazy transactional expiry
+- [x] ADR-011 core argument limits and idempotency namespaces
+- [x] ADR-012 governed retry recalculation and the `AuditAnchor` interface
+- [x] Invariants I9 - I12, boundary controls B12 - B13, registry rules R11 - R12
+- [x] Acceptance criteria AC-26 - AC-33
+- [x] Threats T-38 - T-41; T-12 reclassified
+- [x] BUILD_PLAN, ARCHITECTURE, THREAT_MODEL, WORKFLOW_REGISTRY, MCP_TOOLS updated
+- [x] Doc-consistency checker extended (D10 - D12) and contract tests added
+
 ### Phase 1 — Configuration and storage foundation
 
-- [ ] `config.py`: settings model, env loading, secret indirection, startup validation
-- [ ] `errors.py`: the full error taxonomy from MCP_TOOLS.md
-- [ ] `storage/models.py`: all tables in section 8.1
-- [ ] Alembic initialized; migration `0001_initial` creating the full v1 schema
+- [ ] `config.py`: settings model, env loading, secret indirection, startup validation,
+      `max_argument_bytes` ceiling and approval-URL exposure mode
+- [ ] `errors.py`: the full error taxonomy from MCP_TOOLS.md, including
+      `ARGUMENTS_TOO_LARGE` and `IDEMPOTENCY_CONFLICT` (ADR-011 supersedes the phase-0
+      spelling of the latter)
+- [ ] `storage/models.py`: all tables in section 8.1, with explicit `environment` and
+      `argument_bytes` on `operations` (ADR-011)
+- [ ] Alembic initialized; migration `0001_initial` creating the full v1 schema, including
+      the four-part idempotency unique index
 - [ ] `storage/session.py`, `storage/repository.py` with portable-SQL rules (ADR-004)
 - [ ] `cli db init | migrate | status`
-- [ ] Tests: migration round-trip, autogenerate-is-empty, repository CRUD
+- [ ] Tests: migration round-trip, autogenerate-is-empty, repository CRUD, namespace
+      uniqueness
 
 ### Phase 2 — Registry
 
 - [ ] `registry/schema.py`: Pydantic v2 models for sections 6.1 through 6.5
 - [ ] `registry/loader.py`: parse, canonicalize, hash, snapshot, persist
-- [ ] All load-time rules R1 through R10 (section 6.6) with a named error per rule
+- [ ] All load-time rules R1 through R12 (section 6.6) with a named error per rule
 - [ ] `registry/validation.py`: JSON Schema 2020-12 argument validation with pointer paths
 - [ ] `cli registry validate | list | show | hash | reload`
 - [ ] `examples/registry/workflows.example.yaml` loads clean
@@ -940,21 +1088,30 @@ it touches are updated in the same change.
 
 - [ ] `core/models.py`: domain types
 - [ ] `core/state_machine.py`: section 5.2 as data; transitions applied nowhere else
-- [ ] `core/idempotency.py`: canonical JSON + argument fingerprints
+- [ ] `core/idempotency.py`: canonical JSON, argument fingerprints, namespace resolution,
+      and the core-enforced argument size check (ADR-011, I10)
 - [ ] `core/handles.py`: mint, bind, verify, burn (ADR-003)
 - [ ] `core/redaction.py`: JSONPath redaction, size capping, truncation markers
+- [ ] `core/state_machine.py`: lazy transactional expiry applied before every read and
+      action (ADR-010, I9)
 - [ ] `audit/chain.py` and `audit/writer.py`: hash chain, single writer, verification
 - [ ] `core/service.py`: use cases, transport-agnostic (ADR-001)
-- [ ] Tests: every property in section 10.2; invariants I1 through I8
+- [ ] Tests: every property in section 10.2; invariants I1 through I12
 
 ### Phase 4 — n8n integration
 
 - [ ] `n8n/client.py`: httpx client, explicit timeouts, **no retry logic** (ADR-005)
 - [ ] `n8n/types.py`: response models
-- [ ] `n8n/preflight.py`: reachability, active, definition hash, node credentials
-- [ ] Definition canonicalization and hashing, matching the registry `definition_hash`
+- [ ] `n8n/preflight.py`: reachability, active, definition hash, credential *bindings*,
+      correlation warning; `warn` and `unverifiable` statuses (ADR-009)
+- [ ] Definition canonicalization per CAN-01 - CAN-07, shipping with an **empty** exclusion
+      allowlist (ADR-008)
+- [ ] Empirical compatibility harness (`live_n8n`), version matrix, and the exclusion
+      allowlist table with per-entry evidence
+- [ ] Sanitized fixtures saved to `tests/fixtures/canonicalization/`
+- [ ] Response-envelope parsing for `trigger.correlation: response_envelope`
 - [ ] Mock n8n transport fixture for integration tests
-- [ ] Tests: AC-05, AC-06, AC-07, AC-17
+- [ ] Tests: AC-05, AC-06, AC-07, AC-17, AC-26, AC-27, AC-28, AC-30
 
 ### Phase 5 — MCP adapter
 
@@ -962,32 +1119,38 @@ it touches are updated in the same change.
 - [ ] `mcp/tools.py`: the 12 v1 tools (section 7.1) with Pydantic v2 argument models
 - [ ] `mcp/resources.py`: `registry://workflows`, `audit://operations/{id}`
 - [ ] `mcp/transports.py`: stdio + Streamable HTTP, with the B9 bind guard
-- [ ] Response-shaping allowlist enforcing B5
+- [ ] Response-shaping allowlist enforcing B5, and caller-locality gating for
+      `approval_url` enforcing B13 and invariant I12
 - [ ] `cli serve stdio | serve http`
-- [ ] Tests: contract tests (section 10.3), AC-01, AC-03, AC-04, AC-20, AC-23
+- [ ] Tests: contract tests (section 10.3), AC-01, AC-03, AC-04, AC-20, AC-23, AC-31
 
 ### Phase 6 — Approval
 
-- [ ] `approval/app.py`: FastAPI app, loopback-only bind
+- [ ] `cli operations approve | reject` — the canonical v1 approval channel (ADR-010),
+      rendering workflow, arguments, risk, side-effect class, and drift status
+- [ ] `approval/app.py`: FastAPI app, loopback-only bind — convenience channel
 - [ ] Approval token mint and verify: single-use, TTL, hash-at-rest
 - [ ] Approval page: workflow, arguments, risk, side-effect class, drift status
-- [ ] Approve and reject routes writing T06 and T07
-- [ ] Expiry sweeper writing T08 and T11
+- [ ] Approve and reject routes writing T06 and T07, through the same core use case as
+      the CLI
+- [ ] Best-effort sweeper in the approval app; nothing depends on it
 - [ ] `cli serve approval`
-- [ ] Tests: AC-08, AC-09, AC-12, AC-21
+- [ ] Tests: AC-08, AC-09, AC-12, AC-21, AC-32
 
 ### Phase 7 — Execution and debugging
 
 - [ ] `execute_operation`: handle burn, re-check drift, dispatch, deadline enforcement
-- [ ] Outcome mapping to `SUCCEEDED`, `FAILED`, or `UNKNOWN`
+- [ ] Outcome mapping to `SUCCEEDED`, `FAILED`, or `UNKNOWN`, with no inference that a
+      timed-out dispatch did not run (ADR-009)
+- [ ] Execution-ID capture from the response envelope where declared
 - [ ] `execution_results` persistence with redaction and size capping
 - [ ] `get_execution_result`, `get_execution_log`
 - [ ] `cancel_operation`, `list_operations`, `get_operation`
-- [ ] Tests: AC-10, AC-11, AC-13, AC-14, AC-15, AC-16, AC-19
+- [ ] Tests: AC-10, AC-11, AC-13, AC-14, AC-15, AC-16, AC-19, AC-29, AC-33
 
 ### Phase 8 — Operator surface
 
-- [ ] `cli operations list | show | cancel`
+- [ ] `cli operations list | show | cancel | expire`
 - [ ] `cli audit verify | export`
 - [ ] Structured logging with secret scrubbing
 - [ ] `get_instance_health`
@@ -995,7 +1158,7 @@ it touches are updated in the same change.
 
 ### Phase 9 — v1 hardening and release
 
-- [ ] Full acceptance-criteria pass (AC-01 through AC-25)
+- [ ] Full acceptance-criteria pass (AC-01 through AC-33)
 - [ ] Coverage gates met (section 10.4)
 - [ ] Live-n8n suite green against a Docker instance
 - [ ] README quickstart verified end to end on a clean machine
@@ -1010,10 +1173,14 @@ it touches are updated in the same change.
 - [ ] RBAC over tools, workflows, environments
 - [ ] Multi-environment registry overlays; `list_environments`
 - [ ] Team approvals with quorum; `request_approval`, `get_approval_status`
-- [ ] Governed retries; `retry_operation` (new operation, ADR-005)
+- [ ] Governed retries; `retry_operation` — new operation, full recalculation, no approval
+      reuse (ADR-005, ADR-012, invariant I11)
 - [ ] `diff_workflow_definition`
 - [ ] Monitoring: `get_metrics`, `list_audit_events`, alerting hooks
-- [ ] External audit anchoring
+- [ ] `AuditAnchor` interface plus the signed local anchor file and authenticated HTTPS
+      webhook implementations (ADR-012)
+- [ ] Exact-ID reconciliation annotations for `UNKNOWN` operations that carry an execution
+      ID — annotations only, never a transition (ADR-009, invariant I7)
 
 ### Phase 11 — v3
 
@@ -1023,4 +1190,5 @@ it touches are updated in the same change.
 - [ ] `run_evaluation`, `get_evaluation_report`
 - [ ] Remediation assistant (advisory only)
 - [ ] Template library: `list_templates`, `instantiate_template`
+- [ ] Additional `AuditAnchor` implementations: KMS signing, transparency log, WORM storage
 - [ ] Enterprise controls: SSO enforcement, retention, residency, break-glass, evidence packs

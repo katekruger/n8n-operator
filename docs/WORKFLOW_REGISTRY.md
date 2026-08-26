@@ -4,9 +4,9 @@
 > client, however live it is on the n8n instance ([ADR-002](adr/ADR-002-default-deny-registry.md)).
 >
 > The **normative schema** is [BUILD_PLAN.md](BUILD_PLAN.md) section 6 — field names,
-> types, defaults, and load-time rules R1–R10 live there. This document is the authoring
-> guide: how to register a workflow, how to choose the classifications that drive policy,
-> and how to operate the registry over time.
+> types, defaults, load-time rules R1–R12, and the canonicalization rules CAN-01–CAN-07
+> live there. This document is the authoring guide: how to register a workflow, how to
+> choose the classifications that drive policy, and how to operate the registry over time.
 
 ---
 
@@ -116,6 +116,17 @@ not gate execution on its own, with one exception: `risk: high` forces
 | `external_write` | No (R5). |
 | `irreversible` | No (R5). |
 
+Unattended execution (T05) needs **both** `side_effects: read_only` and `approval: none`.
+Neither alone is enough, and the default stays `approval: required`: you opt into
+unattended running deliberately, per workflow.
+
+When you do, preflight emits an `UNATTENDED_EXECUTION` warning on every check. It is not
+a complaint about your entry — it states the actual trust relationship. Operator has no way
+to read a node graph and confirm that a workflow only reads; it is trusting **your**
+`side_effects` classification, and that classification is the only thing standing between an
+agent and an unsupervised run. This is why section 3.1 asks you to choose the stronger class
+when unsure.
+
 ---
 
 ## 4. Writing `input_schema`
@@ -168,8 +179,7 @@ every number, and `format` where one applies. An unbounded string field is an in
 ## 5. Computing `definition_hash`
 
 The hash pins the n8n workflow definition you reviewed. Operator canonicalizes the
-definition — sorting keys, dropping volatile metadata such as `updatedAt`, node
-positions, and pin data — then takes `sha256` over the canonical JSON.
+definition and takes `sha256` over the canonical form.
 
 ```bash
 n8n-operator registry hash --n8n-workflow-id 7Qx4kLmN2pRstUvW
@@ -178,17 +188,34 @@ n8n-operator registry hash --n8n-workflow-id 7Qx4kLmN2pRstUvW
 
 Paste the output into `definition_hash`.
 
+**Canonicalization is conservative** ([ADR-008](adr/ADR-008-conservative-definition-canonicalization.md),
+rules CAN-01–CAN-07). Every field of the definition contributes to the hash unless it is on
+an explicit exclusion allowlist, and a field joins that allowlist only after an empirical
+harness proves that changing it cannot change what the workflow does. The two failure
+directions are not equal: a hash that is too sensitive costs you a re-review, while a hash
+that is too permissive lets a semantic change through unnoticed and executes a graph nobody
+read.
+
+**What that means for you in practice.** Early versions ship with a small exclusion set —
+possibly empty — so edits you consider cosmetic *may* change the hash. Re-hashing is one
+command. As the harness accumulates evidence, the noisy cases narrow. Expect this to
+improve over time, and do not expect a documented list of "safe" edits until the evidence
+exists to back one.
+
 **When it changes.** Editing the workflow in n8n changes the hash. Every subsequent
 preparation is `BLOCKED` with `DEFINITION_DRIFT`, and any already-approved operation is
-refused at execute (AC-06, AC-13). This is working as intended: the approval you gave
-was for the graph you read.
+refused at execute (AC-06, AC-13). This is working as intended: the approval you gave was
+for the graph you read.
 
 To adopt a change: review the new definition in n8n, re-run `registry hash`, update
-`definition_hash`, bump `version`, and reload. In v2, `diff_workflow_definition` shows
-you a structural diff so the review is a diff review rather than a re-read.
+`definition_hash`, bump `version`, and reload. In v2, `diff_workflow_definition` shows you a
+structural diff so the review is a diff review rather than a re-read.
 
-Cosmetic moves — dragging nodes around the canvas — do not change the hash, because
-positions are dropped during canonicalization.
+**Do not route around drift.** If re-hashing starts to feel like a formality you perform
+without reading, that is the control degrading — say so, and let the harness fix the noise
+at its source. The exclusion allowlist deliberately lives in code, under review, and is not
+configurable per workflow: the person under drift-check pressure must not be able to
+disable the drift check.
 
 ---
 
@@ -242,6 +269,44 @@ sensitive data.
 
 ---
 
+## 7a. Execution correlation
+
+A dispatch that times out leaves the operation `UNKNOWN`, and Operator will never guess
+that it did not run ([ADR-009](adr/ADR-009-dispatch-correlation.md)). What decides whether
+you can *reconcile* that afterwards is whether the workflow tells Operator which n8n
+execution it was.
+
+```yaml
+trigger:
+  type: webhook
+  method: POST
+  path: /webhook/crm-sync-contact
+  auth: header
+  secret_ref: env:N8N_WEBHOOK_TOKEN_CRM
+  correlation: response_envelope     # default: none
+```
+
+To support it, shape the workflow's response node to return the Operator envelope:
+
+```json
+{ "n8n_operator": { "execution_id": "{{ $execution.id }}" },
+  "data": { "…": "whatever your workflow already returns" } }
+```
+
+Operator unwraps `n8n_operator`, records the execution ID, and passes `data` through
+redaction and shaping as the result. Your own consumers see `data` unchanged.
+
+**Declaring `none` is fine.** The workflow stays fully executable and nothing is blocked.
+What you give up is stated honestly rather than hidden: reconciliation after an `UNKNOWN`
+is manual, and `get_execution_log` has less to show. Preflight reports this as a
+non-blocking `warn` with code `NO_EXECUTION_CORRELATION`, so an approver sees the limitation
+*before* deciding.
+
+Add the envelope to anything where a duplicate or a lost execution would be expensive to
+sort out — which is, in practice, exactly your `irreversible` workflows.
+
+---
+
 ## 8. Limits
 
 ```yaml
@@ -251,6 +316,7 @@ limits:
   execution_ttl_seconds: 120   # how long an approval stays executable
   max_concurrent: 1            # concurrent EXECUTING operations
   rate_limit_per_minute: 10
+  max_argument_bytes: 8192     # optional; may only lower the server ceiling
 ```
 
 Set `execution_ttl_seconds` short. It is the window between "a human approved this" and
@@ -262,6 +328,14 @@ produces `UNKNOWN`, which requires a human to go check the downstream system, so
 over-tight timeout converts slow successes into manual work ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md)).
 
 `max_concurrent: 1` is the right default for anything that writes.
+
+`max_argument_bytes` caps the canonical size of the arguments a caller may submit. The
+server ceiling (`N8N_OPERATOR_MAX_ARGUMENT_BYTES`, 256 KiB by default) always applies; this
+field may lower it for one workflow and may never raise it (rule R11,
+[ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)). Set it tight where you know the
+shape of a valid call — a reporting workflow taking two dates has no business receiving a
+megabyte. Oversized arguments are refused with `ARGUMENTS_TOO_LARGE` before anything is
+persisted.
 
 ---
 
@@ -318,7 +392,12 @@ Before adding an entry:
 - [ ] No literal secret appears anywhere in the entry.
 - [ ] `output.redact` covers every sensitive path in a realistic result.
 - [ ] `execution_ttl_seconds` is minutes, not hours.
+- [ ] `max_argument_bytes` reflects the largest call I actually expect.
+- [ ] If a duplicate or lost run would be expensive, the workflow returns the correlation
+      envelope and the entry declares `correlation: response_envelope`.
 - [ ] If it is not `read_only`, it requires approval — and I am willing to be paged for it.
+- [ ] If it *is* `approval: none`, I accept that Operator is trusting my `read_only`
+      classification with no human in the loop.
 - [ ] `n8n-operator registry validate` passes.
 
 ---
@@ -345,6 +424,7 @@ Before adding an entry:
       path: /webhook/send-customer-email
       auth: header
       secret_ref: env:N8N_WEBHOOK_TOKEN_COMMS
+      correlation: response_envelope   # irreversible: reconciliation must be exact
     input_schema:
       type: object
       additionalProperties: false
@@ -375,11 +455,16 @@ Before adding an entry:
       execution_ttl_seconds: 120
       max_concurrent: 1
       rate_limit_per_minute: 5
+      max_argument_bytes: 16384
     tags: [comms, customer-facing]
 ```
 
-Every choice here follows from `irreversible`: approval is mandatory, the execution
-window is two minutes, concurrency is one, the rate limit is low, and the description
-tells the model to get explicit human confirmation of the body *before* preparing —
-belt and braces alongside the approval page, which will show the human the exact body
-anyway.
+Every choice here follows from `irreversible`: approval is mandatory, the execution window
+is two minutes, concurrency is one, the rate limit is low, arguments are capped near the
+schema's own maximum, and the description tells the model to get explicit human confirmation
+of the body *before* preparing — belt and braces alongside the approval surface, which will
+show the human the exact body anyway.
+
+`correlation: response_envelope` matters most here. If a dispatch times out on a workflow
+that sends email, "did it send?" is the only question that matters, and an execution ID is
+what lets anyone answer it.

@@ -14,6 +14,11 @@ webhook path, or a raw request body — impossible by schema, not by check (boun
 Results pass through an allowlist projection, so a new internal field is invisible by
 default rather than leaked by default (boundary B5).
 
+``approval_url`` is gated on caller locality: it is returned only over stdio or a
+loopback-bound Streamable HTTP listener. Remote callers receive ``approval_required``, the
+operation ID, and human-readable instructions instead of an address they cannot reach
+(invariant I12, boundary B13, ADR-010).
+
 Phase 5 (BUILD_PLAN section 12).
 """
 

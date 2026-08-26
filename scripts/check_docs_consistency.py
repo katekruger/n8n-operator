@@ -16,10 +16,18 @@ D4  The v1 tool inventory is consistent: the count claimed in the heading matche
     table, MCP_TOOLS.md documents exactly those tools, and no tool is invented elsewhere.
 D5  v2 and v3 inventory arithmetic holds (12 + 8 = 20, 20 + 8 = 28).
 D6  Acceptance criteria AC-01..AC-25 are each defined once, and every reference resolves.
-D7  Invariants I1-I8, boundary controls B1-B11, and registry rules R1-R10 are each
-    defined, and every reference resolves.
+D7  Invariants I1-I12, boundary controls B1-B13, registry rules R1-R12, and threat IDs
+    are each defined, and every reference resolves.
 D8  Every relative Markdown link between documents resolves to a real file.
 D9  The repository tree published in BUILD_PLAN section 4 matches the filesystem.
+D10 Canonicalization rules CAN-01..CAN-07 are defined in BUILD_PLAN section 6.8, and
+    every reference resolves (ADR-008).
+D11 The error taxonomy is closed: every code a tool declares is defined in MCP_TOOLS
+    section 4, every preflight check code is a taxonomy code or a declared check-only
+    code, and the superseded spelling IDEMPOTENCY_KEY_CONFLICT survives only where the
+    supersession itself is documented (ADR-011).
+D12 Every ADR exists, carries a Status and a Decision, and is referenced by at least one
+    normative document -- no ADR is orphaned (ADR-008..ADR-012).
 
 Exit code 0 means consistent; 1 means at least one contradiction, printed to stdout.
 """
@@ -47,7 +55,33 @@ ADRS = [
     "ADR-005-no-automatic-retry-v1.md",
     "ADR-006-server-owned-n8n-credentials.md",
     "ADR-007-deterministic-before-llm.md",
+    "ADR-008-conservative-definition-canonicalization.md",
+    "ADR-009-dispatch-correlation.md",
+    "ADR-010-approval-delivery-and-expiry.md",
+    "ADR-011-argument-limits-and-idempotency.md",
+    "ADR-012-governed-retry-and-audit-anchoring.md",
 ]
+
+NORMATIVE_DOCS = [
+    "BUILD_PLAN.md",
+    "ARCHITECTURE.md",
+    "THREAT_MODEL.md",
+    "WORKFLOW_REGISTRY.md",
+    "MCP_TOOLS.md",
+]
+
+# Preflight check codes that are findings rather than errors, so they are legitimately
+# absent from the error taxonomy (ADR-009).
+CHECK_ONLY_CODES = {
+    "CREDENTIAL_VALIDITY_UNVERIFIED",
+    "NO_EXECUTION_CORRELATION",
+    "UNATTENDED_EXECUTION",
+}
+
+# The phase-0 spelling superseded by ADR-011. Permitted only where the supersession is
+# what is being documented.
+SUPERSEDED_ERROR_CODE = "IDEMPOTENCY_KEY_CONFLICT"
+SUPERSESSION_DOCS = {"ADR-011-argument-limits-and-idempotency.md", "MCP_TOOLS.md"}
 
 REQUIRED_DOCS = [BUILD_PLAN, ARCHITECTURE, THREAT_MODEL, WORKFLOW_REGISTRY, MCP_TOOLS] + [
     DOCS / "adr" / name for name in ADRS
@@ -242,9 +276,9 @@ for path, text in all_docs.items():
 # --------------------------------------------------------------------------- D6
 ac_block = section(plan, "## 11. Acceptance criteria", "## 12. Progress checklist")
 defined_ac = set(re.findall(r"\*\*(AC-\d\d)\*\*", ac_block))
-expected_ac = {f"AC-{n:02d}" for n in range(1, 26)}
+expected_ac = {f"AC-{n:02d}" for n in range(1, 34)}
 if defined_ac != expected_ac:
-    fail("D6", f"acceptance criteria {sorted(defined_ac)} != expected AC-01..AC-25")
+    fail("D6", f"acceptance criteria {sorted(defined_ac)} != expected AC-01..AC-33")
 
 for path, text in all_docs.items():
     for used in set(re.findall(r"\b(AC-\d\d)\b", text)):
@@ -253,22 +287,22 @@ for path, text in all_docs.items():
 
 # --------------------------------------------------------------------------- D7
 inv_block = section(plan, "### 5.4 Invariants", "## 6. Workflow registry schema")
-defined_inv = set(re.findall(r"\*\*(I\d)\*\*", inv_block))
-expected_inv = {f"I{n}" for n in range(1, 9)}
+defined_inv = set(re.findall(r"\*\*(I\d+)\*\*", inv_block))
+expected_inv = {f"I{n}" for n in range(1, 13)}
 if defined_inv != expected_inv:
-    fail("D7", f"invariants {sorted(defined_inv)} != expected I1-I8")
+    fail("D7", f"invariants {sorted(defined_inv)} != expected I1-I12")
 
 b_block = section(plan, "### 9.2 Boundary controls", "### 9.3")
 defined_b = set(re.findall(r"^\| (B\d+) \|", b_block, re.MULTILINE))
-expected_b = {f"B{n}" for n in range(1, 12)}
+expected_b = {f"B{n}" for n in range(1, 14)}
 if defined_b != expected_b:
-    fail("D7", f"boundary controls {sorted(defined_b)} != expected B1-B11")
+    fail("D7", f"boundary controls {sorted(defined_b)} != expected B1-B13")
 
 r_block = section(plan, "### 6.6 Load-time validation rules", "### 6.7 Snapshots")
 defined_r = set(re.findall(r"^\| (R\d+) \|", r_block, re.MULTILINE))
-expected_r = {f"R{n}" for n in range(1, 11)}
+expected_r = {f"R{n}" for n in range(1, 13)}
 if defined_r != expected_r:
-    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R10")
+    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R12")
 
 for path, text in all_docs.items():
     for used in set(re.findall(r"\b(?:invariant |invariants )(I\d+)\b", text)):
@@ -346,6 +380,103 @@ for root, suffix in ((REPO_ROOT / "src", ".py"), (DOCS, ".md")):
                 f"{actual.relative_to(REPO_ROOT)}",
             )
 
+# --------------------------------------------------------------------------- D10
+can_block = section(plan, "### 6.8 Definition canonicalization", "\n---\n")
+defined_can = set(re.findall(r"^\| (CAN-\d\d) \|", can_block, re.MULTILINE))
+expected_can = {f"CAN-{n:02d}" for n in range(1, 8)}
+if defined_can != expected_can:
+    fail("D10", f"canonicalization rules {sorted(defined_can)} != expected CAN-01..CAN-07")
+
+for path, text in all_docs.items():
+    for used in set(re.findall(r"\b(CAN-\d\d)\b", text)):
+        if used not in expected_can:
+            fail("D10", f"{path.name} references undefined canonicalization rule {used}")
+
+# The conservative direction must be stated, not merely implied: inclusion by default and
+# a ban on excluding semantic categories are what make T-39 mitigated.
+if "Inclusion by default" not in can_block:
+    fail("D10", "CAN-01 must state inclusion by default (ADR-008)")
+if "never excludable" not in can_block:
+    fail("D10", "CAN-05 must state that semantic categories are never excludable (ADR-008)")
+
+# --------------------------------------------------------------------------- D11
+taxonomy_block = section(mcp_text, "## 4. Error taxonomy", "### 4.1 Error shape")
+taxonomy_codes = set(re.findall(r"^\| `([A-Z][A-Z_]+)` \|", taxonomy_block, re.MULTILINE))
+
+for required in ("IDEMPOTENCY_CONFLICT", "ARGUMENTS_TOO_LARGE"):
+    if required not in taxonomy_codes:
+        fail("D11", f"error taxonomy is missing {required} (ADR-011)")
+
+# Every code a tool declares under **Errors:** must exist in the taxonomy.
+for line in mcp_text.splitlines():
+    if not line.startswith("**Errors:**") and not line.startswith("`DEFINITION_DRIFT`"):
+        continue
+    if not line.startswith("**Errors:**"):
+        continue
+    for code in re.findall(r"`([A-Z][A-Z_]+)`", line):
+        if code not in taxonomy_codes:
+            fail("D11", f"MCP_TOOLS declares error `{code}` that the taxonomy does not define")
+
+# Multi-line **Errors:** continuations: scan the whole doc for backticked codes that look
+# like error codes and are neither taxonomy nor declared check-only codes.
+# `REDACTED` is a literal value; `FORBIDDEN` is named in MCP_TOOLS precisely to say it is
+# never returned (authorization must not be an enumeration oracle); the superseded
+# idempotency spelling has its own dedicated check further down.
+KNOWN_NON_ERROR_CODES = {"REDACTED", "FORBIDDEN", SUPERSEDED_ERROR_CODE}
+for code in set(re.findall(r"`([A-Z][A-Z_]{6,})`", mcp_text)):
+    if code in taxonomy_codes or code in CHECK_ONLY_CODES or code in KNOWN_NON_ERROR_CODES:
+        continue
+    if code in declared_states:
+        continue
+    fail("D11", f"MCP_TOOLS mentions code `{code}` that is neither a taxonomy nor a check code")
+
+# Preflight check codes resolve to the taxonomy or the check-only set.
+check_codes_line = re.search(r"Check codes: (.+?)\.\n", mcp_text, re.DOTALL)
+if not check_codes_line:
+    fail("D11", "could not locate the preflight check-code list in MCP_TOOLS section 2.5")
+else:
+    for code in re.findall(r"`([A-Z][A-Z_]+)`", check_codes_line.group(1)):
+        if code not in taxonomy_codes and code not in CHECK_ONLY_CODES:
+            fail(
+                "D11", f"preflight check code `{code}` is neither a taxonomy nor a check-only code"
+            )
+
+# The superseded spelling survives only where the supersession is documented.
+for path, text in all_docs.items():
+    if SUPERSEDED_ERROR_CODE not in text:
+        continue
+    if path.name not in SUPERSESSION_DOCS:
+        fail(
+            "D11",
+            f"{path.name} uses the superseded error code {SUPERSEDED_ERROR_CODE}; "
+            f"the normative spelling is IDEMPOTENCY_CONFLICT (ADR-011)",
+        )
+        continue
+    for match in re.finditer(SUPERSEDED_ERROR_CODE, text):
+        window = text[max(0, match.start() - 400) : match.end() + 400].lower()
+        if "supersed" not in window:
+            fail(
+                "D11",
+                f"{path.name} uses {SUPERSEDED_ERROR_CODE} outside a supersession note",
+            )
+
+# --------------------------------------------------------------------------- D12
+normative_text = "\n".join(
+    all_docs[DOCS / name] for name in NORMATIVE_DOCS if (DOCS / name) in all_docs
+)
+for adr_name in ADRS:
+    adr_path = DOCS / "adr" / adr_name
+    adr_text = all_docs[adr_path]
+    adr_id = adr_name[:7]  # "ADR-008"
+    if "- **Status:**" not in adr_text:
+        fail("D12", f"{adr_name} has no Status line")
+    if "\n## Decision" not in adr_text:
+        fail("D12", f"{adr_name} has no Decision section")
+    if "\n## Consequences" not in adr_text:
+        fail("D12", f"{adr_name} has no Consequences section")
+    if adr_id not in normative_text:
+        fail("D12", f"{adr_id} is orphaned: no normative document references it")
+
 # --------------------------------------------------------------------------- report
 if failures:
     print(f"Documentation consistency: {len(failures)} problem(s)\n")
@@ -358,7 +489,10 @@ print(f"  transitions  {len(defined_transitions)}  (T01-T15)")
 print(f"  v1 tools     {len(v1_tools)}")
 print(f"  v2 tools     {len(v2_tools)} (20 total)")
 print(f"  v3 tools     {len(v3_tools)} (28 total)")
-print(f"  criteria     {len(defined_ac)}  (AC-01-AC-25)")
+print(f"  criteria     {len(defined_ac)}  (AC-01-AC-33)")
 print(f"  invariants   {len(defined_inv)}  boundaries {len(defined_b)}  rules {len(defined_r)}")
+print(f"  canon rules  {len(defined_can)}  (CAN-01-CAN-07)")
+print(f"  error codes  {len(taxonomy_codes)} in the taxonomy, {len(CHECK_ONLY_CODES)} check-only")
+print(f"  ADRs         {len(ADRS)} present, structured, and referenced")
 print(f"  tree entries {len(declared_paths)} verified against the filesystem")
 sys.exit(0)

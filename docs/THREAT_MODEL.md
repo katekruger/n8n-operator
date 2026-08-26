@@ -1,7 +1,7 @@
 # n8n Operator — Threat Model
 
 > Scope: v1 as specified in [BUILD_PLAN.md](BUILD_PLAN.md). Trust zones and boundary
-> controls (B1–B11) are normative there in section 9; this document derives the threats
+> controls (B1–B13) are normative there in section 9; this document derives the threats
 > those controls exist to answer, states what is *not* mitigated, and records what
 > changes in v2 and v3.
 >
@@ -87,7 +87,7 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 | T-09 | Information disclosure | Caller extracts credentials, instance URL, or n8n IDs from a tool result. | Critical | Response-shaping allowlist; secrets never enter result objects; property test asserts non-appearance (B5, AC-18). | mitigated |
 | T-10 | Information disclosure | Caller enumerates unregistered workflows by probing IDs and reading distinct errors. | Medium | `WORKFLOW_NOT_FOUND` is returned identically for unregistered and nonexistent IDs (AC-01). | mitigated |
 | T-11 | Denial of service | Caller floods `prepare_operation` or `execute_operation`. | Medium | Per-workflow `max_concurrent` and `rate_limit_per_minute`; `RATE_LIMITED` and `CONCURRENCY_LIMIT_REACHED`. | partial |
-| T-12 | Denial of service | Caller exhausts disk by preparing operations with huge argument payloads. | Medium | Tool argument size cap at the transport; results capped by `output.max_bytes`. Argument caps are transport-level in v1. | partial |
+| T-12 | Denial of service | Caller exhausts disk by preparing operations with huge argument payloads. | Medium | Core-enforced cap on the canonical argument size, applied identically for every adapter and **before** persistence; transport caps remain as defense in depth; results capped by `output.max_bytes`. B12, invariant I10, [ADR-011](adr/ADR-011-argument-limits-and-idempotency.md). | mitigated |
 | T-13 | Repudiation | Caller denies having requested an action. | High | Every transition writes an `operation_events` row and a hash-chained `audit_log` row in the same transaction (I6). B11. | mitigated |
 | T-14 | Spoofing | Caller claims to be a different principal. | High | v1 has exactly one local principal; there is nothing to spoof. Becomes real in v2 with OIDC. | accepted (v1 by design) |
 
@@ -102,6 +102,7 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 | T-19 | Tampering | The approval page shows different arguments than those that will execute. | Critical | The page renders the exact stored arguments; the same fingerprint gates execution (I5). | mitigated |
 | T-20 | Elevation | Human approves without reading — "approval fatigue" turns the gate into a rubber stamp. | High | Page leads with risk, side-effect class, and full arguments; drift is shown prominently. Ultimately a human factor. | partial |
 | T-21 | Information disclosure | Approval page leaks PII to a shoulder-surfer or browser history. | Medium | Tokens in the path are single-use and short-lived; arguments render redacted per `output.redact`. | partial |
+| T-38 | Spoofing / Denial of service | A remote MCP client is handed a `127.0.0.1` approval URL. The model reports that it "sent the link", the human follows an address that resolves to nothing on their own machine, and the operation silently expires unapproved — or, worse, the URL reaches something else listening on that port on the caller's host. | Medium | `approval_url` is returned only to callers the transport proves are local; remote callers receive `approval_required`, the operation ID, and CLI instructions. B13, invariant I12, [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md), AC-31. | mitigated |
 
 ### 5.3 TB3 — Operator to n8n
 
@@ -109,11 +110,14 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 |---|---|---|---|---|---|
 | T-22 | Information disclosure | Credentials are committed to source control in the registry file. | Critical | `secret_ref` must be an indirect reference; a literal secret is a load-time error (rule R6, [ADR-006](adr/ADR-006-server-owned-n8n-credentials.md)). | mitigated |
 | T-23 | Information disclosure | Credentials leak into logs or the database. | High | Secrets held in memory only; structured logging scrubs configured secret values; no secret column exists in any table. B7. | mitigated |
-| T-24 | Tampering | The workflow is modified in n8n between registration and use. | Critical | `definition_hash` checked at preflight; `BLOCKED` on drift (AC-06). | mitigated |
+| T-24 | Tampering | The workflow is modified in n8n between registration and use. | Critical | `definition_hash` checked at preflight; `BLOCKED` on drift (AC-06). Coverage depends on canonicalization being conservative — see T-39. | mitigated |
 | T-25 | Tampering | The workflow is modified between **approval** and **execution** — the TOCTOU window that matters. | Critical | Hash re-checked at execute; `DEFINITION_DRIFT` and nothing is dispatched (B8, AC-13). | mitigated |
 | T-26 | Spoofing | Operator is pointed at an attacker-controlled n8n instance. | High | Instance URL comes from validated config, never from a tool argument or the registry; TLS verification is not disableable. | mitigated |
 | T-27 | Denial of service | A hung n8n exhausts Operator's connections. | Medium | Explicit connect and read timeouts on every request; no unbounded waits; no retries (ADR-005). | mitigated |
 | T-28 | Elevation | A registered workflow does more than its description claims — a benign title over a destructive graph. | Critical | `definition_hash` pins *what was reviewed*. Operator cannot read intent from a node graph; the operator must review before registering. v3 evaluation lab narrows this. | partial |
+| T-39 | Tampering | **Canonicalization excludes a field that turns out to be behaviourally significant.** A semantic change to the workflow then preserves the hash, the drift check passes, and Operator executes a graph nobody reviewed — silently defeating B8, T-24, and T-25 at once. | Critical | Inclusion by default; a field is excluded only after an empirical harness proves it cannot alter behavior; the allowlist is explicit, enumerated, evidence-bearing and version-scoped; semantic categories are never excludable; phase 4 ships with an empty allowlist. CAN-01 - CAN-07, [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md), AC-26 - AC-28. | mitigated |
+| T-40 | Repudiation | An indeterminate dispatch cannot be reconciled, because the workflow returns no execution identifier — so whether the side effect occurred is unrecoverable from Operator's records. | Medium | Opt-in response envelope carries the n8n execution ID; preflight reports `NO_EXECUTION_CORRELATION` as a non-blocking `warn` **before** approval, so the limitation is visible when it can still be fixed. [ADR-009](adr/ADR-009-dispatch-correlation.md), AC-29, AC-30. | partial |
+| T-41 | Spoofing | Preflight reports a credential check as passing and an operator reads it as "the credential works", approving on false assurance when the credential is bound but expired or revoked. | Medium | The check is named and worded for bindings only; validity is reported `unverifiable` with `CREDENTIAL_VALIDITY_UNVERIFIED` rather than `pass`, and Operator never asserts validity without a supported n8n mechanism that tests it. [ADR-009](adr/ADR-009-dispatch-correlation.md), AC-30. | mitigated |
 
 ### 5.4 TB4 — n8n results returning into the trusted zone
 
@@ -146,10 +150,11 @@ with no intent at all, doing the wrong thing confidently.
 | L-01 | **Indirect prompt injection.** The model reads hostile content and is steered into calling a destructive workflow. | The model can only reach registered workflows (T-01), only with schema-valid arguments (T-03), and — for anything with side effects — only after a human outside the model's channel approved *these* arguments (T-07, T-19). Injection can produce a *request*; it cannot produce an *approval*. |
 | L-02 | **Tool-description poisoning.** Hostile text in a workflow title or description manipulates the model. | Titles and descriptions are operator-authored in the registry, never fetched from n8n at runtime. The registry is the only source of tool-adjacent text. |
 | L-03 | **Confused deputy.** The model borrows Operator's credentials for something it should not do. | Authority is enumerated, not delegated (BUILD_PLAN section 9.3). Operator can only do the finite set of registered things. |
-| L-04 | **Retry storms.** The model, seeing an ambiguous failure, retries and duplicates a side effect. | No automatic retry anywhere; `UNKNOWN` is terminal; handles are single-use; `retryable: false` on every side-effect-adjacent error; the `DISPATCH_INDETERMINATE` message tells the model plainly not to retry ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md)). |
+| L-04 | **Retry storms.** The model, seeing an ambiguous failure, retries and duplicates a side effect. | No automatic retry anywhere; `UNKNOWN` is terminal; handles are single-use; `retryable: false` on every side-effect-adjacent error; the `DISPATCH_INDETERMINATE` message tells the model plainly not to retry ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md)). Operator itself never infers that a timed-out dispatch was a non-event ([ADR-009](adr/ADR-009-dispatch-correlation.md)), and v2's governed retry recalculates rather than reusing an approval ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md), invariant I11). |
 | L-05 | **Argument drift under multi-turn pressure.** The model gradually alters arguments across turns after an approval. | Fingerprint binding: the approved arguments are the executed arguments or nothing runs (T-05). |
 | L-06 | **Plausible-sounding justification.** The model supplies a persuasive `reason` to get a dangerous call through. | `reason` is displayed to the human and recorded in the audit log. It never affects policy — no gate reads it ([ADR-007](adr/ADR-007-deterministic-before-llm.md)). |
 | L-07 | **Over-broad discovery.** The model finds a powerful workflow and uses it for an unrelated purpose. | Risk and side-effect classes are surfaced at discovery, and anything above `read_only` requires human approval per invocation. |
+| L-08 | **Approval theatre.** The model reports that it "sent an approval link" and treats the operation as effectively approved, because it was handed a URL-shaped string it cannot reach and cannot act on. | Remote callers never receive a URL; they receive `approval_required: true`, the operation ID, and instructions naming the human action required (T-38, invariant I12). `approval_required` is a boolean to branch on rather than a presence-of-URL inference. |
 
 ---
 
@@ -168,8 +173,15 @@ with no intent at all, doing the wrong thing confidently.
 | B9 transport guards | T-33, T-34 |
 | B10 loopback approval app | T-15, T-16, T-17, T-18 |
 | B11 append-only audit | T-13, T-35 |
+| B12 core argument limits | T-12 |
+| B13 approval reachability | T-38, L-08 |
 | ADR-005 no retries | L-04, T-27, T-37 |
 | ADR-007 deterministic gates | L-06, L-01 |
+| ADR-008 conservative canonicalization | T-39, and the coverage T-24/T-25 depend on |
+| ADR-009 correlation and honest reporting | T-40, T-41, L-04 |
+| ADR-010 approval delivery and lazy expiry | T-38, L-08 |
+| ADR-011 argument limits and namespaces | T-12 |
+| ADR-012 retry recalculation and anchoring | L-04, T-35 |
 
 Every boundary control traces to at least one threat, and every Critical or High threat
 traces to at least one control or an explicit acceptance in section 8.
@@ -191,7 +203,18 @@ Stated plainly so no one mistakes silence for coverage:
 6. **Approval-fatigue as a systemic risk (T-20).** Mitigated by page design and honest
    risk labeling, but a human who always clicks approve is not a solvable software problem.
 7. **Availability.** Operator is not designed for high availability; an outage means
-   workflows cannot be run through it, which is the safe failure direction.
+   workflows cannot be run through it, which is the safe failure direction. Preparation
+   stays coupled to a successful live preflight, so an n8n outage blocks new work rather
+   than queueing unverified work ([ADR-009](adr/ADR-009-dispatch-correlation.md)). Approval
+   *correctness* depends on no process being up: expiry is applied lazily inside the
+   transaction that acts on an operation (invariant I9,
+   [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
+8. **Credential validity.** Operator reports whether credentials are *bound*, never
+   whether they work (T-41). Testing a credential means using it, which is the side effect
+   preflight exists to gate.
+9. **Reconciling an `UNKNOWN` without correlation data.** For a workflow that returns no
+   execution identifier, deciding whether the side effect occurred is a human task against
+   the downstream system (T-40).
 
 ---
 
@@ -202,10 +225,12 @@ Stated plainly so no one mistakes silence for coverage:
 | RR-1 | Prompt injection can still *cause a request* for any registered workflow; a fatigued approver may pass it (T-20, T-29, L-01). | Medium | Operator | v2 team approvals and quorum raise the bar. |
 | RR-2 | A registered workflow may do more than its description claims (T-28). | Medium | Operator | v3 evaluation lab and governed change review. |
 | RR-3 | Redaction completeness depends on operator-authored paths (T-30). | Medium | Operator | v2 default redaction heuristics with explicit opt-out. |
-| RR-4 | Audit tampering is detectable, not preventable (T-35). | Medium | Operator | v2 external anchoring; v3 signed evidence packs. |
-| RR-5 | `UNKNOWN` outcomes require a human to reconcile downstream (BUILD_PLAN 9.5). | Medium | Operator | v2 governed retry with explicit reconciliation. |
+| RR-4 | Audit tampering is detectable, not preventable (T-35). | Medium | Operator | v2 `AuditAnchor`: signed local file and authenticated HTTPS webhook; v3 KMS, transparency log, WORM ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md)). |
+| RR-5 | `UNKNOWN` outcomes require a human to reconcile downstream (BUILD_PLAN 9.5), and without correlation data there is nothing exact to reconcile against (T-40). | Medium | Operator | v2 governed retry with recalculation; exact-ID reconciliation annotations where an execution ID exists ([ADR-009](adr/ADR-009-dispatch-correlation.md)). |
 | RR-6 | Data at rest is unencrypted (T-36). | Low–Medium | Operator | v3 enterprise controls. |
-| RR-7 | Rate limiting and argument-size caps are coarse (T-11, T-12). | Low | Engineering | v2 per-principal quotas. |
+| RR-7 | Rate limiting remains coarse (T-11). Argument-size caps are no longer coarse — T-12 is mitigated by B12. | Low | Engineering | v2 per-principal quotas. |
+| RR-8 | Early canonicalization is deliberately over-inclusive, so cosmetic n8n edits produce false `DEFINITION_DRIFT` until the harness justifies exclusions. Friction on a security control invites routing around it (T-39, [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)). | Low–Medium | Engineering | Phase-4 harness narrows the allowlist on evidence; v2 `diff_workflow_definition` makes re-review a diff. |
+| RR-9 | In a stdio-only deployment with no sweeper and no scheduled `operations expire`, `EXPIRED` audit events are written at next touch rather than at the deadline, and may never be written for an operation nobody touches again. Audit-timeline fidelity only; no expired operation is executable (invariant I9). | Low | Operator | Run `operations expire` on a timer, or the approval app. |
 
 ---
 
@@ -218,7 +243,11 @@ Re-run this analysis when any of the following changes:
 - a new trust boundary appears (multi-user in v2, workflow writes in v3);
 - the registry gains a field that affects policy;
 - any control in BUILD_PLAN section 9.2 is weakened or removed;
-- a transport is added or a default bind address changes.
+- a transport is added or a default bind address changes;
+- **a field is added to the canonicalization exclusion allowlist** (CAN-02 — this is a
+  reduction in drift-detection coverage and must be reviewed as one);
+- an approval channel is added, or the rule deciding caller locality changes;
+- an `AuditAnchor` implementation is added.
 
 Phase 9 of the build plan requires a full review of this document against the shipped
 v1 code before release, including re-confirmation of every accepted risk.
