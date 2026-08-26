@@ -43,6 +43,7 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2,<4"]   # v2 (ADR-004); unused in v1
+keyring = ["keyring>=25,<26"]            # optional secret-indirection backend (ADR-006)
 
 [project.urls]
 Homepage = "https://github.com/n8n-operator/n8n-operator"
@@ -118,6 +119,12 @@ files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["jsonpath_ng.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional dependency (the 'keyring' extra, ADR-006); imported lazily inside a
+# try/except in config.py precisely so its absence is not a hard failure.
+module = ["keyring.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

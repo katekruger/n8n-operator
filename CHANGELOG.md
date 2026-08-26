@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — phase 1: configuration and storage foundation
+
+Implements BUILD_PLAN section 12 phase 1. Does not implement registry behavior, MCP
+tools, n8n HTTP calls, approval routes, or workflow execution — those remain later
+phases.
+
+- `config.py`: Pydantic v2 `Settings` (`N8N_OPERATOR_` prefix), startup validation for
+  every field in ARCHITECTURE.md section 7, `env:`/`keyring:` secret indirection for
+  `n8n_api_key` mirroring the registry's `trigger.secret_ref` scheme, and
+  `resolve_database_url()` — a database-URL resolver independent of the rest of
+  `Settings`, so schema management never requires `N8N_BASE_URL`/`N8N_API_KEY`.
+- `errors.py`: the complete 24-code error taxonomy from MCP_TOOLS.md section 4, split
+  into `DomainError` / `AuthorizationError` / `ProviderError` / `ConfigurationError` /
+  `StorageError`, each carrying a stable `code`, `retryable`, and `remediation` matching
+  the documented "model's correct next move" verbatim. `to_dict()` scrubs any
+  accidentally-included secret (duck-typed on `get_secret_value`) before serialization.
+- `storage/models.py`: the complete v1 schema (BUILD_PLAN section 8.1) — 8 tables,
+  portable per ADR-004 rules D1–D10. `UTCDateTime`, a `TypeDecorator` guaranteeing
+  timestamps survive a round trip as UTC-aware — added after integration testing showed
+  that bare `DateTime(timezone=True)` alone does not on SQLite (the driver returns a
+  naive datetime on read, discarding tzinfo that was correctly attached on write).
+- Alembic initialized; migration `0001_initial` creates the full schema. Verified:
+  empty-database upgrade to head, downgrade/upgrade round trip, and autogenerate against
+  the ORM metadata producing an empty diff (AC-24).
+- `storage/session.py`: engine/session lifecycle with `PRAGMA foreign_keys=ON`, WAL mode,
+  and a busy timeout set at connection setup only (ADR-004 D9). `storage/repository.py`:
+  typed repositories per table, the compare-and-set primitives later phases build handle
+  burning on (`compare_and_set_state`, `burn_handle`), and no state-machine policy.
+- `cli db init | migrate | status`, driving Alembic programmatically against a `Config`
+  built without reading `alembic.ini` at runtime, so behavior is identical from a source
+  checkout or an installed package.
+- Tests: 319 passing — configuration validation and secret redaction, migration
+  round-trip and autogenerate-empty, repository CRUD, transaction rollback, idempotency-
+  namespace uniqueness, SQLite foreign-key enforcement, a portable-SQL contract (ADR-004
+  D1–D10, AST-based to avoid false positives against this codebase's own docstrings), an
+  import-graph layering contract, and CLI end-to-end tests via `typer.testing.CliRunner`.
+  96% coverage on the modules this phase implements (100% on `storage/models.py`,
+  `storage/repository.py`, `errors.py`).
+
 ### Added — phase 0: architecture and bootstrap
 
 - Product definition, v1/v2/v3 outcomes, and exact feature boundaries

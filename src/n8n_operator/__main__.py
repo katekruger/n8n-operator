@@ -1,17 +1,18 @@
 """Entry point for ``python -m n8n_operator``.
 
-Delegates to the Typer application in :mod:`n8n_operator.cli.main`.
-Not implemented in phase 0 (see BUILD_PLAN section 12, phase 1).
+Delegates to the same Typer application the installed ``n8n-operator`` script uses
+(``n8n_operator.cli.main:app``), so the two invocation styles behave identically.
 """
 
 from __future__ import annotations
 
+from n8n_operator.cli.main import app
+
+__all__ = ["app", "main"]
+
 
 def main() -> None:
-    """Run the CLI. Implemented in phase 1."""
-    raise NotImplementedError(
-        "n8n Operator is in the architecture/bootstrap phase; the CLI lands in phase 1."
-    )
+    app()
 
 
 if __name__ == "__main__":

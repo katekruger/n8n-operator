@@ -3,10 +3,12 @@
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: architecture-decision closure (phase 0.1).** The documentation set and the
-> repository skeleton are complete, and the architecture decisions left open at the end of
-> phase 0 are now closed in ADR-008 through ADR-012. No product functionality is
-> implemented yet. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
+> **Status: configuration and storage foundation (phase 1).** The documentation set is
+> complete and the architecture decisions from phase 0.1 are closed. Phase 1 adds
+> validated configuration, the full error taxonomy, the complete v1 database schema and
+> its first migration, a portable storage layer, and the `db init | migrate | status`
+> CLI. No registry, MCP tool, n8n integration, or workflow-execution behavior is
+> implemented yet — see [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
 > checklist.
 
 ---

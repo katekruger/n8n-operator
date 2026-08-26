@@ -256,6 +256,7 @@ n8n-operator/
 │       │       ├── env.py
 │       │       ├── script.py.mako
 │       │       └── versions/
+│       │           └── 0001_initial.py    # AC-24: empty DB upgrades to head
 │       ├── audit/                  # append-only, hash-chained
 │       │   ├── __init__.py
 │       │   ├── chain.py            # chain construction + verification
@@ -1028,7 +1029,7 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
 Every phase is done when its checklist is complete, its tests are green, and the docs
 it touches are updated in the same change.
 
-### Phase 0 — Architecture and bootstrap *(this phase)*
+### Phase 0 — Architecture and bootstrap
 
 - [x] Product definition, version outcomes, feature boundaries
 - [x] Operation state machine defined (section 5)
@@ -1045,7 +1046,7 @@ it touches are updated in the same change.
 - [x] Doc-consistency checker
 - [ ] Repository published to a remote *(deliberately deferred)*
 
-### Phase 0.1 — Architecture-decision closure *(this phase)*
+### Phase 0.1 — Architecture-decision closure
 
 - [x] ADR-008 conservative definition canonicalization (CAN-01 - CAN-07)
 - [x] ADR-009 dispatch correlation, indeterminate outcomes, credential-binding semantics
@@ -1058,21 +1059,36 @@ it touches are updated in the same change.
 - [x] BUILD_PLAN, ARCHITECTURE, THREAT_MODEL, WORKFLOW_REGISTRY, MCP_TOOLS updated
 - [x] Doc-consistency checker extended (D10 - D12) and contract tests added
 
-### Phase 1 — Configuration and storage foundation
+### Phase 1 — Configuration and storage foundation *(this phase)*
 
-- [ ] `config.py`: settings model, env loading, secret indirection, startup validation,
-      `max_argument_bytes` ceiling and approval-URL exposure mode
-- [ ] `errors.py`: the full error taxonomy from MCP_TOOLS.md, including
+- [x] `config.py`: settings model, env loading, secret indirection (`env:`/`keyring:`,
+      mirroring registry `secret_ref`), startup validation, `max_argument_bytes` ceiling
+      and approval-URL exposure mode. `resolve_database_url()` factored out so schema
+      management never requires `N8N_BASE_URL`/`N8N_API_KEY` to be set.
+- [x] `errors.py`: the full 24-code error taxonomy from MCP_TOOLS.md, including
       `ARGUMENTS_TOO_LARGE` and `IDEMPOTENCY_CONFLICT` (ADR-011 supersedes the phase-0
-      spelling of the latter)
-- [ ] `storage/models.py`: all tables in section 8.1, with explicit `environment` and
-      `argument_bytes` on `operations` (ADR-011)
-- [ ] Alembic initialized; migration `0001_initial` creating the full v1 schema, including
-      the four-part idempotency unique index
-- [ ] `storage/session.py`, `storage/repository.py` with portable-SQL rules (ADR-004)
-- [ ] `cli db init | migrate | status`
-- [ ] Tests: migration round-trip, autogenerate-is-empty, repository CRUD, namespace
-      uniqueness
+      spelling of the latter), separated into `DomainError` / `AuthorizationError` /
+      `ProviderError` / `ConfigurationError` / `StorageError` categories, with a
+      `to_dict()` that scrubs any accidentally-included secret before serialization.
+- [x] `storage/models.py`: all tables in section 8.1, with explicit `environment` and
+      `argument_bytes` on `operations` (ADR-011). `UTCDateTime` type decorator added
+      after integration testing found that bare `DateTime(timezone=True)` does not
+      survive a round trip through SQLite with its tzinfo intact.
+- [x] Alembic initialized; migration `0001_initial` creating the full v1 schema, including
+      the four-part idempotency unique index (a plain constraint, not a partial index —
+      NULL-uniqueness semantics do the work ADR-011 needs)
+- [x] `storage/session.py`, `storage/repository.py` with portable-SQL rules (ADR-004):
+      `PRAGMA foreign_keys=ON`/WAL/busy-timeout at connection setup, CAS primitives
+      (`compare_and_set_state`, `burn_handle`) for later handle burning, no state-machine
+      policy in the repository layer
+- [x] `cli db init | migrate | status`, driving Alembic programmatically (no `alembic.ini`
+      read at runtime) so behavior is identical from a source checkout or an installed
+      package
+- [x] Tests: migration round-trip, autogenerate-is-empty (AC-24), repository CRUD,
+      transaction rollback, namespace uniqueness, SQLite FK enforcement, portable-SQL
+      contract (ADR-004 D1-D10), import-graph layering contract, CLI end-to-end via
+      `typer.testing.CliRunner` — 319 tests, 96% coverage on the modules this phase
+      implements (100% on `storage/models.py`, `storage/repository.py`, `errors.py`)
 
 ### Phase 2 — Registry
 
