@@ -22,7 +22,6 @@ from typer.testing import CliRunner
 from n8n_operator.cli.main import app
 from n8n_operator.core import service
 from n8n_operator.core.models import PreflightResult
-from n8n_operator.storage.repository import PrincipalRepository
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
@@ -92,9 +91,10 @@ def cli_env(cli_db_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
 def prepared(cli_env: None, cli_db_url: str, registry_path: Path) -> str:
     """Init the database, load the registry, and prepare one PENDING_APPROVAL
     operation — through ``db init``/``registry reload`` (the real CLI) for the first
-    two, and directly through ``core.service`` for the third, since preparing an
-    operation is normally an MCP tool call this test suite has no MCP session for.
-    Returns the operation ID.
+    two (``db init`` also seeds the v1 default ``"local"`` principal — nothing else in
+    the shipped product does), and directly through ``core.service`` for the third,
+    since preparing an operation is normally an MCP tool call this test suite has no
+    MCP session for. Returns the operation ID.
     """
     init_result = runner.invoke(app, ["db", "init"])
     assert init_result.exit_code == 0, init_result.output
@@ -104,8 +104,6 @@ def prepared(cli_env: None, cli_db_url: str, registry_path: Path) -> str:
     engine = create_engine_for_url(cli_db_url)
     session_factory = create_session_factory(engine)
     try:
-        with session_scope(session_factory) as session:
-            PrincipalRepository(session).create(id="local", kind="local", display_name="local")
         with session_scope(session_factory) as session:
             operation, _replay, _token = service.prepare_operation(
                 session,

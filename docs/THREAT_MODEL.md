@@ -134,9 +134,9 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 |---|---|---|---|---|---|
 | T-33 | Spoofing | Anyone on the network reaches an exposed Streamable HTTP listener. | Critical | Loopback bind by default; non-loopback requires a bearer token **and** an `Origin` allowlist, or startup fails (B9, AC-20). | mitigated |
 | T-34 | Elevation | ADV-4 reaches the loopback MCP HTTP listener via DNS rebinding. | High | `Origin` validation on the MCP HTTP transport, same as the approval app. | mitigated |
-| T-35 | Tampering | ADV-6 edits the SQLite file to erase or fabricate audit records. | High | Hash-chained audit log makes edits detectable via `audit verify` (AC-22). Detection, not prevention. | partial |
-| T-36 | Information disclosure | ADV-6 reads PII from the database at rest. | Medium | Arguments and results are stored redacted; no secrets are stored. Filesystem permissions are the operator's responsibility; v1 adds no encryption at rest. | accepted |
-| T-37 | Tampering | An operation is left stranded in `EXECUTING` by a crash, and later resolved wrongly. | Medium | `EXECUTING` commits before dispatch; recovery resolves stranded operations to `UNKNOWN`, never to `SUCCEEDED` or a retry. | mitigated |
+| T-35 | Tampering | ADV-6 edits the SQLite file to erase or fabricate audit records. | High | Hash-chained audit log makes edits detectable: `n8n-operator audit verify` (phase 8) walks the whole chain and reports the exact sequence number of the first break, exiting a distinct code; `audit export` embeds the same verification in a portable record a separate process can independently re-check (AC-22, AC-25). Detection, not prevention. | mitigated |
+| T-36 | Information disclosure | ADV-6 reads PII from the database at rest. | Medium | `execution_results.redacted_payload`/`error` are redacted and size-capped before they are ever written (`record_execution_outcome`). `operations.arguments`, however, is stored **raw** — phase 7 moved redaction from write-time to the read boundary (`get_operation`, `audit export`) because dispatch and the execute-time argument-fingerprint re-check both need the real values, and a value redacted at rest can never be un-redacted later. So an operator with database read access sees caller-supplied arguments in the clear; no credential is ever stored (ADR-006), and filesystem permissions remain the operator's sole protection. v1 adds no encryption at rest. | accepted |
+| T-37 | Tampering | An operation is left stranded in `EXECUTING` by a crash, and later resolved wrongly. | Medium | `EXECUTING` commits (the handle burn) before dispatch, so a crash can never make an operation appear to have both never run and already been claimed. What v1 does *not* have: any automatic or CLI-driven path that resolves a crash-stranded `EXECUTING` operation forward at all — it is not silently promoted to `SUCCEEDED`, and nothing retries it (ADR-005), but nothing moves it to `UNKNOWN` either. It stays `EXECUTING` — correctly inert, not correctly resolved — until an operator manually confirms the outcome against n8n and updates the row directly; see [v1 limitations](V1_LIMITATIONS.md) and the [UNKNOWN reconciliation guide](RECONCILING_UNKNOWN.md). This is a narrower guarantee than "recovery resolves stranded operations" implied — corrected here for the v1 release audit (phase 9). | partial |
 
 ---
 
@@ -215,6 +215,12 @@ Stated plainly so no one mistakes silence for coverage:
 9. **Reconciling an `UNKNOWN` without correlation data.** For a workflow that returns no
    execution identifier, deciding whether the side effect occurred is a human task against
    the downstream system (T-40).
+10. **Automatic or CLI-driven resolution of a crash-stranded `EXECUTING` operation.**
+    v1 detects nothing wrong (the operation simply never resolves) and provides no
+    command to move it forward; an operator must confirm the outcome against n8n and
+    edit the row directly (T-37, RR-10). See the
+    [UNKNOWN reconciliation guide](RECONCILING_UNKNOWN.md), which also covers this
+    case despite the operation technically sitting in `EXECUTING`, not `UNKNOWN`.
 
 ---
 
@@ -227,10 +233,11 @@ Stated plainly so no one mistakes silence for coverage:
 | RR-3 | Redaction completeness depends on operator-authored paths (T-30). | Medium | Operator | v2 default redaction heuristics with explicit opt-out. |
 | RR-4 | Audit tampering is detectable, not preventable (T-35). | Medium | Operator | v2 `AuditAnchor`: signed local file and authenticated HTTPS webhook; v3 KMS, transparency log, WORM ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md)). |
 | RR-5 | `UNKNOWN` outcomes require a human to reconcile downstream (BUILD_PLAN 9.5), and without correlation data there is nothing exact to reconcile against (T-40). | Medium | Operator | v2 governed retry with recalculation; exact-ID reconciliation annotations where an execution ID exists ([ADR-009](adr/ADR-009-dispatch-correlation.md)). |
-| RR-6 | Data at rest is unencrypted (T-36). | Low–Medium | Operator | v3 enterprise controls. |
+| RR-6 | Data at rest is unencrypted, and operation arguments are stored **raw** (not redacted) since phase 7 — dispatch and execute-time fingerprint re-verification both need the real values, and a value redacted at rest can never be un-redacted for that check. Execution results *are* redacted before they are ever written (T-36). | Low–Medium | Operator | v3 enterprise controls; encryption at rest. |
 | RR-7 | Rate limiting remains coarse (T-11). Argument-size caps are no longer coarse — T-12 is mitigated by B12. | Low | Engineering | v2 per-principal quotas. |
 | RR-8 | Early canonicalization is deliberately over-inclusive, so cosmetic n8n edits produce false `DEFINITION_DRIFT` until the harness justifies exclusions. Friction on a security control invites routing around it (T-39, [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)). | Low–Medium | Engineering | Phase-4 harness narrows the allowlist on evidence; v2 `diff_workflow_definition` makes re-review a diff. |
 | RR-9 | In a stdio-only deployment with no sweeper and no scheduled `operations expire`, `EXPIRED` audit events are written at next touch rather than at the deadline, and may never be written for an operation nobody touches again. Audit-timeline fidelity only; no expired operation is executable (invariant I9). | Low | Operator | Run `operations expire` on a timer, or the approval app. |
+| RR-10 | An operation crash-stranded in `EXECUTING` (process killed between the handle burn and dispatch completing) has no automatic or CLI-driven resolution in v1 — it stays `EXECUTING` indefinitely, correctly inert but not resolved, and (since `max_concurrent` counts `EXECUTING` operations) permanently occupies one concurrency slot for that workflow until an operator manually confirms the outcome against n8n and updates the row directly (T-37). Narrower in practice than it sounds: the window is one process between two adjacent statements, not an extended period. | Low | Operator | v2: a supported reconciliation command instead of a direct database edit. |
 
 ---
 

@@ -3,13 +3,12 @@
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: configuration and storage foundation (phase 1).** The documentation set is
-> complete and the architecture decisions from phase 0.1 are closed. Phase 1 adds
-> validated configuration, the full error taxonomy, the complete v1 database schema and
-> its first migration, a portable storage layer, and the `db init | migrate | status`
-> CLI. No registry, MCP tool, n8n integration, or workflow-execution behavior is
-> implemented yet — see [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
-> checklist.
+> **Status: v1 complete.** All nine build phases are implemented and verified —
+> registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
+> full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). See
+> [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
+> [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
+> do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
@@ -30,9 +29,10 @@ thing happened."
 |---|---|
 | **Discover** | Only workflows an operator explicitly registered, with human-authored descriptions, risk classes, and input schemas. |
 | **Validate** | Arguments checked against a declared JSON Schema before anything reaches n8n. |
-| **Preflight** | Target verified live, active, and unmodified since registration, before approval is sought. |
+| **Preflight** | Target verified live, active, and unmodified since registration, before approval is sought — and again immediately before dispatch. |
 | **Execute** | An explicit `prepare → approve → execute` lifecycle with single-use handles, idempotency, and a durable audit trail. |
 | **Debug** | Redacted, structured execution traces — enough to diagnose, not enough to exfiltrate. |
+| **Operate** | A CLI for approval, cancellation, history, and a chain-verifiable audit export — no browser required. |
 
 ## What it refuses to do
 
@@ -43,6 +43,78 @@ thing happened."
 - Retry anything automatically. Ambiguous outcomes surface as `UNKNOWN` for a human.
 - Edit workflows (v1 and v2). Authoring stays in the n8n UI.
 
+## Quickstart
+
+Requires Python 3.12. Installs the `n8n-operator` command.
+
+```bash
+uv tool install n8n-operator
+```
+
+<sub>Or `pip install n8n-operator` / `pipx install n8n-operator` if you're not using uv.</sub>
+
+**1. Initialize the database.** This also seeds the v1 default principal — do this
+before anything else.
+
+```bash
+n8n-operator db init
+```
+
+**2. Write or copy a registry.** [`examples/registry/workflows.example.yaml`](examples/registry/workflows.example.yaml)
+is a fully annotated starting point; [docs/WORKFLOW_REGISTRY.md](docs/WORKFLOW_REGISTRY.md)
+is the authoring reference. Validate before loading:
+
+```bash
+n8n-operator registry validate --path ./workflows.yaml
+n8n-operator registry reload --path ./workflows.yaml
+```
+
+**3. Configure the n8n connection** (only needed for `serve`/`health`, not for `db`/
+`registry`/`operations`/`audit`):
+
+```bash
+export N8N_OPERATOR_N8N_BASE_URL=https://your-n8n-instance.example.com
+export N8N_OPERATOR_N8N_API_KEY=...          # or env:NAME / keyring:SERVICE/ACCOUNT
+n8n-operator health                           # confirms the instance is reachable
+```
+
+**4. Run the server.**
+
+```bash
+n8n-operator serve stdio     # Claude Desktop and any subprocess-launching MCP host
+n8n-operator serve http      # a remote Streamable HTTP MCP client (see below)
+```
+
+**No n8n instance yet?** [`scripts/demo.sh`](scripts/demo.sh) walks through discovery,
+validation, and the audit trail against a scratch database — nothing above step 3
+required. Run it:
+
+```bash
+scripts/demo.sh
+```
+
+### Connecting a client
+
+[`examples/mcp-clients/`](examples/mcp-clients/) has ready-to-copy configs for Claude
+Desktop (stdio) and a remote Streamable HTTP client (OpenAI's MCP connector and
+similar) — both verified against a real build of this package. See
+[examples/mcp-clients/README.md](examples/mcp-clients/README.md) for the details each
+one needs (a non-loopback `serve http` bind requires a bearer token and an Origin
+allowlist — boundary B9 — the server refuses to start otherwise).
+
+### Approving a pending operation
+
+Anything above `read_only` needs a human decision before it runs. The CLI is the
+canonical channel ([ADR-010](docs/adr/ADR-010-approval-delivery-and-expiry.md)):
+
+```bash
+n8n-operator operations list                  # what's pending
+n8n-operator operations approve <operation_id>  # renders the full decision context first
+```
+
+`n8n-operator serve approval` runs a convenience loopback web page over the same
+decision — never the only way to decide an operation.
+
 ## Documentation
 
 | Document | What it covers |
@@ -52,6 +124,12 @@ thing happened."
 | [THREAT_MODEL.md](docs/THREAT_MODEL.md) | Assets, trust boundaries, STRIDE analysis, LLM-specific threats, residual risks. |
 | [WORKFLOW_REGISTRY.md](docs/WORKFLOW_REGISTRY.md) | How to register a workflow, and how to classify it correctly. |
 | [MCP_TOOLS.md](docs/MCP_TOOLS.md) | **Normative** for tool arguments, results, and the error taxonomy. |
+| [N8N_COMPATIBILITY.md](docs/N8N_COMPATIBILITY.md) | Empirical n8n API findings behind ADR-008/ADR-009. |
+| [COMPATIBILITY_MATRIX.md](docs/COMPATIBILITY_MATRIX.md) | Tested n8n versions and feature support, at a glance. |
+| [V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) | Plain-language index of what v1 deliberately doesn't do. |
+| [RECONCILING_UNKNOWN.md](docs/RECONCILING_UNKNOWN.md) | Step-by-step manual procedure for resolving an `UNKNOWN` operation. |
+| [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the PR gate, and house conventions. |
 
 ### Decision records
 
@@ -83,18 +161,20 @@ environments, team approvals, monitoring, governed retries, workflow definition 
 **v3** — declarative workflow compiler, evaluation lab, governed workflow changes,
 remediation assistant, template library, enterprise controls.
 
-Full boundary table: [BUILD_PLAN.md](docs/BUILD_PLAN.md) section 3.
+Full boundary table: [BUILD_PLAN.md](docs/BUILD_PLAN.md) section 3. Known v1-specific
+gaps and their practical consequences: [V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md).
 
 ## Development
 
-Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full guide; the short version:
 
 ```bash
-uv sync
+uv sync --all-extras --dev
 ```
 
 ```bash
-uv run pytest
+uv run pytest -m "not live_n8n"
 ```
 
 ```bash

@@ -12,7 +12,15 @@ entirely in Python — no ``alembic.ini`` is read at runtime — so these comman
 identically whether invoked from a source checkout or an installed package, and
 regardless of the process's current working directory.
 
-Phase 1 (BUILD_PLAN section 12).
+``init``/``migrate`` also seed the v1 default principal (``id="local"``, the constant
+every adapter and test in this codebase writes as ``ToolDeps.principal_id`` /
+``_PRINCIPAL_ID``) if it does not already exist — a genuine gap found in phase 9
+release verification: nothing else in the shipped product ever creates this row, so a
+real fresh install's very first ``prepare_operation`` failed a ``principals`` foreign
+key. v1 has exactly one principal (BUILD_PLAN section 8.1); seeding it here, in the
+one-time setup command, is the whole fix — no other code path needed to change.
+
+Phase 1 (BUILD_PLAN section 12); default-principal seeding added in phase 9.
 """
 
 from __future__ import annotations
@@ -30,8 +38,32 @@ from sqlalchemy.exc import OperationalError
 
 import n8n_operator.storage as storage_package
 from n8n_operator.config import resolve_database_url
+from n8n_operator.storage.repository import PrincipalRepository
+from n8n_operator.storage.session import (
+    create_engine_for_url,
+    create_session_factory,
+    session_scope,
+)
 
 app = typer.Typer(help="Manage the operator's database schema.", no_args_is_help=True)
+
+DEFAULT_PRINCIPAL_ID = "local"
+
+
+def _ensure_default_principal(database_url: str) -> bool:
+    """Idempotently create the v1 default principal. Returns whether it was created —
+    ``False`` means it already existed, not that anything failed."""
+    engine = create_engine_for_url(database_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_scope(session_factory) as session:
+            repo = PrincipalRepository(session)
+            if repo.get(DEFAULT_PRINCIPAL_ID) is not None:
+                return False
+            repo.create(id=DEFAULT_PRINCIPAL_ID, kind="local", display_name="local")
+            return True
+    finally:
+        engine.dispose()
 
 
 def _migrations_dir() -> Path:
@@ -76,25 +108,29 @@ def _resolve_database_url_or_exit() -> str:
 
 @app.command("init")
 def init() -> None:
-    """Create the database (if needed) and bring its schema to head.
+    """Create the database (if needed), bring its schema to head, and seed the v1
+    default principal.
 
-    Safe to re-run: an already-initialized database at head is reported as such, not
-    treated as an error.
+    Safe to re-run: an already-initialized database at head, with its principal
+    already seeded, is reported as such, not treated as an error.
     """
     database_url = _resolve_database_url_or_exit()
     _ensure_sqlite_parent_exists(database_url)
     cfg = _alembic_config(database_url)
     command.upgrade(cfg, "head")
+    _ensure_default_principal(database_url)
     typer.echo(f"Database initialized ({database_url}); schema is at head.")
 
 
 @app.command("migrate")
 def migrate() -> None:
-    """Bring the database schema to head. Works from an empty database (AC-24)."""
+    """Bring the database schema to head and seed the v1 default principal. Works
+    from an empty database (AC-24)."""
     database_url = _resolve_database_url_or_exit()
     _ensure_sqlite_parent_exists(database_url)
     cfg = _alembic_config(database_url)
     command.upgrade(cfg, "head")
+    _ensure_default_principal(database_url)
     typer.echo("Database schema is now at head.")
 
 

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "n8n-operator": {
+      "command": "n8n-operator",
+      "args": ["serve", "stdio"],
+      "env": {
+        "N8N_OPERATOR_N8N_BASE_URL": "https://n8n.example.com",
+        "N8N_OPERATOR_N8N_API_KEY": "REPLACE_WITH_YOUR_N8N_API_KEY",
+        "N8N_OPERATOR_DATABASE_URL": "sqlite+pysqlite:////Users/you/.n8n-operator/n8n-operator.db",
+        "N8N_OPERATOR_REGISTRY_PATH": "/Users/you/.n8n-operator/workflows.yaml"
+      }
+    }
+  }
+}
+

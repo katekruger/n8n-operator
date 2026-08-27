@@ -26,7 +26,6 @@ from n8n_operator.cli.main import app
 from n8n_operator.core import service
 from n8n_operator.core.models import PreflightResult
 from n8n_operator.storage.models import AuditLogEntry
-from n8n_operator.storage.repository import PrincipalRepository
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
@@ -100,7 +99,9 @@ def prepared(cli_env: None, cli_db_url: str, registry_path: Path) -> str:
     """Init the database, load the registry, and prepare, approve, execute, and
     complete one operation whose ``api_key`` argument is what the export must redact —
     the same "real CLI for schema, core.service directly for what would otherwise need
-    an MCP session" pattern ``test_cli_operations.py`` establishes."""
+    an MCP session" pattern ``test_cli_operations.py`` establishes. ``db init`` seeds
+    the v1 default ``"local"`` principal itself — nothing else in the shipped product
+    does."""
     init_result = runner.invoke(app, ["db", "init"])
     assert init_result.exit_code == 0, init_result.output
     reload_result = runner.invoke(app, ["registry", "reload", "--path", str(registry_path)])
@@ -109,8 +110,6 @@ def prepared(cli_env: None, cli_db_url: str, registry_path: Path) -> str:
     engine = create_engine_for_url(cli_db_url)
     session_factory = create_session_factory(engine)
     try:
-        with session_scope(session_factory) as session:
-            PrincipalRepository(session).create(id="local", kind="local", display_name="local")
         with session_scope(session_factory) as session:
             operation, _replay, _token = service.prepare_operation(
                 session,

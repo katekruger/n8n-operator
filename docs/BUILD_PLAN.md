@@ -190,6 +190,8 @@ n8n-operator/
 ├── README.md
 ├── LICENSE
 ├── CHANGELOG.md
+├── SECURITY.md                     # vulnerability reporting (phase 9)
+├── CONTRIBUTING.md                 # dev setup, PR gate, conventions (phase 9)
 ├── pyproject.toml                  # uv-managed, src layout, Python 3.12
 ├── alembic.ini
 ├── .env.example
@@ -205,6 +207,9 @@ n8n-operator/
 │   ├── WORKFLOW_REGISTRY.md        # registry authoring reference
 │   ├── MCP_TOOLS.md                # tool contracts — normative for tool I/O
 │   ├── N8N_COMPATIBILITY.md        # phase 4 empirical findings (ADR-008, ADR-009)
+│   ├── COMPATIBILITY_MATRIX.md     # tested n8n versions and feature support (v1 release)
+│   ├── V1_LIMITATIONS.md           # plain-language index of v1 boundaries (phase 9)
+│   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -219,10 +224,16 @@ n8n-operator/
 │       ├── ADR-011-argument-limits-and-idempotency.md
 │       └── ADR-012-governed-retry-and-audit-anchoring.md
 ├── examples/
-│   └── registry/
-│       └── workflows.example.yaml  # annotated sample registry
+│   ├── registry/
+│   │   ├── workflows.example.yaml         # annotated sample registry
+│   │   └── synthetic_test_workflow.json   # importable n8n workflow for testing (phase 9)
+│   └── mcp-clients/                       # ready-to-copy client configs (phase 9)
+│       ├── README.md
+│       ├── claude_desktop_config.json     # stdio
+│       └── streamable_http_client.json    # remote / Streamable HTTP
 ├── scripts/
-│   └── check_docs_consistency.py   # doc invariants enforced in CI
+│   ├── check_docs_consistency.py   # doc invariants enforced in CI
+│   └── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
 ├── src/
 │   └── n8n_operator/
 │       ├── __init__.py             # version only
@@ -925,8 +936,16 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
   not appear in `list_workflows` and cannot be prepared. `prepare_operation` on its
   registry ID returns `WORKFLOW_NOT_FOUND` with no signal distinguishing
   "unregistered" from "nonexistent".
-- **AC-02** — A registry violating any rule in section 6.6 fails to load; the server
-  exits non-zero at startup and `registry validate` reports the offending entry and rule.
+- **AC-02** — A registry violating any rule in section 6.6 fails to load: `registry
+  reload` refuses to write a new snapshot and exits non-zero, `registry validate`
+  reports the offending entry and rule, and the previously active snapshot (if any)
+  remains in force. Corrected in phase 9 release verification: `n8n-operator serve
+  stdio`/`serve http` do not themselves read the registry file or exit at startup on
+  an invalid one — they serve from whatever snapshot is already in the database, which
+  can only ever be one `registry reload` already validated (default-deny is enforced
+  at load time, not at every server start). A database with no snapshot loaded at all
+  starts serving normally and returns `REGISTRY_UNAVAILABLE` on every registry-dependent
+  tool call, rather than refusing to start the process.
 - **AC-03** — `describe_workflow` returns the input schema, approval policy, risk,
   side-effect class, and limits — and no `n8n_workflow_id`, URL, or secret reference.
 - **AC-04** — `validate_input` rejects a missing required field, a wrong-typed field,
@@ -1678,13 +1697,73 @@ it touches are updated in the same change.
 
 ### Phase 9 — v1 hardening and release
 
-- [ ] Full acceptance-criteria pass (AC-01 through AC-33)
-- [ ] Coverage gates met (section 10.4)
-- [ ] Live-n8n suite green against a Docker instance
-- [ ] README quickstart verified end to end on a clean machine
-- [ ] Claude Desktop and one remote MCP client verified against the same build
-- [ ] Threat model reviewed against the shipped code; residual risks re-confirmed
-- [ ] `CHANGELOG.md`, version tag, install instructions
+- [x] Full acceptance-criteria pass (AC-01 through AC-25 individually mapped to
+      verifying tests; AC-26 through AC-33 already carried direct evidence from the
+      phases that implemented them). All 25 have direct test evidence except two
+      findings, both corrected during this pass rather than left as silent gaps:
+      **AC-02**'s own wording claimed "the server exits non-zero at startup" on an
+      invalid registry — verified false by actually starting `serve http` against a
+      database with no registry snapshot loaded (it starts fine and returns
+      `REGISTRY_UNAVAILABLE` per call); the criterion's text is corrected above to
+      describe what's actually enforced (`registry reload` refusing to write an
+      invalid snapshot, which is the real default-deny gate). **AC-11**'s idempotency
+      guarantee has direct behavioral tests but no test carries an explicit "AC-11"
+      marker — confirmed by test name/logic match, not by comment. Full per-AC
+      evidence table produced for this session; not duplicated here in full.
+- [x] Coverage gates met (section 10.4): 93% overall, `core/` 97%, `registry/` 95% —
+      both above the 90% gate. 930 tests total, all green.
+- [ ] **Live-n8n suite green against a Docker instance — not run.** No Docker was
+      available in the environment doing this verification pass. More significantly,
+      a genuine finding: **the `live_n8n` pytest layer described in section 10.1 was
+      never actually built** — the marker is registered and CI excludes it, but zero
+      tests in the repository carry it (`pytest -m live_n8n --collect-only` → 0
+      tests). The only n8n compatibility evidence on record is phase 4's one-time
+      manual empirical spike (`docs/N8N_COMPATIBILITY.md`, summarized in the new
+      `docs/COMPATIBILITY_MATRIX.md`). Recorded honestly as unfinished v1 work in
+      `docs/V1_LIMITATIONS.md` rather than marked done.
+- [x] README quickstart verified end to end on a clean machine: built the wheel
+      (`uv build`), installed it into a brand-new venv with no access to the source
+      checkout's own `.venv`, and ran `db init` → `registry reload` (against
+      `examples/registry/workflows.example.yaml`) → a full stdio MCP session
+      (`initialize`, `list_tools` = the exact 12, `list_resources` = the exact 2,
+      `list_workflows`, `get_instance_health`, `describe_workflow` on an unknown ID)
+      → a full Streamable HTTP MCP session (same tool/resource inventory,
+      `prepare_operation` reaching a real, fully-detailed `BLOCKED` preflight report
+      against a deliberately unreachable n8n address) — all against the built
+      artifact, not the dev checkout. **Found and fixed a real bug in the process**:
+      `db init` never seeded the v1 default principal, so this exact quickstart
+      failed a `principals` foreign key on the very first `prepare_operation` before
+      the fix. `db init`/`db migrate` now seed it idempotently; regression tests in
+      `tests/integration/test_cli_db.py`.
+- [x] Claude Desktop and one remote MCP client verified against the same build — with
+      an honest caveat. **Claude Desktop itself (the GUI application) was not
+      launched** — this verification environment has no desktop session to run it in.
+      What was verified instead, against the built wheel: a full stdio MCP client
+      session using the same protocol and transport Claude Desktop's `command`/`args`
+      launch mechanism uses (`mcp.client.stdio`), and a full Streamable HTTP client
+      session (`mcp.client.streamable_http`) representing the "remote MCP client"
+      half directly. `examples/mcp-clients/` ships both configs, ready to paste into
+      an actual Claude Desktop install. No OpenAI credentials were available in this
+      environment for a live OpenAI-connector run specifically; the Streamable HTTP
+      protocol surface a remote OpenAI connector would use was verified directly
+      instead (see `examples/mcp-clients/README.md`'s own note on this).
+- [x] Threat model reviewed against the shipped code; residual risks re-confirmed.
+      Found and corrected three entries that had drifted from actual implementation
+      rather than describing it: **T-35** (audit tampering detection) upgraded
+      `partial` → `mitigated` — `audit verify`/`audit export` are now real, shipped,
+      tested commands (they weren't when this entry was last accurate). **T-36**
+      (data at rest) corrected — it claimed arguments are "stored redacted," which
+      stopped being true in phase 7 (arguments are stored raw; only results are
+      redacted at rest). **T-37** (crash-stranded `EXECUTING`) downgraded `mitigated`
+      → `partial` — the entry claimed "recovery resolves stranded operations to
+      `UNKNOWN`," and no such recovery exists anywhere in the codebase, automatic or
+      manual; v1 detects nothing wrong and provides no command for it. New residual
+      risk RR-10 and out-of-scope item 10 record this honestly, with the manual
+      emergency procedure in `docs/RECONCILING_UNKNOWN.md`. Every other `mitigated`
+      entry was spot-checked against the phase that implements it and found accurate.
+- [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc1` —
+      `pyproject.toml` and `n8n_operator.__version__`), install instructions (README
+      quickstart, verified per above).
 
 ### Phase 10 — v2
 

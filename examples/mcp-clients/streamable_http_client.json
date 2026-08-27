@@ -1,0 +1,12 @@
+{
+  "_comment": "JSON has no comment syntax; this key is documentation only and is not read by any client. A generic Streamable HTTP MCP client configuration — the exact key names vary by client (see examples/mcp-clients/README.md for specifics). N8N_OPERATOR_HTTP_BEARER_TOKEN and N8N_OPERATOR_HTTP_ALLOWED_ORIGINS are REQUIRED on the server side for any bind other than loopback (boundary B9) — the server refuses to start without both.",
+  "mcpServers": {
+    "n8n-operator": {
+      "url": "https://operator.example.com/mcp",
+      "transport": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_BEARER_TOKEN"
+      }
+    }
+  }
+}

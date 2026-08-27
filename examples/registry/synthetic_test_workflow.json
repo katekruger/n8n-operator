@@ -1,0 +1,131 @@
+{
+  "name": "n8n Operator — synthetic test workflow",
+  "nodes": [
+    {
+      "id": "webhook-node-1",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {},
+        "path": "operator-smoke-test",
+        "responseMode": "responseNode"
+      },
+      "position": [-200, 0],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2
+    },
+    {
+      "id": "validate-node-1",
+      "name": "Validate Input",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assign-1",
+              "name": "valid",
+              "type": "boolean",
+              "value": "={{ typeof $json.body.value === 'number' }}"
+            },
+            {
+              "id": "assign-2",
+              "name": "value",
+              "type": "number",
+              "value": "={{ $json.body.value }}"
+            }
+          ]
+        },
+        "mode": "manual",
+        "options": {}
+      },
+      "position": [20, 0],
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4
+    },
+    {
+      "id": "route-node-1",
+      "name": "Route",
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-1",
+              "leftValue": "={{ $json.valid }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": true
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        },
+        "options": {}
+      },
+      "position": [240, 0],
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2
+    },
+    {
+      "id": "process-node-1",
+      "name": "Process",
+      "parameters": {
+        "jsCode": "return [{ json: { result: $input.first().json.value * 2 } }];"
+      },
+      "position": [460, -80],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "id": "respond-success-1",
+      "name": "Respond Success",
+      "parameters": {
+        "options": {},
+        "respondWith": "json",
+        "responseBody": "={{ { \"n8n_operator\": { \"execution_id\": $execution.id }, \"data\": { \"result\": $json.result } } }}"
+      },
+      "position": [680, -80],
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4
+    },
+    {
+      "id": "respond-error-1",
+      "name": "Respond Error",
+      "parameters": {
+        "options": {
+          "responseCode": 400
+        },
+        "respondWith": "json",
+        "responseBody": "={{ { \"n8n_operator\": { \"execution_id\": $execution.id }, \"error\": \"invalid input\" } }}"
+      },
+      "position": [460, 80],
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Input": {
+      "main": [[{ "node": "Route", "type": "main", "index": 0 }]]
+    },
+    "Route": {
+      "main": [
+        [{ "node": "Process", "type": "main", "index": 0 }],
+        [{ "node": "Respond Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Process": {
+      "main": [[{ "node": "Respond Success", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

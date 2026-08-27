@@ -1,8 +1,9 @@
 """n8n Operator — a governed MCP control plane for approved n8n workflows.
 
-Phase 0 (architecture and bootstrap): this package is a structural skeleton only.
-No product functionality is implemented yet. See ``docs/BUILD_PLAN.md`` section 12
-for the phase checklist that fills it in.
+v1: registry, MCP server (stdio + Streamable HTTP), n8n integration, the full
+prepare/approve/execute lifecycle, and the operator CLI. See ``docs/BUILD_PLAN.md``
+section 12 for the phase checklist and ``docs/V1_LIMITATIONS.md`` for what v1
+deliberately does not do.
 
 Layering (ADR-001, enforced by a contract test):
 
@@ -11,6 +12,6 @@ Layering (ADR-001, enforced by a contract test):
 ``core`` must not import any adapter package, ``fastapi``, ``typer``, or the MCP SDK.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0rc1"
 
 __all__ = ["__version__"]

@@ -6,6 +6,188 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.0.0-rc1] - 2026-08-27
+
+### Added — phase 9: v1 release preparation
+
+Full release-readiness pass: every acceptance criterion AC-01–AC-25 mapped to its
+verifying test, the full quality gate re-run clean (ruff, format, mypy strict, the
+complete pytest suite, coverage gates, the import-graph layering contract, a manual
+secret scan, a package build, a fresh-database migration, and end-to-end MCP smoke
+tests over both stdio and Streamable HTTP against the built wheel in an isolated
+environment), and `docs/THREAT_MODEL.md` reviewed against shipped code rather than
+design intent.
+
+- **Found and fixed a real pre-release bug**: nothing in the shipped product ever
+  created the v1 default (`"local"`) principal row — every test passed only because
+  test fixtures seeded it directly, bypassing the CLI path a real user takes. A
+  genuinely fresh `db init` → `registry reload` → `prepare_operation` failed a
+  `principals` foreign key on first use. `n8n-operator db init`/`db migrate` now seed
+  it idempotently; regression tests added
+  (`tests/integration/test_cli_db.py::test_a_genuinely_fresh_cli_only_install_can_prepare_an_operation`
+  and neighbors).
+- **Corrected AC-02's own wording** to match shipped behavior: `serve stdio`/
+  `serve http` do not read the registry file or refuse to start on an invalid one —
+  they serve from whatever snapshot `registry reload` already validated into the
+  database (which is the actual default-deny enforcement point), and return
+  `REGISTRY_UNAVAILABLE` per call, not at startup, when no snapshot exists.
+- **Corrected three stale `THREAT_MODEL.md` entries** against actual implementation:
+  T-35 (audit tampering detection) upgraded `partial` → `mitigated` now that
+  `audit verify`/`audit export` are real, shipped, tested commands; T-36 (data at
+  rest) corrected — operation arguments are stored **raw**, not redacted, since phase
+  7 (dispatch and fingerprint re-verification need the real values); T-37
+  (crash-stranded `EXECUTING`) downgraded `mitigated` → `partial` — v1 has no
+  automatic or CLI-driven recovery for this case, only detection that it's stuck. New
+  residual risk RR-10 and out-of-scope item 10 record the T-37 gap explicitly.
+- `docs/V1_LIMITATIONS.md` (new): a plain-language index of every `partial`/`accepted`
+  threat-model item and version-boundary limitation, with the practical consequence
+  spelled out — not just the severity table.
+- `docs/RECONCILING_UNKNOWN.md` (new): the step-by-step manual procedure for resolving
+  an `UNKNOWN` operation (with and without an execution ID) and, separately, for the
+  rarer crash-stranded-`EXECUTING` case — including the exact emergency SQL for the
+  latter, since v1 provides no supported command for it.
+- `docs/COMPATIBILITY_MATRIX.md` (new): tested-version and feature-support summary,
+  distinct from `N8N_COMPATIBILITY.md`'s empirical deep-dive, plus the procedure for
+  extending it to a new n8n version.
+- `examples/registry/synthetic_test_workflow.json` (new): an importable n8n workflow
+  (webhook → validate → route → process/respond, with the `n8n_operator` response
+  envelope) — the same structure the phase 4 compatibility spike used, packaged for
+  reuse rather than re-derived from a sanitized test fixture.
+- `examples/mcp-clients/` (new): ready-to-copy Claude Desktop (stdio) and Streamable
+  HTTP configs, both verified against a real build of this package during release
+  testing — a full MCP session, not just "the process starts," over each transport.
+- `scripts/demo.sh` (new): a five-minute, no-n8n-required walkthrough of discovery,
+  validation, and the audit trail against a scratch database.
+- `SECURITY.md`, `CONTRIBUTING.md` (new).
+- `README.md`, this changelog: brought current with v1's actual shipped state (the
+  README had been stale since phase 1, still describing "no registry, MCP tool, or
+  n8n integration implemented yet").
+
+### Added — phase 8: operator surface
+
+Implements BUILD_PLAN section 12 phase 8. 51 new tests (926 total), 93% coverage
+overall; `core/` (96%) and `registry/` (94–98%) remain above the 90% gate.
+
+- `cli operations list | show | cancel` (`expire` already existed) — a `rich`-table or
+  `--json` history, one operation's full detail, and confirm-then-withdraw.
+- `cli audit verify | export` (new): `verify` walks the full hash chain and reports
+  the first break by sequence number, exiting the new code `2` (distinct from `1`, a
+  general/usage error). `export`
+  (`core.service.export_audit_record`) produces the full audit log, every operation's
+  transitions/actor/timestamps, and the registry snapshots those operations were
+  governed against — redacting arguments at the export boundary exactly like
+  `get_operation`, and never including `approvals` table content (including the
+  token hash) at all.
+- `logging_setup.py` (new, greenfield): structured JSON logs on the `n8n_operator`
+  logger namespace, a process-wide additive secret-scrub list, and a correlation ID
+  bound per CLI invocation and per Streamable HTTP request.
+- `cli health`: `get_instance_health` from the command line.
+
+### Added — phase 7: execution and debugging
+
+Implements BUILD_PLAN section 12 phase 7 — the highest-risk boundary. 40 new tests
+(875 total), 93% coverage overall.
+
+- `execute_operation` extended with the full pre-burn verification chain: handle/
+  operation-ID equality, lazy expiry, environment binding, an argument-fingerprint
+  re-verification, the registry's own current-snapshot drift check, then a *live*
+  re-check against n8n, and finally `max_concurrent` — the handle is burned *before*
+  the concurrency count is read (SQLite is single-writer; the burn is what makes a
+  caller's transaction acquire the write lock a stale-count race would otherwise slip
+  through).
+- `core.service.dispatch_operation` (new): the one function that manages its own
+  transactions, sandwiching the real dispatch call between two — a database
+  transaction is never held open across a network call.
+- Outcome mapping is conservative by construction: confirmed 2xx → `SUCCEEDED`,
+  confirmed non-2xx → `FAILED`, timeout/lost response/unparseable body → `UNKNOWN`. A
+  malformed-but-parseable correlation envelope does not demote a real success/error to
+  `UNKNOWN` — a pre-existing phase 4 test had this backwards and was corrected
+  alongside the fix in `n8n/client.py::dispatch_webhook`.
+- `n8n/client.py::get_execution_node_trace` (new): the one deliberate exception to
+  "never fetch `includeData=true`," reading only five named scalar fields per node so
+  it can never forward a node's raw payload.
+- Arguments are now stored **raw** at rest (previously redacted, which made dispatch
+  and fingerprint re-verification structurally impossible); redaction moved to the
+  read boundary (`get_operation`, the approval-decision context).
+
+### Added — phase 6: approval
+
+Implements BUILD_PLAN section 12 phase 6 (ADR-010). 38 new tests (835 total), 94%
+coverage overall.
+
+- Approval token service (`core/handles.py`): 256-bit random token, sha256 hash at
+  rest, single-use, TTL-bounded, bound to operation ID, principal, argument
+  fingerprint, registry snapshot, and definition hash.
+- `cli operations approve | reject | expire | approval-status` — the canonical v1
+  approval channel, rendering the full decision surface before confirming.
+- `approval/app.py` + `approval/routes.py`: a loopback-only FastAPI app, CSRF-
+  protected, no token ever in a log line, safe cache headers, no framing.
+- Lazy transactional expiry made authoritative everywhere an operation is read or
+  acted on, plus a best-effort sweeper and `operations expire` for audit-timeline
+  fidelity.
+- **Concurrency fix found while building this phase's own tests**: every state
+  transition now catches a lost compare-and-set race and re-validates against the
+  row's current state, rather than propagating a raw `OptimisticLockError`.
+
+### Added — phase 5: MCP adapter
+
+Implements BUILD_PLAN section 12 phase 5. 92 new tests (797 total), 95% coverage
+overall.
+
+- All 12 v1 MCP tools and both v1 resources, over stdio and Streamable HTTP, with
+  identical schemas across both transports (AC-23) — verified by a cross-transport
+  contract test.
+- Response-shaping allowlists on every tool result; a property test asserts no
+  configured secret or n8n identifier ever appears in any result (AC-18).
+- Streamable HTTP transport security: loopback by default; a non-loopback bind
+  requires a bearer token **and** an Origin allowlist, or startup fails (boundary B9,
+  AC-20).
+- `cli serve stdio | serve http`.
+
+### Added — phase 4: n8n integration
+
+Implements BUILD_PLAN section 12 phase 4 (ADR-005/006/008/009). Includes a live
+empirical spike against a real, local-only n8n 2.35.7 instance — see
+`docs/N8N_COMPATIBILITY.md` for the full record.
+
+- `n8n/client.py`: httpx client with explicit connect/read timeouts, no retry logic
+  anywhere (statically enforced by a grep-based contract test).
+- `n8n/canonicalization.py`: versioned, evidence-driven definition hashing — every
+  field included by default; phase 4 ships with an **empty** exclusion allowlist,
+  since every candidate field tested was found behaviorally significant.
+- `n8n/preflight.py`: liveness, active-state, drift, and credential-binding checks,
+  including the non-blocking `warn`/`unverifiable` statuses ADR-009 introduces.
+- Dispatch correlation via an opt-in response envelope (`trigger.correlation:
+  response_envelope`) carrying the n8n execution ID.
+
+### Added — phase 3: core domain
+
+Implements BUILD_PLAN section 12 phase 3.
+
+- `core/service.py`: the full operation lifecycle — twelve states, fifteen
+  transitions — as plain functions over domain types, with no dependency on any
+  adapter (ADR-001).
+- `core/handles.py` (ADR-003): server-minted, single-use operation handles bound to
+  principal, workflow, and argument fingerprint.
+- `core/idempotency.py`: canonical-JSON argument fingerprints and namespace-scoped
+  idempotency (ADR-011).
+- `core/redaction.py`: the output redaction engine (`output.redact`, `max_bytes`).
+- The hash-chained audit log (`audit/chain.py`, `audit/writer.py`) and the
+  append-only `operation_events` trail, written atomically with every transition.
+
+### Added — phase 2: workflow registry
+
+Implements BUILD_PLAN section 12 phase 2 (ADR-002).
+
+- `registry/schema.py` + `registry/loader.py`: the full YAML registry schema, ten
+  load-time validation rules (R1–R12 by the time later phases finished), canonical
+  content hashing, and immutable snapshotting.
+- `registry/validation.py`: caller-argument validation against each workflow's
+  declared JSON Schema.
+- `cli registry validate | list | show | hash | reload`.
+
 ### Added — phase 1: configuration and storage foundation
 
 Implements BUILD_PLAN section 12 phase 1. Does not implement registry behavior, MCP

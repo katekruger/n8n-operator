@@ -1,6 +1,6 @@
 [project]
 name = "n8n-operator"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "A governed MCP control plane for discovering, validating, executing, and debugging approved n8n workflows."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

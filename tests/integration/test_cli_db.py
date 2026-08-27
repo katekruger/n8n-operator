@@ -127,6 +127,133 @@ def test_db_init_is_idempotent(cli_env: None) -> None:
 
 
 @pytest.mark.integration
+def test_db_init_seeds_the_default_principal(cli_env: None, cli_db_url: str) -> None:
+    """Phase 9 regression: a fresh install's first real ``prepare_operation`` failed a
+    ``principals`` foreign key, because nothing in the shipped product ever created the
+    v1 default principal row — every test before this one only worked because test
+    fixtures seeded it directly through the repository, bypassing the CLI path a real
+    user takes. ``db init`` now seeds it itself."""
+    from n8n_operator.storage.repository import PrincipalRepository
+    from n8n_operator.storage.session import create_engine_for_url, create_session_factory
+
+    result = runner.invoke(app, ["db", "init"])
+    assert result.exit_code == 0
+
+    engine = create_engine_for_url(cli_db_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_factory() as session:
+            principal = PrincipalRepository(session).get("local")
+    finally:
+        engine.dispose()
+    assert principal is not None
+    assert principal.kind == "local"
+
+
+@pytest.mark.integration
+def test_db_init_seeding_the_default_principal_is_idempotent(cli_env: None) -> None:
+    first = runner.invoke(app, ["db", "init"])
+    assert first.exit_code == 0
+    second = runner.invoke(app, ["db", "init"])
+    assert second.exit_code == 0, second.output
+    assert "Traceback" not in second.output
+
+
+@pytest.mark.integration
+def test_db_migrate_also_seeds_the_default_principal(cli_env: None, cli_db_url: str) -> None:
+    """``migrate`` (not just ``init``) can be the first command run against an empty
+    database (AC-24) — it must seed the principal too, not only ``init``."""
+    from n8n_operator.storage.repository import PrincipalRepository
+    from n8n_operator.storage.session import create_engine_for_url, create_session_factory
+
+    result = runner.invoke(app, ["db", "migrate"])
+    assert result.exit_code == 0
+
+    engine = create_engine_for_url(cli_db_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_factory() as session:
+            principal = PrincipalRepository(session).get("local")
+    finally:
+        engine.dispose()
+    assert principal is not None
+
+
+@pytest.mark.integration
+def test_a_genuinely_fresh_cli_only_install_can_prepare_an_operation(
+    cli_env: None, cli_db_url: str, tmp_path: Path
+) -> None:
+    """The real end-to-end regression test for the phase 9 finding above: nothing here
+    manually seeds a principal — only ``db init`` and ``registry reload``, the exact
+    two commands the README quickstart tells a new operator to run — and
+    ``prepare_operation`` (standing in for the MCP tool call a real client would make)
+    must succeed against the fresh database that leaves."""
+    from datetime import UTC, datetime
+    from typing import Any
+
+    from n8n_operator.core import service
+    from n8n_operator.core.models import PreflightResult
+    from n8n_operator.storage.session import (
+        create_engine_for_url,
+        create_session_factory,
+        session_scope,
+    )
+
+    class _FakePreflight:
+        def check(self, workflow: Any) -> PreflightResult:
+            return PreflightResult(ready=True, checks=[], checked_at=datetime.now(UTC))
+
+    registry_path = tmp_path / "workflows.yaml"
+    registry_path.write_text(
+        """apiVersion: n8n-operator/v1
+metadata:
+  name: fresh-install-test
+workflows:
+  - id: wf.smoke
+    n8n_workflow_id: n8n-1
+    title: Smoke
+    description: A smoke-test workflow.
+    owner: carolyn
+    version: 1
+    definition_hash: sha256:{hash_a}
+    risk: low
+    side_effects: read_only
+    approval: none
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/a
+      auth: none
+    input_schema:
+      type: object
+      additionalProperties: false
+""".format(hash_a="a" * 64)
+    )
+
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0, init_result.output
+    reload_result = runner.invoke(app, ["registry", "reload", "--path", str(registry_path)])
+    assert reload_result.exit_code == 0, reload_result.output
+
+    engine = create_engine_for_url(cli_db_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_scope(session_factory) as session:
+            operation, _replay, _token = service.prepare_operation(
+                session,
+                principal_id="local",
+                environment="default",
+                workflow_id="wf.smoke",
+                arguments={},
+                preflight=_FakePreflight(),
+                server_max_argument_bytes=262_144,
+            )
+        assert operation.state == "APPROVED"  # read_only + approval: none auto-approves
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.integration
 def test_no_secret_setting_names_appear_in_any_db_command_output(cli_env: None) -> None:
     """A blunt but meaningful guard: db command output should never resemble a
     credential dump, whatever the command's outcome (ADR-006)."""
