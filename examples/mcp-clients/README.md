@@ -80,9 +80,25 @@ The config shape above is generic Streamable HTTP — the same `url`+bearer-toke
 most remote MCP connectors expect, OpenAI's included. The exact place to paste it
 (a connector settings page, a `mcp_servers` block in an API request, etc.) is specific
 to whichever client you're using; consult that client's own MCP documentation for
-where the `url` and `Authorization` header go. Phase 9 release testing did not have
-credentials and a publicly reachable TLS endpoint for a live OpenAI/remote-connector
-run — the transport itself (bearer
-token enforcement, Origin allowlist, the 12-tool surface) was verified directly against
-the Streamable HTTP protocol instead; see `docs/BUILD_PLAN.md`'s phase 9 notes for
-exactly what that covered and what it didn't.
+where the `url` and `Authorization` header go.
+
+[`openai_responses_tool.json`](openai_responses_tool.json)'s `Authorization`+`Origin`
+`headers` map matches the OpenAI Responses API's own documented `mcp` tool schema
+(`https://developers.openai.com/api/docs/api-reference/responses/create`, `tools[].mcp`):
+`headers` is real and documented ("Optional HTTP headers to send to the MCP server.
+Use for authentication or other purposes."), confirmed directly against that page
+rather than assumed. What that page does *not* say is whether OpenAI's hosted backend
+forwards a literal `Origin` header override verbatim on its outbound request — that's
+unverified without a real hosted call.
+
+No credentials and no publicly reachable TLS endpoint have been available for a live
+OpenAI/remote-connector run. What has been verified instead, automated and run on
+every CI pytest pass: `tests/integration/test_mcp_http_openai_compat.py` drives the
+real `build_server`/`serve_http` middleware stack in-process, configured non-loopback
+so the actual bearer-token and Origin-allowlist enforcement (boundary B9) runs exactly
+as a real remote deployment would hit it — a full MCP session using the documented
+`Authorization`+`Origin` header shape (init, the identical 12-tool/2-resource surface,
+a safe tool call, session continuation), plus the missing-bearer, missing-origin, and
+disallowed-origin rejections. This is protocol-and-transport-level evidence, not a
+substitute for an actual hosted OpenAI request; see `docs/BUILD_PLAN.md`'s phase 9
+notes for the full detail of what's covered and what still isn't.

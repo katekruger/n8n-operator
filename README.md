@@ -24,7 +24,7 @@ approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.*
 |---|---|---|
 | MCP stdio clients (Claude Desktop and similar) | stdio | ✅ Automated on every CI push — `scripts/release_smoke.sh` runs a full MCP session against the built wheel (reference `mcp` Python client v2.1.1, last verified 2026-08-27) |
 | Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified (phase 9, one-time manual run) |
-| OpenAI hosted connector | Streamable HTTP | 🟡 Configuration documented; live connector verification pending |
+| OpenAI Responses API `mcp` tool shape | Streamable HTTP | 🟢 Automated on every CI test run — a real MCP session against the documented `Authorization`+`Origin` `headers` shape, with bearer/Origin enforcement exercised (`tests/integration/test_mcp_http_openai_compat.py`); 🟡 an actual hosted OpenAI request is still pending a public TLS endpoint and credentials |
 | n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; repeatable live gate available |
 
 <sub>"MCP session verified" always means the reference `mcp` protocol client, not a

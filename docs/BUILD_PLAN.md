@@ -1769,8 +1769,32 @@ it touches are updated in the same change.
       `scripts/release_smoke.sh`, so it executes on every CI push
       (`build · clean-install smoke`), not only when someone remembers to run it by
       hand. It also asserts the tool call and resource read carry none of the real
-      registry's `n8n_workflow_id` values or the configured n8n base URL/API key. The
-      Streamable HTTP half remains the phase 9 manual, one-time result above.
+      registry's `n8n_workflow_id` values or the configured n8n base URL/API key.
+
+      The Streamable HTTP half is now also automated, in
+      `tests/integration/test_mcp_http_openai_compat.py` (5 tests, run in every CI
+      pytest pass, not opt-in). Before writing it, the OpenAI Responses API's official
+      `mcp` tool reference
+      (`https://developers.openai.com/api/docs/api-reference/responses/create`) was
+      checked directly: the `mcp` tool object documents `server_url`, an `authorization`
+      OAuth-token field, and — confirmed only in the API reference, not the higher-level
+      guide page, which omits it — a `headers` map, "Optional HTTP headers to send to
+      the MCP server. Use for authentication or other purposes." That confirms
+      `examples/mcp-clients/openai_responses_tool.json`'s `Authorization`+`Origin`
+      `headers` shape is a real, documented mechanism, not an invented one — though
+      neither the guide nor the reference states whether OpenAI's hosted backend will
+      forward a literal `Origin` override verbatim; that remains unverified without a
+      real hosted call. The test suite runs the real `build_server`/`serve_http`
+      middleware stack (not a hand-rolled substitute) in-process over an ASGI
+      transport, configured non-loopback so the actual bearer-token + Origin-allowlist
+      enforcement (boundary B9) is exercised exactly as a real remote deployment would
+      hit it: a full session with the documented header shape (init, the identical
+      12-tool/2-resource surface stdio serves, a safe tool call, session continuation),
+      and the missing-bearer/missing-origin/disallowed-origin rejections. This is
+      **not** a real hosted OpenAI Responses API call — no publicly reachable TLS
+      endpoint or OpenAI credentials were available to attempt one; per the
+      release-readiness task's Phase 5 stop condition, that requires explicit
+      human-in-the-loop approval before any public exposure, not attempted here.
 - [x] Threat model reviewed against the shipped code; residual risks re-confirmed.
       Found and corrected three entries that had drifted from actual implementation
       rather than describing it: **T-35** (audit tampering detection) upgraded
