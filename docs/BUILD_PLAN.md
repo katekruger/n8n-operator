@@ -1829,11 +1829,10 @@ it touches are updated in the same change.
       directly from the matching `CHANGELOG.md` section via
       `scripts/extract_changelog_section.py`, never hand-typed separately) →
       `pypi` (trusted publishing / OIDC, `pypa/gh-action-pypi-publish`, no long-lived
-      token). The last two jobs each target a GitHub Environment (`release`, `pypi`)
-      that does not exist yet in this repository — creating one with required
-      reviewers needs a paid plan while private, the same constraint already
-      documented for branch protection — so a run reaching either job fails closed at
-      the environment gate rather than silently publishing. `docs/RELEASE_ROLLBACK.md`
+      token). The last two jobs each target a GitHub Environment (`release`, `pypi`) —
+      both now created, restricted to protected branches only (`main`); neither has a
+      required-reviewer rule configured (naming a specific human reviewer is a decision
+      only the repository owner can make). `docs/RELEASE_ROLLBACK.md`
       documents the rollback (GitHub Release/tag deletion) and yank (PyPI has no
       delete; yanking is the only correction mechanism, and needs a human with PyPI
       account access) procedures for either surface. Nothing in this workflow has
