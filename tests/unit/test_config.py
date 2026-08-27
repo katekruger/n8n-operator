@@ -8,6 +8,8 @@ precisely.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from pydantic import SecretStr
 
@@ -101,19 +103,62 @@ def test_env_indirection_missing_variable_fails_safely(monkeypatch: pytest.Monke
 
 
 @pytest.mark.unit
-def test_keyring_indirection_without_the_extra_installed_fails_safely() -> None:
-    # The 'keyring' package is an optional extra (pyproject.toml), not installed by
-    # default — this is exactly the environment most operators run in, and the failure
-    # must be a clear, actionable ValueError, not an unhandled ImportError traceback.
+def test_keyring_indirection_without_the_extra_installed_fails_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 'keyring' package is an optional extra (pyproject.toml) — many operators
+    # genuinely won't have it, and the failure must be a clear, actionable ValueError,
+    # never an unhandled ImportError traceback. Forced via sys.modules rather than
+    # relying on the ambient test environment actually lacking the package: CI installs
+    # every extra (`uv sync --all-extras --dev`), so "not installed" must be simulated
+    # to be tested at all, deterministically, on every machine this runs on.
+    monkeypatch.setitem(sys.modules, "keyring", None)
     with pytest.raises(ValueError, match="keyring") as excinfo:
         resolve_secret_reference("keyring:myservice/myaccount")
     assert "myservice/myaccount" in str(excinfo.value)
+    assert "extra" in str(excinfo.value)
 
 
 @pytest.mark.unit
 def test_keyring_indirection_requires_service_slash_account() -> None:
     with pytest.raises(ValueError, match="SERVICE/ACCOUNT"):
         resolve_secret_reference("keyring:no-slash-here")
+
+
+class _FakeKeyring:
+    """A minimal stand-in for the real ``keyring`` package's module-level API — just
+    ``get_password``, the only function ``resolve_secret_reference`` calls. Lets the
+    two tests below exercise "the extra *is* installed" deterministically, without
+    depending on (or mutating) any real OS keychain."""
+
+    def __init__(self, value: str | None) -> None:
+        self._value = value
+        self.calls: list[tuple[str, str]] = []
+
+    def get_password(self, service: str, account: str) -> str | None:
+        self.calls.append((service, account))
+        return self._value
+
+
+@pytest.mark.unit
+def test_keyring_indirection_with_the_extra_installed_resolves_the_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeKeyring("s3cr3t-from-keychain")
+    monkeypatch.setitem(sys.modules, "keyring", fake)
+    resolved = resolve_secret_reference("keyring:myservice/myaccount")
+    assert resolved == "s3cr3t-from-keychain"
+    assert fake.calls == [("myservice", "myaccount")]
+
+
+@pytest.mark.unit
+def test_keyring_indirection_with_the_extra_installed_but_no_value_fails_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "keyring", _FakeKeyring(None))
+    with pytest.raises(ValueError, match="returned no value") as excinfo:
+        resolve_secret_reference("keyring:myservice/myaccount")
+    assert "myservice/myaccount" in str(excinfo.value)
 
 
 @pytest.mark.unit

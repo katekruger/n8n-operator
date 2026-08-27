@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from pydantic import Field, HttpUrl, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -87,7 +87,7 @@ def resolve_secret_reference(value: str) -> str:
             f"secret reference 'keyring:{target}' requires the optional 'keyring' extra: "
             "install with `uv sync --extra keyring`"
         ) from exc
-    resolved = cast("str | None", keyring.get_password(service, account))
+    resolved = keyring.get_password(service, account)
     if resolved is None:
         raise ValueError(f"secret reference 'keyring:{target}' returned no value")
     return resolved
