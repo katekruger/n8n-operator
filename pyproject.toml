@@ -33,13 +33,13 @@ dependencies = [
   "httpx>=0.28,<1",
   # CLI
   "typer>=0.27,<1",
-  "rich>=13.9,<15",
+  "rich>=13.9,<16",
   # Registry: YAML parsing, JSON Schema 2020-12 validation, JSONPath redaction
   "pyyaml>=6.0,<7",
   "jsonschema>=4.23,<5",
   "jsonpath-ng>=1.7,<2",
   # Operation handles and event ordering
-  "python-ulid>=3.0,<4",
+  "python-ulid>=3.0,<5",
 ]
 
 [project.optional-dependencies]
