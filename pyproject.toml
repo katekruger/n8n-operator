@@ -62,7 +62,7 @@ dev = [
   "pytest-cov>=7.0,<8",
   "hypothesis>=6.165,<7",
   "ruff>=0.14,<1",
-  "mypy>=1.14,<2",
+  "mypy>=1.14,<3",
   "types-pyyaml>=6.0,<7",
   "types-jsonschema>=4.26.0.20260518",
 ]
