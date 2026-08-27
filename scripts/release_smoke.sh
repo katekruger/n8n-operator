@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SMOKE_DIR="$(mktemp -d -t n8n-operator-release-smoke)"
+SMOKE_DIR="$(mktemp -d -t n8n-operator-release-smoke.XXXXXX)"
 cleanup() { rm -rf "$SMOKE_DIR"; }
 trap cleanup EXIT
 

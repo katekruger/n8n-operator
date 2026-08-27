@@ -32,7 +32,7 @@ else
   exit 1
 fi
 
-DEMO_DIR="$(mktemp -d -t n8n-operator-demo)"
+DEMO_DIR="$(mktemp -d -t n8n-operator-demo.XXXXXX)"
 cleanup() {
   if [[ "$KEEP" -eq 1 ]]; then
     echo
