@@ -15,6 +15,10 @@ permissions:
 jobs:
   analyze:
     name: analyze Python
+    # GitHub code scanning is unavailable for this private repo on the current plan.
+    # The job activates automatically when the repository is made public; Gitleaks
+    # remains the enforced security scan while it is private.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

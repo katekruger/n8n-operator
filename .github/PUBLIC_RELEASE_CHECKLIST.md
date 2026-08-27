@@ -9,6 +9,7 @@ a package. Visibility and publication are separate, explicit operator decisions.
 - [ ] Push protection enabled
 - [ ] Private vulnerability reporting enabled and tested from the public Security tab
 - [ ] CodeQL and Secret scan workflows green on the release commit
+- [ ] Confirm the visibility-triggered CodeQL job ran (it is intentionally skipped while private)
 - [ ] Dependabot alerts reviewed; no unresolved critical or high-risk finding
 - [ ] Branch protection requires CI, CodeQL, and Secret scan
 - [ ] Repository topics, description, homepage, and social preview reviewed
