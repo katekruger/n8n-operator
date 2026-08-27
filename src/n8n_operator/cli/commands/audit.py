@@ -1,9 +1,151 @@
 """``n8n-operator audit`` — verify, export.
 
 ``audit verify`` walks the hash chain and reports the first break by sequence number
-(AC-22). ``audit export`` produces a complete, chain-verifiable record (AC-25).
+(AC-22). ``audit export`` produces a complete, chain-verifiable record: every audit
+entry, every operation's state transitions, and the registry snapshots those operations
+were governed against — enough for a separate process to independently re-verify the
+chain and reconstruct what happened, with arguments redacted per each workflow's own
+``output.redact`` policy and no approval token, n8n credential, or webhook secret ever
+included (AC-25; BUILD_PLAN section 9.4; see ``core.service.export_audit_record``'s own
+docstring for exactly what is and is not in the export, and why).
+
+Neither command requires ``N8N_OPERATOR_N8N_BASE_URL``/``N8N_OPERATOR_N8N_API_KEY`` —
+the same "governance state is orthogonal to n8n reachability" reasoning
+``operations.py`` already documents for approve/reject/expire, applied here to
+inspecting and exporting that state's own audit trail.
 
 Phase 8 (BUILD_PLAN section 12).
 """
 
 from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+import typer
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, sessionmaker
+
+from n8n_operator.config import resolve_database_url
+from n8n_operator.core import service
+from n8n_operator.storage.session import (
+    create_engine_for_url,
+    create_session_factory,
+    session_scope,
+)
+
+app = typer.Typer(help="Verify and export the audit trail.", no_args_is_help=True)
+
+EXIT_CHAIN_BROKEN = 2
+"""``audit verify``'s exit code when the chain does not verify — distinct from ``1``
+(a general/usage error, e.g. an uninitialized database) so a monitoring script can tell
+"the audit trail was tampered with" apart from "this command was invoked wrong"."""
+
+
+@contextmanager
+def _connected() -> Iterator[sessionmaker[Session]]:
+    engine: Engine = create_engine_for_url(resolve_database_url())
+    try:
+        yield create_session_factory(engine)
+    finally:
+        engine.dispose()
+
+
+def _database_not_initialized_or_exit() -> None:
+    typer.secho(
+        "Database is not initialized — run `n8n-operator db init` first.",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+@app.command("verify")
+def verify(
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Walk the audit hash chain and report whether it is intact.
+
+    A clean database exits ``0``. A broken chain — any row whose stored content no
+    longer matches its own hash, or whose ``prev_hash`` no longer matches the entry
+    before it — exits ``2`` and names the exact sequence number where verification
+    first failed (AC-22). This is tamper-*evidence*, not tamper-*proofing*: it proves a
+    row was changed, not who changed it or what it said before.
+    """
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                result = service.verify_audit_chain(session)
+        except OperationalError:
+            _database_not_initialized_or_exit()
+            return
+
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": result.ok,
+                    "first_break_seq": result.first_break_seq,
+                    "reason": result.reason,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif result.ok:
+        typer.secho("OK — the audit chain is intact.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            f"BROKEN at seq={result.first_break_seq}: {result.reason}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+
+    if not result.ok:
+        raise typer.Exit(code=EXIT_CHAIN_BROKEN)
+
+
+@app.command("export")
+def export(
+    output: Path | None = typer.Option(
+        None, "--output", "-o", help="Write to this file instead of stdout."
+    ),
+) -> None:
+    """Produce a complete, chain-verifiable, redacted record of every operation and the
+    full audit log (AC-25) — see this module's docstring for exactly what is and is not
+    included. Always JSON, with sorted keys, so two exports of the same underlying
+    state produce byte-identical *data* (the ``exported_at`` timestamp is the one
+    field that necessarily differs run to run).
+    """
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                record = service.export_audit_record(session)
+        except OperationalError:
+            _database_not_initialized_or_exit()
+            return
+
+    payload = json.dumps(record, indent=2, sort_keys=True)
+    if output is not None:
+        output.write_text(payload + "\n", encoding="utf-8")
+        typer.echo(
+            f"Wrote {len(record['operations'])} operation(s) and "
+            f"{len(record['audit_log'])} audit entries to {output}."
+        )
+    else:
+        typer.echo(payload)
+
+    if not record["chain"]["ok"]:
+        typer.secho(
+            f"WARNING: the exported audit chain is broken at "
+            f"seq={record['chain']['first_break_seq']}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_CHAIN_BROKEN)
+
+
+__all__ = ["app"]

@@ -16,7 +16,12 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from n8n_operator.mcp.transports import _is_loopback_bind, _TransportSecurityMiddleware
+from n8n_operator.logging_setup import get_correlation_id
+from n8n_operator.mcp.transports import (
+    _CorrelationIdMiddleware,
+    _is_loopback_bind,
+    _TransportSecurityMiddleware,
+)
 
 
 async def _inner_endpoint(request: object) -> PlainTextResponse:
@@ -97,3 +102,43 @@ def test_is_loopback_bind() -> None:
     assert _is_loopback_bind("::1:8000")
     assert not _is_loopback_bind("0.0.0.0:8000")
     assert not _is_loopback_bind("10.0.0.5:8000")
+
+
+# --------------------------------------------------------------------------------------
+# _CorrelationIdMiddleware — phase 8.
+# --------------------------------------------------------------------------------------
+
+
+async def _echo_correlation_id(request: object) -> PlainTextResponse:
+    return PlainTextResponse(get_correlation_id() or "")
+
+
+def _correlated_client() -> TestClient:
+    inner = Starlette(routes=[Route("/mcp", _echo_correlation_id)])
+    return TestClient(_CorrelationIdMiddleware(inner))
+
+
+def test_a_request_has_a_non_empty_correlation_id() -> None:
+    response = _correlated_client().get("/mcp")
+    assert response.status_code == 200
+    assert response.text != ""
+
+
+def test_two_requests_get_different_correlation_ids() -> None:
+    client = _correlated_client()
+    first = client.get("/mcp").text
+    second = client.get("/mcp").text
+    assert first != second
+
+
+def test_correlation_id_is_restored_after_the_request_completes() -> None:
+    """The middleware's ``correlation_scope`` unwinds when the request finishes —
+    whatever was bound (or not) before the request is exactly what's bound after,
+    never left as that request's own ID. Compares before/after rather than asserting
+    an absolute ``None``: this test suite shares one process across many test cases,
+    some of which (any CLI test, via ``bind_correlation_id``'s deliberate no-unbind
+    shape) may have already bound something ambient before this test ever runs."""
+    before = get_correlation_id()
+    _correlated_client().get("/mcp")
+    after = get_correlation_id()
+    assert after == before

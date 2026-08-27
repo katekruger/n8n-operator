@@ -821,7 +821,7 @@ def test_no_update_or_delete_method_exists_on_audit_log_repository() -> None:
     """Boundary B11: append-only. There is no method here that could update or delete a
     row — checked directly against the class's own public interface."""
     public_methods = {name for name in dir(AuditLogRepository) if not name.startswith("_")}
-    assert public_methods == {"append", "get_last", "get_last_hash", "list_range"}
+    assert public_methods == {"append", "get_last", "get_last_hash", "list_range", "list_all"}
 
 
 @pytest.mark.integration

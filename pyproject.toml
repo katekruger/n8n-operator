@@ -33,6 +33,7 @@ dependencies = [
   "httpx>=0.28,<1",
   # CLI
   "typer>=0.27,<1",
+  "rich>=13.9,<15",
   # Registry: YAML parsing, JSON Schema 2020-12 validation, JSONPath redaction
   "pyyaml>=6.0,<7",
   "jsonschema>=4.23,<5",
@@ -107,6 +108,14 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["n8n_operator"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer's own signature-introspection requires typer.Option(...)/typer.Argument(...) to
+# be the actual default value (B008 otherwise flags any non-trivially-immutable
+# annotation, e.g. Path | None or list[str] | None, as a mutable-default risk it isn't
+# here — the call runs once at definition time either way, and Typer treats the result
+# as an immutable option/argument spec, never mutates it).
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 # ---------------------------------------------------------------------------
 # Type checking

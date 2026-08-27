@@ -275,6 +275,16 @@ class OperationRepository:
         stmt = stmt.order_by(Operation.created_at.desc()).limit(limit)
         return list(self._session.scalars(stmt))
 
+    def list_all(self, *, limit: int = 10_000) -> builtins.list[Operation]:
+        """Every operation, across every principal, oldest first — audit export's own
+        read path (phase 8, AC-25). Not principal-scoped, unlike :meth:`list`: an
+        export is an operator-level view of the whole system, not one caller's own
+        history."""
+        stmt: Select[tuple[Operation]] = (
+            select(Operation).order_by(Operation.created_at.asc()).limit(limit)
+        )
+        return list(self._session.scalars(stmt))
+
     def list_overdue(self, *, now: datetime) -> builtins.list[Operation]:
         """Every operation, across every principal, whose deadline has passed while it
         sits in a state lazy expiry would move (``PENDING_APPROVAL`` past
@@ -639,6 +649,26 @@ class AuditLogRepository:
             .limit(limit)
         )
         return list(self._session.scalars(stmt))
+
+    def list_all(self, *, page_size: int = 500) -> list[AuditLogEntry]:
+        """Every row in ``seq`` order, paging through :meth:`list_range` until a page
+        comes back short — ``audit verify``/``audit export``'s own read path (AC-22,
+        AC-25). Chain verification assumes the *first* entry it sees has
+        ``prev_hash == GENESIS_HASH``; a caller that instead fetched one 100-row page
+        at a time and verified each page independently would misreport every page
+        after the first as broken, so this method exists to hand back the whole table
+        in one call."""
+        entries: list[AuditLogEntry] = []
+        start_seq = 1
+        while True:
+            page = self.list_range(start_seq=start_seq, limit=page_size)
+            if not page:
+                break
+            entries.extend(page)
+            if len(page) < page_size:
+                break
+            start_seq = page[-1].seq + 1
+        return entries
 
 
 __all__ = [

@@ -1,4 +1,5 @@
-"""``n8n-operator operations`` — approve, reject, expire, approval-status.
+"""``n8n-operator operations`` — list, show, cancel, approve, reject, expire,
+approval-status.
 
 ``approve`` and ``reject`` are the **canonical** v1 approval channel (ADR-010); the
 loopback approval page is a convenience alternative over the same core use case. Both
@@ -12,15 +13,19 @@ approval app. It is a maintenance convenience only: lazy transactional expiry is
 authoritative, so no expired operation is ever executable regardless of whether this has
 run (invariant I9).
 
+``list``/``show`` are read-only history/detail views; ``cancel`` withdraws a
+``PENDING_APPROVAL`` or ``APPROVED`` operation before it runs, the same confirm-then-act
+shape ``approve``/``reject`` already use. Every command that prints a machine-readable
+form takes ``--json`` — sorted keys, so the same underlying state always prints the same
+bytes (no reliance on dict insertion order or any other incidental ordering).
+
 None of these commands requires ``N8N_OPERATOR_N8N_BASE_URL``/``N8N_OPERATOR_N8N_API_KEY``
 to be set — approving, rejecting, and expiring are pure Operator-state operations that
 never call n8n, so the operator can act on them even while n8n itself is unreachable
 (the same "schema management is orthogonal" reasoning ``db.py``/``registry.py`` already
 document, applied here to "governance state management").
 
-``list``, ``show``, and ``cancel`` arrive in phase 8.
-
-Phase 6 (BUILD_PLAN section 12).
+Phases 6 and 8 (BUILD_PLAN section 12).
 """
 
 from __future__ import annotations
@@ -28,23 +33,32 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import typer
+from rich.console import Console
+from rich.table import Table
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.config import resolve_database_url
 from n8n_operator.core import service
-from n8n_operator.core.models import ApprovalDecisionContext
-from n8n_operator.errors import InvalidStateTransitionError, OperationNotFoundError
+from n8n_operator.core.models import ApprovalDecisionContext, Operation
+from n8n_operator.errors import (
+    InvalidArgumentsError,
+    InvalidStateTransitionError,
+    OperationNotFoundError,
+)
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
     session_scope,
 )
 
-app = typer.Typer(help="Approve, reject, and expire pending operations.", no_args_is_help=True)
+app = typer.Typer(
+    help="List, inspect, cancel, approve, reject, and expire operations.", no_args_is_help=True
+)
 
 _PRINCIPAL_ID = "local"  # v1 has exactly one principal (BUILD_PLAN section 8.1)
 
@@ -101,6 +115,177 @@ def _render_context(context: ApprovalDecisionContext) -> None:
         )
     else:
         typer.echo("approval:            pending")
+
+
+def _summary_dict(operation: Operation) -> dict[str, Any]:
+    return {
+        "operation_id": operation.id,
+        "workflow_id": operation.workflow_id,
+        "state": operation.state,
+        "created_at": operation.created_at.isoformat(),
+        "updated_at": operation.updated_at.isoformat(),
+    }
+
+
+def _detail_dict(operation: Operation) -> dict[str, Any]:
+    return {
+        "operation_id": operation.id,
+        "workflow_id": operation.workflow_id,
+        "environment": operation.environment,
+        "state": operation.state,
+        "arguments": operation.arguments,
+        "definition_hash": operation.definition_hash,
+        "created_at": operation.created_at.isoformat(),
+        "updated_at": operation.updated_at.isoformat(),
+        "approval_expires_at": (
+            operation.approval_expires_at.isoformat()
+            if operation.approval_expires_at is not None
+            else None
+        ),
+        "execution_deadline": (
+            operation.execution_deadline.isoformat()
+            if operation.execution_deadline is not None
+            else None
+        ),
+        "n8n_execution_id": operation.n8n_execution_id,
+        "handle_used": operation.handle_burned_at is not None,
+    }
+
+
+@app.command("list")
+def list_operations(
+    workflow_id: str | None = typer.Option(None, "--workflow-id", help="Filter to one workflow."),
+    state: list[str] | None = typer.Option(
+        None, "--state", help="Repeatable; filter to these states."
+    ),
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="Max rows (1-100)."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print machine-readable JSON instead of a table."
+    ),
+) -> None:
+    """List this principal's own operations, most recently created first."""
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                operations = service.list_operations(
+                    session,
+                    principal_id=_PRINCIPAL_ID,
+                    workflow_id=workflow_id,
+                    states=state,
+                    limit=limit,
+                )
+        except InvalidArgumentsError as exc:
+            typer.secho(exc.message, fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+        except OperationalError:
+            typer.secho(
+                "Database is not initialized — run `n8n-operator db init` first.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+
+    if as_json:
+        typer.echo(json.dumps([_summary_dict(op) for op in operations], indent=2, sort_keys=True))
+        return
+
+    if not operations:
+        typer.echo("No operations.")
+        return
+
+    table = Table()
+    table.add_column("operation_id")
+    table.add_column("workflow_id")
+    table.add_column("state")
+    table.add_column("created_at")
+    for operation in operations:
+        table.add_row(
+            operation.id, operation.workflow_id, operation.state, operation.created_at.isoformat()
+        )
+    # A fixed, generous width rather than terminal auto-detection: operation IDs are
+    # 26-character ULIDs, and a narrow or non-TTY width (the common case for a piped
+    # or captured invocation) would otherwise truncate the one column that identifies
+    # the row at all.
+    Console(width=200).print(table)
+
+
+@app.command("show")
+def show(
+    operation_id: str = typer.Argument(..., help="The operation to show."),
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Show one operation's current state, redacted arguments, and deadlines."""
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                operation = service.get_operation(
+                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                )
+        except OperationNotFoundError:
+            _operation_not_found_or_exit(operation_id)
+            return
+
+    if as_json:
+        typer.echo(json.dumps(_detail_dict(operation), indent=2, sort_keys=True))
+        return
+
+    typer.echo(f"operation_id:        {operation.id}")
+    typer.echo(f"workflow_id:         {operation.workflow_id}")
+    typer.echo(f"environment:         {operation.environment}")
+    typer.echo(f"state:               {operation.state}")
+    typer.echo(f"arguments:           {json.dumps(operation.arguments, indent=2, sort_keys=True)}")
+    typer.echo(f"definition_hash:     {operation.definition_hash}")
+    typer.echo(f"created_at:          {operation.created_at.isoformat()}")
+    typer.echo(f"updated_at:          {operation.updated_at.isoformat()}")
+    if operation.approval_expires_at is not None:
+        typer.echo(f"approval_expires_at: {operation.approval_expires_at.isoformat()}")
+    if operation.execution_deadline is not None:
+        typer.echo(f"execution_deadline:  {operation.execution_deadline.isoformat()}")
+    if operation.n8n_execution_id is not None:
+        typer.echo(f"n8n_execution_id:    {operation.n8n_execution_id}")
+    typer.echo(f"handle_used:         {operation.handle_burned_at is not None}")
+
+
+@app.command("cancel")
+def cancel(
+    operation_id: str = typer.Argument(..., help="The operation to cancel."),
+    reason: str | None = typer.Option(None, "--reason", help="Recorded on the audit trail."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Withdraw a ``PENDING_APPROVAL`` or ``APPROVED`` operation before it runs."""
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                operation = service.get_operation(
+                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                )
+        except OperationNotFoundError:
+            _operation_not_found_or_exit(operation_id)
+            return
+
+        typer.echo(f"operation_id: {operation.id}")
+        typer.echo(f"workflow_id:  {operation.workflow_id}")
+        typer.echo(f"state:        {operation.state}")
+
+        if not yes and not typer.confirm("Cancel this operation?"):
+            typer.echo("Not canceled.")
+            raise typer.Exit(code=1)
+
+        try:
+            with session_scope(session_factory) as session:
+                updated = service.cancel_operation(
+                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID, reason=reason
+                )
+        except InvalidStateTransitionError:
+            typer.secho(
+                f"This operation is {operation.state}; only PENDING_APPROVAL or APPROVED "
+                "operations can be canceled.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+
+    typer.secho(f"Canceled. state={updated.state}", fg=typer.colors.GREEN)
 
 
 @app.command("approval-status")

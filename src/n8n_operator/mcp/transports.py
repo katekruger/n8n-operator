@@ -16,7 +16,12 @@ header as same-origin and lets it through — the wrong default for a listener t
 reject exactly that). It is applied only on a non-loopback bind; a loopback bind is
 unreachable from anywhere but a local process to begin with.
 
-Phase 5 (BUILD_PLAN section 12).
+:class:`_CorrelationIdMiddleware` (phase 8) is the Streamable HTTP counterpart to the
+CLI root callback's one-per-invocation correlation ID (``cli/main.py``): applied
+unconditionally, it binds a fresh ID per HTTP request rather than per process, since one
+long-running server process handles many requests.
+
+Phases 5 and 8 (BUILD_PLAN section 12).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from n8n_operator.config import Settings
+from n8n_operator.logging_setup import correlation_scope
 from n8n_operator.mcp.server import build_server
 
 __all__ = ["serve_http", "serve_stdio"]
@@ -83,6 +89,27 @@ class _TransportSecurityMiddleware:
         await self._app(scope, receive, send)
 
 
+class _CorrelationIdMiddleware:
+    """Binds a fresh correlation ID (``logging_setup.correlation_scope``) for the
+    duration of each HTTP request, so every log line a request's handling produces —
+    across every module, via the shared ``n8n_operator`` logger namespace — carries
+    the same ID, and the *next* request never inherits it. Applied unconditionally
+    (unlike :class:`_TransportSecurityMiddleware`, which only guards a non-loopback
+    bind): correlating log lines is useful regardless of bind, and costs nothing a
+    loopback deployment needs to opt out of.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        with correlation_scope():
+            await self._app(scope, receive, send)
+
+
 def serve_stdio(settings: Settings, session_factory: sessionmaker[Session]) -> None:
     """Run the MCP server over stdio (the default transport). Blocks until the client
     disconnects. Always local — the parent process launched this one (boundary B9)."""
@@ -108,6 +135,7 @@ def serve_http(settings: Settings, session_factory: sessionmaker[Session]) -> No
         max_request_body_size=max_request_body_size,
         event_store=None,
     )
+    app = _CorrelationIdMiddleware(app)
     if not caller_is_local:
         # `_validate_http_bind_guard` (config.py) already guarantees both are set.
         bearer_token = settings.http_bearer_token

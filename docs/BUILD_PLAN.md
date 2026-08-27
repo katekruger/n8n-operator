@@ -230,6 +230,7 @@ n8n-operator/
 │       ├── py.typed
 │       ├── config.py               # settings (Pydantic v2 BaseSettings)
 │       ├── errors.py               # error taxonomy
+│       ├── logging_setup.py        # structured JSON logs, correlation IDs, scrubbing
 │       ├── core/                   # transport-agnostic domain (ADR-001)
 │       │   ├── __init__.py
 │       │   ├── models.py           # domain types: Operation, Principal, Result
@@ -286,6 +287,7 @@ n8n-operator/
 │               ├── serve.py        # serve stdio | serve http | serve approval
 │               ├── operations.py   # list, show, cancel, expire
 │               ├── audit.py        # verify, export
+│               ├── health.py       # get_instance_health, from the command line
 │               └── db.py           # init, migrate, status
 └── tests/
     ├── conftest.py
@@ -1603,11 +1605,76 @@ it touches are updated in the same change.
 
 ### Phase 8 — Operator surface
 
-- [ ] `cli operations list | show | cancel | expire`
-- [ ] `cli audit verify | export`
-- [ ] Structured logging with secret scrubbing
-- [ ] `get_instance_health`
-- [ ] Tests: AC-22, AC-25
+- [x] `cli operations list | show | cancel` — `expire` already existed (phase 6).
+      `list` is this principal's own history, most recent first, as a `rich` table by
+      default or `--json` (sorted keys) on request; `show` is one operation's full
+      state, deadlines, and redacted arguments; `cancel` withdraws a
+      `PENDING_APPROVAL`/`APPROVED` operation, the same render-then-confirm shape
+      `approve`/`reject` already use. None of the three requires n8n configuration
+      (the same "governance state is orthogonal to n8n reachability" reasoning already
+      documented for `approve`/`reject`/`expire`).
+- [x] `cli audit verify | export` (`cli/commands/audit.py`, new). `verify` walks the
+      full hash chain (`storage.repository.AuditLogRepository.list_all`, paging
+      through `list_range` so a >100-row table is not misreported as broken after the
+      first page — `verify_chain` assumes the *first* entry it sees anchors to the
+      genesis hash) and reports the first break by sequence number, exiting `0`
+      (intact) or the new `2` (broken) — distinct from `1` (a general/usage error, e.g.
+      an uninitialized database) so a monitoring script can tell "tampered with" apart
+      from "invoked wrong." `export` (`core.service.export_audit_record`, new) produces
+      the full audit log, every operation's state transitions/actor/timestamps, and
+      the registry snapshot(s) those operations were governed against — sorted-key
+      JSON, to a file or stdout. Arguments are redacted at the export boundary exactly
+      like `get_operation` (`operations.arguments` has stored raw at rest since phase
+      7 — dispatch and fingerprint re-verification need the real values — so nothing
+      upstream of a read boundary is safe to hand out unredacted), with an optional
+      value-based `scrub_secrets` layer for a caller that has n8n configuration loaded
+      (the CLI itself does not, so it passes none, relying on the structural guarantee
+      that a credential is never written to the database at all — ADR-006). The
+      `approvals` table — including the token's hash — is not part of the export at
+      all; `operation_events` already carries every T06/T07 decision, actor, and
+      timestamp verification needs.
+- [x] Structured logging with secret scrubbing and correlation IDs
+      (`logging_setup.py`, new — greenfield: nothing in the codebase configured
+      logging before this phase). One JSON line per record
+      (`timestamp`/`level`/`logger`/`message`/`correlation_id`/extras) on the
+      `n8n_operator` logger namespace, to stderr, never stdout (a CLI command's own
+      `--json` output must never share a stream with operational log noise). A
+      process-wide, additive list of secret *values* (registered once known —
+      typically after `config.load_settings()` resolves the n8n API key or HTTP bearer
+      token) is scrubbed from every subsequent record regardless of which field put it
+      there — the log-output counterpart to `core.redaction.scrub_secrets`, duplicated
+      rather than imported so this module keeps zero internal dependencies and can be
+      configured before anything else is. A correlation ID (a `contextvars.ContextVar`)
+      is bound once per CLI invocation (`cli/main.py`'s new root callback, which
+      configures logging before every subcommand) and once per Streamable HTTP request
+      (`mcp/transports.py`'s new `_CorrelationIdMiddleware`) — every log line one unit
+      of work produces, across every module (including `approval/app.py`'s existing
+      logger, which propagates up to the same namespace with no code there needing to
+      change), carries the same ID.
+- [x] `get_instance_health` from the command line: `n8n-operator health`
+      (`cli/commands/health.py`, new) — the one command besides `serve stdio`/`serve
+      http` that needs the full n8n configuration, since reachability is a property of
+      the configured instance. `--json` for machine output; exits `1` when
+      unreachable. Carries no URL and no credential (boundary B5) — a discovery tool,
+      not a way to learn where the instance lives — so nothing printed needs
+      redaction; the shape itself cannot leak one.
+- [x] Tests: AC-22 (`audit verify` passes on a clean database and identifies the exact
+      sequence number after a single row is mutated — proven with the mutated row *not*
+      always being the first one), AC-25 (`audit export` produces a complete,
+      chain-verifiable record of every operation, with redaction and exclusion
+      verified directly: `[REDACTED]` in place of a configured-secret argument/result
+      field, the raw value never appearing anywhere in the export, and no `approvals`
+      content at all). Also: export re-verification in a genuinely separate Python
+      process (a `subprocess` reads the exported file, reconstructs
+      `audit.chain.AuditEntryLike`-shaped entries from nothing but the JSON, and calls
+      `verify_chain` itself — both on a clean chain and a tampered one); CLI exit codes
+      across `list`/`show`/`cancel`/`audit verify`/`audit export`/`health` (`0`
+      success, `1` general/not-found, the new `2` for a broken audit chain); logging
+      secret scrubbing (registered before and after `configure_logging` has already
+      run); deterministic JSON output (`operations list --json` byte-identical across
+      repeated calls against unchanged state; sorted keys checked directly). 51 new
+      tests (926 total), 93% coverage overall; `core/` (96%) and `registry/` (93-98%)
+      remain above the 90% gate.
 
 ### Phase 9 — v1 hardening and release
 

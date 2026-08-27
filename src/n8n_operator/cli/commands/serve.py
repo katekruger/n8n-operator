@@ -21,11 +21,24 @@ from __future__ import annotations
 import typer
 
 from n8n_operator.approval.app import run_approval_app
-from n8n_operator.config import load_settings, resolve_approval_bind, resolve_database_url
+from n8n_operator.config import Settings, load_settings, resolve_approval_bind, resolve_database_url
+from n8n_operator.logging_setup import configure_logging, register_secret
 from n8n_operator.mcp.transports import serve_http, serve_stdio
 from n8n_operator.storage.session import create_engine_for_url, create_session_factory
 
 app = typer.Typer(help="Run the MCP server or the approval app.", no_args_is_help=True)
+
+
+def _apply_settings_to_logging(settings: Settings) -> None:
+    """Reconfigure logging with ``settings.log_level`` (may differ from the root
+    callback's own plain-envvar read if the value only came from a ``.env`` file) and
+    register the credentials this process now holds for scrubbing — the root callback
+    (``cli/main.py``) configures logging before any command has resolved a setting, so
+    it cannot do either itself."""
+    configure_logging(level=settings.log_level)
+    register_secret(settings.n8n_api_key.get_secret_value())
+    if settings.http_bearer_token is not None:
+        register_secret(settings.http_bearer_token.get_secret_value())
 
 
 @app.command("stdio")
@@ -34,6 +47,7 @@ def stdio() -> None:
     any host that launches this process as a subprocess. Blocks until the client
     disconnects."""
     settings = load_settings()
+    _apply_settings_to_logging(settings)
     engine = create_engine_for_url(settings.database_url)
     session_factory = create_session_factory(engine)
     serve_stdio(settings, session_factory)
@@ -46,6 +60,7 @@ def http() -> None:
     ``N8N_OPERATOR_HTTP_BEARER_TOKEN`` and ``N8N_OPERATOR_HTTP_ALLOWED_ORIGINS`` to already
     be set — ``load_settings`` refuses to start otherwise (boundary B9)."""
     settings = load_settings()
+    _apply_settings_to_logging(settings)
     engine = create_engine_for_url(settings.database_url)
     session_factory = create_session_factory(engine)
     serve_http(settings, session_factory)

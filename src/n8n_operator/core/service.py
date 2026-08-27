@@ -29,6 +29,7 @@ from typing import Any, Literal, Protocol
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.audit import writer as audit_writer
+from n8n_operator.audit.chain import ChainVerificationResult, verify_chain
 from n8n_operator.core import state_machine
 from n8n_operator.core.handles import (
     compute_approval_binding,
@@ -112,6 +113,7 @@ __all__ = [
     "dispatch_operation",
     "execute_operation",
     "expire_overdue_operations",
+    "export_audit_record",
     "get_active_snapshot",
     "get_approval_decision_context",
     "get_execution_result",
@@ -127,6 +129,7 @@ __all__ = [
     "resolve_approval_token",
     "validate_input",
     "validate_registry",
+    "verify_audit_chain",
 ]
 
 
@@ -1407,3 +1410,151 @@ def expire_overdue_operations(session: Session) -> int:
         if after.state != before:
             changed += 1
     return changed
+
+
+# ----------------------------------------------------------------------------------
+# Audit (phase 8, BUILD_PLAN section 9.4). Operator-level views across every
+# principal — unlike the read paths above, nothing here is scoped to a caller.
+# ----------------------------------------------------------------------------------
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def verify_audit_chain(session: Session) -> ChainVerificationResult:
+    """AC-22: walk the full ``audit_log`` table, in ``seq`` order, and report the first
+    break, if any — ``n8n-operator audit verify``'s entire read path. A clean database
+    reports ``ok=True``; a single row mutated in place is caught at its exact sequence
+    number (BUILD_PLAN section 9.4: tamper-*evidence*, not tamper-*proofing*)."""
+    entries = AuditLogRepository(session).list_all()
+    return verify_chain(entries)
+
+
+def export_audit_record(session: Session, *, known_secrets: Sequence[str] = ()) -> dict[str, Any]:
+    """AC-25: a complete, chain-verifiable, redacted export of every operation and the
+    full audit log — everything a separate process needs to independently re-verify
+    the hash chain and inspect what happened, without ever including a credential, a
+    webhook secret, raw unredacted arguments or results, or an approval token.
+
+    Arguments are redacted here, at the export boundary, exactly like
+    :func:`get_operation`: ``operations.arguments`` has been stored raw at rest since
+    phase 7 (dispatch and fingerprint re-verification need the real values), so nothing
+    upstream of a read boundary is safe to hand out unredacted. ``known_secrets``, when
+    given, additionally scrubs by *value* (the operator's configured n8n API key or
+    webhook secret, wherever it might appear) — the same defense-in-depth
+    :func:`record_execution_outcome` already applies to results. ``n8n-operator audit
+    export`` itself does not require n8n configuration to run (like every other
+    ``operations``/``audit`` command) and so calls this with no secrets to scrub,
+    relying on the structural guarantee that a credential is never written to the
+    database in the first place (ADR-006) — a caller with n8n configuration loaded may
+    pass its known secrets for an extra, cheap layer of defense.
+
+    ``execution_results.redacted_payload``/``error`` are already redacted and
+    size-capped at write time (:func:`record_execution_outcome`) — exported as stored.
+    ``execution_results.node_trace`` is allowlist-shaped by construction
+    (``n8n/client.py::get_execution_node_trace``) and never carries a raw payload.
+
+    Approval tokens are never exported: only their *hash* is ever stored
+    (``approvals.token_hash``), and this export does not include the ``approvals``
+    table at all — ``operation_events`` already carries the T06/T07 decision, actor,
+    and timestamp verification needs, without a reason to touch that table.
+    """
+    audit_entries = AuditLogRepository(session).list_all()
+    chain_result = verify_chain(audit_entries)
+    audit_log = [
+        {
+            "seq": entry.seq,
+            "prev_hash": entry.prev_hash,
+            "entry_hash": entry.entry_hash,
+            "occurred_at": _iso(entry.occurred_at),
+            "actor": entry.actor,
+            "action": entry.action,
+            "subject_type": entry.subject_type,
+            "subject_id": entry.subject_id,
+            "outcome": entry.outcome,
+            "detail": entry.detail,
+        }
+        for entry in audit_entries
+    ]
+
+    event_repo = OperationEventRepository(session)
+    result_repo = ExecutionResultRepository(session)
+    operations: list[dict[str, Any]] = []
+    referenced_snapshot_ids: set[str] = set()
+    for row in OperationRepository(session).list_all():
+        entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+        arguments = scrub_secrets(redact(row.arguments, entry.output.redact), known_secrets)
+        events = [
+            {
+                "from_state": event.from_state,
+                "to_state": event.to_state,
+                "transition": event.transition,
+                "actor": event.actor,
+                "detail": event.detail,
+                "occurred_at": _iso(event.occurred_at),
+            }
+            for event in event_repo.list_for_operation(row.id)
+        ]
+        result_row = result_repo.get(row.id)
+        execution_result = (
+            None
+            if result_row is None
+            else {
+                "status": result_row.status,
+                "n8n_execution_id": result_row.n8n_execution_id,
+                "started_at": _iso(result_row.started_at),
+                "finished_at": _iso(result_row.finished_at),
+                "redacted_payload": result_row.redacted_payload,
+                "node_trace": result_row.node_trace,
+                "error": result_row.error,
+            }
+        )
+        referenced_snapshot_ids.add(row.snapshot_id)
+        operations.append(
+            {
+                "id": row.id,
+                "principal_id": row.principal_id,
+                "environment": row.environment,
+                "workflow_id": row.workflow_id,
+                "snapshot_id": row.snapshot_id,
+                "definition_hash": row.definition_hash,
+                "state": row.state,
+                "arguments": arguments,
+                "argument_fingerprint": row.argument_fingerprint,
+                "argument_bytes": row.argument_bytes,
+                "created_at": _iso(row.created_at),
+                "updated_at": _iso(row.updated_at),
+                "events": events,
+                "execution_result": execution_result,
+            }
+        )
+
+    snapshot_repo = RegistrySnapshotRepository(session)
+    registry_snapshots: list[dict[str, Any]] = []
+    for snapshot_id in sorted(referenced_snapshot_ids):
+        snapshot = snapshot_repo.get(snapshot_id)
+        if snapshot is None:
+            continue  # snapshots are never deleted; defensive only
+        registry_snapshots.append(
+            {
+                "id": snapshot.id,
+                "content_hash": snapshot.content_hash,
+                "source_path": snapshot.source_path,
+                "document": snapshot.document,
+                "loaded_at": _iso(snapshot.loaded_at),
+            }
+        )
+
+    return {
+        "exported_at": _iso(datetime.now(UTC)),
+        "chain": {
+            "ok": chain_result.ok,
+            "first_break_seq": chain_result.first_break_seq,
+            "reason": chain_result.reason,
+            "entry_count": len(audit_entries),
+        },
+        "audit_log": audit_log,
+        "operations": operations,
+        "registry_snapshots": registry_snapshots,
+    }

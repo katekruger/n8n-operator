@@ -1,14 +1,17 @@
 """``n8n-operator operations`` end to end, through the real Typer CLI (BUILD_PLAN
-section 12, phase 6; ADR-010).
+section 12, phases 6 and 8; ADR-010).
 
 Demonstrates the CLI-only stdio flow ADR-010 makes canonical: init the database, load
 the registry, prepare an operation (standing in for the MCP `prepare_operation` tool,
 which needs a running MCP session this test doesn't stand up), and approve or reject it
-entirely from the command line — no browser, no listener, ever reachable.
+entirely from the command line — no browser, no listener, ever reachable. Phase 8 adds
+`list`/`show`/`cancel` — history, detail, and withdrawal — including their `--json`
+output shapes and determinism.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -192,6 +195,135 @@ def test_expire_reports_a_count_and_is_idempotent(prepared: str, cli_env: None) 
     second = runner.invoke(app, ["operations", "expire"])
     assert second.exit_code == 0
     assert "Expired 0 operation(s)." in second.output
+
+
+@pytest.mark.integration
+def test_list_shows_a_prepared_operation(prepared: str, cli_env: None) -> None:
+    result = runner.invoke(app, ["operations", "list"])
+    assert result.exit_code == 0
+    assert prepared[:20] in result.output
+    assert "wf.approval" in result.output
+    assert "PENDING_APPROVAL" in result.output
+
+
+@pytest.mark.integration
+def test_list_json_output_shape(prepared: str, cli_env: None) -> None:
+    result = runner.invoke(app, ["operations", "list", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert len(payload) == 1
+    assert payload[0]["operation_id"] == prepared
+    assert payload[0]["workflow_id"] == "wf.approval"
+    assert payload[0]["state"] == "PENDING_APPROVAL"
+    assert set(payload[0]) == {"operation_id", "workflow_id", "state", "created_at", "updated_at"}
+
+
+@pytest.mark.integration
+def test_list_json_output_is_deterministic_across_repeated_calls(
+    prepared: str, cli_env: None
+) -> None:
+    first = runner.invoke(app, ["operations", "list", "--json"])
+    second = runner.invoke(app, ["operations", "list", "--json"])
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert first.output == second.output
+
+
+@pytest.mark.integration
+def test_list_filters_by_state(prepared: str, cli_env: None) -> None:
+    approved_state = runner.invoke(app, ["operations", "list", "--state", "APPROVED", "--json"])
+    assert approved_state.exit_code == 0
+    assert json.loads(approved_state.output) == []
+
+    pending_state = runner.invoke(
+        app, ["operations", "list", "--state", "PENDING_APPROVAL", "--json"]
+    )
+    assert pending_state.exit_code == 0
+    assert len(json.loads(pending_state.output)) == 1
+
+
+@pytest.mark.integration
+def test_list_with_no_operations_is_empty(cli_env: None, cli_db_url: str) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+    result = runner.invoke(app, ["operations", "list"])
+    assert result.exit_code == 0
+    assert "No operations." in result.output
+    json_result = runner.invoke(app, ["operations", "list", "--json"])
+    assert json.loads(json_result.output) == []
+
+
+@pytest.mark.integration
+def test_show_renders_state_and_redacted_arguments(prepared: str, cli_env: None) -> None:
+    result = runner.invoke(app, ["operations", "show", prepared])
+    assert result.exit_code == 0
+    assert f"operation_id:        {prepared}" in result.output
+    assert "workflow_id:         wf.approval" in result.output
+    assert "state:               PENDING_APPROVAL" in result.output
+    assert '"email": "a@b.com"' in result.output
+
+
+@pytest.mark.integration
+def test_show_json_shape(prepared: str, cli_env: None) -> None:
+    result = runner.invoke(app, ["operations", "show", prepared, "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["operation_id"] == prepared
+    assert payload["state"] == "PENDING_APPROVAL"
+    assert payload["arguments"] == {"email": "a@b.com"}
+    assert payload["handle_used"] is False
+
+
+@pytest.mark.integration
+def test_show_unknown_operation_id(cli_env: None, cli_db_url: str) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+    result = runner.invoke(app, ["operations", "show", "op_does_not_exist"])
+    assert result.exit_code == 1
+    assert "No such operation: op_does_not_exist" in result.output
+
+
+@pytest.mark.integration
+def test_cancel_with_yes_flag(prepared: str, cli_env: None) -> None:
+    result = runner.invoke(app, ["operations", "cancel", prepared, "--yes"])
+    assert result.exit_code == 0
+    assert "Canceled. state=CANCELED" in result.output
+
+    status = runner.invoke(app, ["operations", "show", prepared, "--json"])
+    assert json.loads(status.output)["state"] == "CANCELED"
+
+
+@pytest.mark.integration
+def test_cancel_interactive_confirmation_declined_does_not_cancel(
+    prepared: str, cli_env: None
+) -> None:
+    result = runner.invoke(app, ["operations", "cancel", prepared], input="n\n")
+    assert result.exit_code == 1
+    assert "Not canceled." in result.output
+
+    status = runner.invoke(app, ["operations", "show", prepared, "--json"])
+    assert json.loads(status.output)["state"] == "PENDING_APPROVAL"
+
+
+@pytest.mark.integration
+def test_cancel_an_already_terminal_operation_gives_a_clean_error(
+    prepared: str, cli_env: None
+) -> None:
+    first = runner.invoke(app, ["operations", "cancel", prepared, "--yes"])
+    assert first.exit_code == 0
+
+    second = runner.invoke(app, ["operations", "cancel", prepared, "--yes"])
+    assert second.exit_code == 1
+    assert "only PENDING_APPROVAL or APPROVED operations can be canceled" in second.output
+
+
+@pytest.mark.integration
+def test_cancel_unknown_operation_id(cli_env: None, cli_db_url: str) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+    result = runner.invoke(app, ["operations", "cancel", "op_does_not_exist", "--yes"])
+    assert result.exit_code == 1
+    assert "No such operation: op_does_not_exist" in result.output
 
 
 @pytest.mark.integration
