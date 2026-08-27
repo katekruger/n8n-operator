@@ -237,10 +237,15 @@ n8n-operator/
 │       ├── claude_desktop_config.json     # stdio
 │       ├── streamable_http_client.json    # generic remote / Streamable HTTP
 │       └── openai_responses_tool.json     # OpenAI Responses MCP tool object
+├── docker/
+│   └── live-n8n/                   # reproducible live-n8n harness (phase 9)
+│       └── docker-compose.yml      # pinned, loopback-only, project-scoped instance
 ├── scripts/
 │   ├── check_docs_consistency.py   # doc invariants enforced in CI
 │   ├── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
-│   └── release_smoke.sh            # isolated built-wheel release verification
+│   ├── release_smoke.sh            # isolated built-wheel release verification
+│   ├── live_n8n_up.sh              # bring up + import/activate the live-n8n harness
+│   └── live_n8n_down.sh            # scoped teardown of the live-n8n harness
 ├── src/
 │   └── n8n_operator/
 │       ├── __init__.py             # version only

@@ -10,8 +10,10 @@
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
 > **Status: v1 release candidate.** All nine product phases are implemented and the
-> local release gate is green. Repeatable live-n8n and hosted OpenAI connector checks
-> remain before the public v1 release —
+> local release gate is green. A reproducible, Docker-based live-n8n harness exists
+> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) — actually running it against a
+> real instance, and a hosted OpenAI connector check, remain before the public v1
+> release —
 > registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
 > full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). See
 > [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,

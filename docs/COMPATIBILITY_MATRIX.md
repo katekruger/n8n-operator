@@ -59,9 +59,12 @@ The repeatable smoke contract is documented in
 [`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md). It covers the stable runtime path; the
 broader field-by-field canonicalization pass below remains required for a new version.
 
-1. Stand up the target n8n version, isolated (no Docker required — see
-   [N8N_COMPATIBILITY.md §1](N8N_COMPATIBILITY.md#1-test-environment) for how the phase-4
-   spike ran without it).
+1. Stand up the target n8n version, isolated: bump the image tag in
+   [`docker/live-n8n/docker-compose.yml`](../docker/live-n8n/docker-compose.yml) and run
+   `scripts/live_n8n_up.sh` (Docker required for this path), or stand one up any other
+   way — Docker is not required in general; see
+   [N8N_COMPATIBILITY.md §1](N8N_COMPATIBILITY.md#1-test-environment) for how the
+   original phase-4 spike ran without it.
 2. Recreate (or reuse) the synthetic test workflow:
    [`examples/registry/synthetic_test_workflow.json`](../examples/registry/synthetic_test_workflow.json).
 3. Repeat the field-by-field comparison in

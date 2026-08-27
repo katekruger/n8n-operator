@@ -1,0 +1,43 @@
+name: n8n-operator-live-test
+
+# An isolated, disposable n8n instance for the live compatibility harness
+# (docs/LIVE_N8N_TESTING.md). Never targets production: fresh named volumes scoped to
+# this project name only, loopback-only port binding, no shared network with anything
+# else on the host, and nothing here reads or writes the operator's own database or
+# registry.
+#
+# Pinned to the version docs/COMPATIBILITY_MATRIX.md currently verifies. Bump the tag
+# only alongside a new compatibility-matrix row backed by real evidence (ADR-008's
+# evidence process) — never on assumption that a newer release behaves the same.
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.35.7
+    container_name: n8n-operator-live-test
+    ports:
+      # Loopback only — never expose this test instance beyond the local machine.
+      - "127.0.0.1:5678:5678"
+    environment:
+      # First-run owner setup and API key creation are UI-only in n8n (no documented
+      # REST/CLI provisioning path) — see docs/LIVE_N8N_TESTING.md's one manual step.
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_TEMPLATES_ENABLED=false
+      - N8N_HIRING_BANNER_ENABLED=false
+      - N8N_SECURE_COOKIE=false
+      - N8N_USER_FOLDER=/home/node/.n8n
+      - GENERIC_TIMEZONE=UTC
+    volumes:
+      # A fresh, project-scoped named volume — never a bind mount into the operator
+      # repository, never a volume shared with any other n8n instance on this host.
+      - n8n_live_test_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:5678/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+volumes:
+  n8n_live_test_data:
+    name: n8n-operator-live-test-data

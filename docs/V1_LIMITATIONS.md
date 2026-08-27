@@ -123,14 +123,25 @@ performance characteristics, and browser-level testing of the approval page (its
 is tested through the FastAPI test client, not a real browser) — BUILD_PLAN section
 10.5.
 
-## The `live_n8n` layer requires an operator-provided test instance
+## The `live_n8n` layer needs a one-time manual step, even with the reproducible harness
 
-BUILD_PLAN section 10.1's fourth layer now exists in `tests/live/` and is runnable
-locally or through the manual `Live n8n compatibility` workflow. It verifies health,
-workflow retrieval, webhook dispatch, response correlation, and execution retrieval
-against the isolated synthetic workflow. It is excluded from ordinary CI because the
-repository does not provision or retain a credential-bearing n8n instance. See
-[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md) for the exact setup and evidence procedure.
+BUILD_PLAN section 10.1's fourth layer exists in `tests/live/` and is runnable locally
+or through the manual `Live n8n compatibility` GitHub Actions workflow. `docker/live-n8n/`
++ `scripts/live_n8n_up.sh` fully automate standing up a pinned, isolated instance and
+importing and activating the synthetic workflow — but n8n has no documented REST or CLI
+path to create the first owner account or an API key; both are UI-only. One person has
+to click through that once per instance before the suite can authenticate at all. See
+[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md) for the exact procedure.
+
+The suite verifies instance health, authenticated workflow retrieval (with an exact
+workflow-ID match), active status, deterministic definition hashing, webhook dispatch,
+response-envelope correlation, exact execution retrieval, drift detection (both the
+no-drift and the detected-drift case, against the real live definition), and clean,
+typed failures for a wrong API key, a wrong workflow ID, a wrong webhook path, and an
+unreachable instance. It is excluded from ordinary CI because the repository does not
+provision or retain a credential-bearing n8n instance — a GitHub Actions run still needs
+the `live-n8n` environment's secret populated manually, from an instance someone stood
+up (locally, or however they choose) and completed that one UI step against.
 
 Practical consequence: ordinary pull requests prove the full deterministic and mocked
 contract but cannot prove a hosted n8n target is currently reachable or unchanged. A

@@ -15,6 +15,12 @@
 
 ## 1. Test environment
 
+> A reproducible, Docker-based harness now exists for repeat runs of the compatibility
+> *contract* against a pinned version — see [`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md).
+> It does not replace this document's deeper, field-by-field canonicalization pass; see
+> [`COMPATIBILITY_MATRIX.md`](COMPATIBILITY_MATRIX.md#extending-this-matrix) for how the
+> two combine when extending coverage to a new version.
+
 **Docker was not available** on the machine this spike ran on (checked `docker`,
 `docker-compose`, `podman`, `colima`, `lima` — none installed). With the user's
 explicit approval, n8n ran standalone via Node.js instead of in a container — the same
