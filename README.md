@@ -22,10 +22,17 @@ approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.*
 
 | Client / target | Transport | Evidence |
 |---|---|---|
-| Claude Desktop | stdio | ✅ Built-wheel MCP session verified |
-| Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified |
+| MCP stdio clients (Claude Desktop and similar) | stdio | ✅ Automated on every CI push — `scripts/release_smoke.sh` runs a full MCP session against the built wheel (reference `mcp` Python client v2.1.1, last verified 2026-08-27) |
+| Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified (phase 9, one-time manual run) |
 | OpenAI hosted connector | Streamable HTTP | 🟡 Configuration documented; live connector verification pending |
 | n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; repeatable live gate available |
+
+<sub>"MCP session verified" always means the reference `mcp` protocol client, not a
+vendor's own GUI application — Claude Desktop's own process has not been separately
+launched in any of this testing. See
+[examples/mcp-clients/README.md](examples/mcp-clients/README.md) and
+[scripts/mcp_session_smoke.py](scripts/mcp_session_smoke.py) for exactly what each
+check covers.</sub>
 
 ## Who this is for
 

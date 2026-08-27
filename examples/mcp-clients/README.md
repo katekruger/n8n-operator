@@ -8,10 +8,15 @@ Two files here, matching Operator's two transports (BUILD_PLAN section 7.2):
 | [`streamable_http_client.json`](streamable_http_client.json) | Streamable HTTP | A remote MCP client (a hosted agent, a browser-based client, ChatGPT/OpenAI's MCP connector) that cannot spawn a local subprocess and must reach Operator over the network. |
 | [`openai_responses_tool.json`](openai_responses_tool.json) | Streamable HTTP | The MCP tool object for an OpenAI Responses API request. |
 
-Both were verified against a real build of this package during phase 9 release
-testing — a full stdio session and a full Streamable HTTP session, each confirming the
-documented 12-tool/2-resource surface and live tool calls, not just that the process
-starts. See `docs/BUILD_PLAN.md`'s phase 9 checklist entry for what was run.
+Both were verified against a real build of this package — a full stdio session and a
+full Streamable HTTP session, each confirming the documented 12-tool/2-resource
+surface and live tool calls, not just that the process starts. Both sessions used the
+reference `mcp` Python client, not Claude Desktop's own GUI application, which has not
+been separately launched. The stdio session is no longer a one-time check: it's
+automated in [`scripts/mcp_session_smoke.py`](../../scripts/mcp_session_smoke.py) and
+runs inside `scripts/release_smoke.sh` on every CI push. The Streamable HTTP session
+remains the one-time result from phase 9 release testing. See
+`docs/BUILD_PLAN.md`'s phase 9 checklist entry for what was run.
 
 ## stdio (Claude Desktop)
 

@@ -25,4 +25,15 @@ export N8N_OPERATOR_DATABASE_URL="sqlite+pysqlite:///$SMOKE_DIR/operator.db"
   --path "$REPO_ROOT/examples/registry/workflows.example.yaml"
 "$SMOKE_DIR/venv/bin/n8n-operator" audit verify
 
-echo "release smoke passed: wheel install, import, CLI, migration, registry, audit"
+# A real MCP client session over stdio against the installed entry point — not just
+# "the process starts." Dummy, obviously-fake values: no tool this script calls ever
+# dispatches to n8n, and mcp_session_smoke.py asserts neither value leaks into any
+# tool or resource result.
+"$SMOKE_DIR/venv/bin/n8n-operator" registry reload \
+  --path "$REPO_ROOT/examples/registry/workflows.example.yaml"
+N8N_OPERATOR_N8N_BASE_URL="https://mcp-session-smoke-dummy-n8n-instance.invalid" \
+N8N_OPERATOR_N8N_API_KEY="mcp-session-smoke-dummy-api-key-0000000000" \
+  "$SMOKE_DIR/venv/bin/python" "$REPO_ROOT/scripts/mcp_session_smoke.py" \
+  "$SMOKE_DIR/venv/bin/n8n-operator"
+
+echo "release smoke passed: wheel install, import, CLI, migration, registry, audit, MCP stdio session"

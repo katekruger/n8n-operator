@@ -244,6 +244,7 @@ n8n-operator/
 │   ├── check_docs_consistency.py   # doc invariants enforced in CI
 │   ├── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
 │   ├── release_smoke.sh            # isolated built-wheel release verification
+│   ├── mcp_session_smoke.py        # real MCP client session over stdio, built wheel
 │   ├── live_n8n_up.sh              # bring up + import/activate the live-n8n harness
 │   └── live_n8n_down.sh            # scoped teardown of the live-n8n harness
 ├── src/
@@ -1760,6 +1761,16 @@ it touches are updated in the same change.
       environment for a live OpenAI-connector run specifically; the Streamable HTTP
       protocol surface a remote OpenAI connector would use was verified directly
       instead (see `examples/mcp-clients/README.md`'s own note on this).
+
+      **Phase 9 continuation:** the stdio half of this check is no longer a one-time
+      manual run — `scripts/mcp_session_smoke.py` automates the same
+      `initialize`/`list_tools`/`list_resources`/tool-call/resource-read/shutdown
+      session (reference `mcp` Python client) and now runs inside
+      `scripts/release_smoke.sh`, so it executes on every CI push
+      (`build · clean-install smoke`), not only when someone remembers to run it by
+      hand. It also asserts the tool call and resource read carry none of the real
+      registry's `n8n_workflow_id` values or the configured n8n base URL/API key. The
+      Streamable HTTP half remains the phase 9 manual, one-time result above.
 - [x] Threat model reviewed against the shipped code; residual risks re-confirmed.
       Found and corrected three entries that had drifted from actual implementation
       rather than describing it: **T-35** (audit tampering detection) upgraded
