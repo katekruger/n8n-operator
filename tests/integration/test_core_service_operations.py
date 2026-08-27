@@ -23,6 +23,7 @@ from n8n_operator.errors import (
     ApprovalRequiredError,
     ArgumentMismatchError,
     ArgumentsTooLargeError,
+    ConcurrencyLimitReachedError,
     DefinitionDriftError,
     HandleAlreadyUsedError,
     HandleInvalidError,
@@ -428,7 +429,13 @@ def test_no_expired_operation_can_ever_be_approved_or_executed(
         pytest.raises((InvalidStateTransitionError, ApprovalRequiredError, OperationExpiredError)),
         session_scope(session_factory) as session,
     ):
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -479,7 +486,13 @@ def test_a_canceled_operation_cannot_be_executed(
     with session_scope(session_factory) as session:
         service.cancel_operation(session, operation_id=op_id, principal_id="local")
     with pytest.raises(OperationCanceledError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -496,7 +509,11 @@ def test_t10_execute_burns_the_handle_and_moves_to_executing(
         service.approve_operation(session, operation_id=op_id, decided_by="local")
     with session_scope(session_factory) as session:
         operation = service.execute_operation(
-            session, operation_id=op_id, handle=op_id, principal_id="local"
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
         )
     assert operation.state == "EXECUTING"
     assert operation.handle_burned_at is not None
@@ -508,7 +525,13 @@ def test_execute_before_approval_is_approval_required(
 ) -> None:
     op_id, _state = _prepare(session_factory, env)
     with pytest.raises(ApprovalRequiredError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 @pytest.mark.integration
@@ -520,7 +543,11 @@ def test_execute_with_mismatched_handle_and_operation_id(
         service.approve_operation(session, operation_id=op_id, decided_by="local")
     with pytest.raises(ArgumentMismatchError), session_scope(session_factory) as session:
         service.execute_operation(
-            session, operation_id=op_id, handle="op_wrong", principal_id="local"
+            session,
+            operation_id=op_id,
+            handle="op_wrong",
+            principal_id="local",
+            preflight=FakePreflight(),
         )
 
 
@@ -532,9 +559,21 @@ def test_execute_twice_gives_handle_already_used(
     with session_scope(session_factory) as session:
         service.approve_operation(session, operation_id=op_id, decided_by="local")
     with session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
     with pytest.raises(HandleAlreadyUsedError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 @pytest.mark.integration
@@ -543,7 +582,12 @@ def test_concurrent_execute_burns_the_handle_exactly_once(
 ) -> None:
     """Invariant I4: a handle can be burned at most once, enforced by the database, not
     application logic — proven under genuine thread concurrency, not just sequential
-    calls."""
+    calls. A losing thread may observe either ``HandleAlreadyUsedError`` (it reached the
+    compare-and-set burn after another thread already won it) or
+    ``ConcurrencyLimitReachedError`` (the workflow's own ``max_concurrent`` — default 1
+    — was already reached by the thread that won, and this thread's concurrency check
+    ran after that commit but before its own burn attempt); which one depends on exact
+    interleaving, but either correctly means "did not execute twice."""
     op_id, _state = _prepare(session_factory, env)
     with session_scope(session_factory) as session:
         service.approve_operation(session, operation_id=op_id, decided_by="local")
@@ -552,17 +596,23 @@ def test_concurrent_execute_burns_the_handle_exactly_once(
         try:
             with session_scope(session_factory) as session:
                 service.execute_operation(
-                    session, operation_id=op_id, handle=op_id, principal_id="local"
+                    session,
+                    operation_id=op_id,
+                    handle=op_id,
+                    principal_id="local",
+                    preflight=FakePreflight(),
                 )
             return "success"
         except HandleAlreadyUsedError:
             return "already_used"
+        except ConcurrencyLimitReachedError:
+            return "concurrency_limited"
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(attempt, range(8)))
 
     assert results.count("success") == 1
-    assert results.count("already_used") == 7
+    assert results.count("already_used") + results.count("concurrency_limited") == 7
 
 
 @pytest.mark.integration
@@ -582,7 +632,13 @@ def test_execute_detects_definition_drift_since_approval(
         pytest.raises(DefinitionDriftError) as excinfo,
         session_scope(session_factory) as session,
     ):
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
     assert excinfo.value.details["registered"] != excinfo.value.details["current"]
 
 
@@ -594,7 +650,13 @@ def test_execute_detects_definition_drift_since_approval(
 def _prepare_and_execute(session_factory: sessionmaker[Session], env: dict[str, Any]) -> str:
     op_id, _state = _prepare(session_factory, env, workflow_id="wf.auto_approved", arguments={})
     with session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
     return op_id
 
 
@@ -666,7 +728,13 @@ def test_terminal_states_reject_every_further_action(
         pytest.raises((HandleAlreadyUsedError, InvalidStateTransitionError)),
         session_scope(session_factory) as session,
     ):
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -780,7 +848,13 @@ def test_approving_one_operation_does_not_authorize_a_different_operation(
         operation_b = service.get_operation(session, operation_id=op_b, principal_id="local")
     assert operation_b.state == "PENDING_APPROVAL"
     with pytest.raises(ApprovalRequiredError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_b, handle=op_b, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_b,
+            handle=op_b,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -1004,6 +1078,7 @@ def test_operations_on_a_nonexistent_id_are_operation_not_found(
             operation_id="op_does_not_exist",
             handle="op_does_not_exist",
             principal_id="local",
+            preflight=FakePreflight(),
         )
 
 
@@ -1020,7 +1095,13 @@ def test_execute_on_an_invalid_operation_gives_handle_invalid_not_approval_requi
     op_id, state = _prepare(session_factory, env, arguments={})  # -> INVALID
     assert state == "INVALID"
     with pytest.raises(HandleInvalidError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
 
 @pytest.mark.integration
@@ -1030,4 +1111,10 @@ def test_execute_on_a_blocked_operation_gives_handle_invalid(
     op_id, state = _prepare(session_factory, env, preflight=FakePreflight(ready=False))
     assert state == "BLOCKED"
     with pytest.raises(HandleInvalidError), session_scope(session_factory) as session:
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )

@@ -59,8 +59,8 @@ from pydantic import ConfigDict, Field
 from sqlalchemy.orm import sessionmaker
 
 from n8n_operator.core import service
-from n8n_operator.core.service import HealthPort, PreflightPort
-from n8n_operator.errors import InvalidArgumentsError, OperatorError
+from n8n_operator.core.service import DispatchPort, HealthPort, PreflightPort
+from n8n_operator.errors import DispatchIndeterminateError, InvalidArgumentsError, OperatorError
 from n8n_operator.storage.repository import ApprovalRepository, OperationEventRepository
 from n8n_operator.storage.session import session_scope
 
@@ -80,11 +80,13 @@ class ToolDeps:
     session_factory: sessionmaker[Any]
     preflight: PreflightPort
     health: HealthPort
+    dispatch: DispatchPort
     server_max_argument_bytes: int
     principal_id: str = "local"
     environment: str = "default"
     caller_is_local: bool = True
     approval_base_url: str | None = None
+    known_secrets: tuple[str, ...] = ()
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -531,25 +533,83 @@ class ExecuteOperationArgs(_ToolArgs):
 
 def _make_execute_operation(deps: ToolDeps) -> Tool:
     async def handler(operation_id: str, handle: str) -> dict[str, Any]:
+        # Burns the handle and moves to EXECUTING (ARCHITECTURE.md section 4.3 steps
+        # 0-6), in its own transaction. Dispatching to n8n and resolving to
+        # SUCCEEDED/FAILED/UNKNOWN (steps 7-14) is a *separate* call, to a *separate*
+        # use case (core.service.dispatch_operation) that manages its own transaction
+        # pair around the network call — never inside the transaction above.
         with session_scope(deps.session_factory) as session:
             try:
-                operation = service.execute_operation(
+                service.execute_operation(
                     session,
                     operation_id=operation_id,
                     handle=handle,
                     principal_id=deps.principal_id,
+                    preflight=deps.preflight,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
-        # Burns the handle and moves to EXECUTING (ARCHITECTURE.md section 4.3 steps
-        # 0-6); dispatching to n8n and resolving to SUCCEEDED/FAILED/UNKNOWN (steps
-        # 7-10) is Phase 7's extension of core.service.execute_operation itself, not
-        # this adapter — this handler needs no change when that lands, since it always
-        # reports whatever state the use case returns.
+
+        try:
+            operation = service.dispatch_operation(
+                deps.session_factory,
+                operation_id=operation_id,
+                principal_id=deps.principal_id,
+                dispatch=deps.dispatch,
+                known_secrets=deps.known_secrets,
+            )
+        except OperatorError as exc:
+            return _error_result(exc)
+
+        if operation.state == "UNKNOWN":
+            # ADR-009/ADR-005: never inferred to be a failure, never retried. The
+            # message is written to tell a model plainly not to retry.
+            if operation.n8n_execution_id is not None:
+                correlation: dict[str, Any] = {
+                    "available": True,
+                    "execution_id": operation.n8n_execution_id,
+                }
+            else:
+                correlation = {"available": False, "reason": "NO_EXECUTION_CORRELATION"}
+            indeterminate = DispatchIndeterminateError()
+            return {
+                "operation_id": operation.id,
+                "state": operation.state,
+                "code": indeterminate.code,
+                "message": indeterminate.message,
+                "started_at": _iso(operation.updated_at),
+                "correlation": correlation,
+            }
+
+        with session_scope(deps.session_factory) as session:
+            try:
+                result = service.get_execution_result(
+                    session, operation_id=operation_id, principal_id=deps.principal_id
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+            truncated = bool(_latest_event_detail(session, operation_id).get("truncated", False))
+
+        duration_ms: int | None = None
+        if result.started_at is not None and result.finished_at is not None:
+            duration_ms = int((result.finished_at - result.started_at).total_seconds() * 1000)
+
+        if operation.state == "FAILED":
+            return {
+                "operation_id": operation.id,
+                "state": operation.state,
+                "started_at": _iso(result.started_at),
+                "finished_at": _iso(result.finished_at),
+                "duration_ms": duration_ms,
+                "error": {**(result.error or {}), "truncated": truncated},
+            }
         return {
             "operation_id": operation.id,
             "state": operation.state,
-            "started_at": _iso(operation.updated_at),
+            "started_at": _iso(result.started_at),
+            "finished_at": _iso(result.finished_at),
+            "duration_ms": duration_ms,
+            "result": {**result.redacted_payload, "truncated": truncated},
         }
 
     return _build_tool(

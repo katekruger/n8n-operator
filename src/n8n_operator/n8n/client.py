@@ -107,18 +107,32 @@ and is documented as the one place that is true."""
 class DispatchOutcome:
     """The result of one webhook dispatch attempt (ADR-005, ADR-009).
 
-    ``kind`` is the only field ``core/service.py``'s ``record_execution_outcome`` needs
-    to decide T13/T14/T15: ``"success"`` (2xx), ``"error"`` (a non-2xx HTTP response —
-    the request reached n8n and n8n said no), or ``"indeterminate"`` (no response could
-    be confirmed at all — timeout, connection failure, or an unparseable response).
-    ``execution_id`` is populated only when the response body parsed as the documented
-    envelope and carried one; its absence is never itself an error.
+    ``kind`` is what ``core/service.py``'s ``record_execution_outcome`` uses to decide
+    T13/T14/T15: ``"success"`` (2xx, body parsed), ``"error"`` (a non-2xx HTTP response
+    that *did* arrive — n8n responded, so nothing here is ambiguous about whether the
+    request was received), or ``"indeterminate"`` (no response could be confirmed at
+    all — timeout, connection failure, an oversized response, or **a response body that
+    could not be parsed as JSON**, which ADR-009 section 1.1 treats identically to a
+    lost response: "a timeout, connection loss, or *unparseable response* after
+    dispatch transitions EXECUTING -> UNKNOWN").
+
+    ``result`` is the *unwrapped* payload: when the body is a dict carrying the
+    documented ``n8n_operator`` envelope key, this is its ``data`` field; otherwise it
+    is the raw parsed body as-is. A **malformed** envelope (present but not shaped
+    right) does not change ``kind`` or demote ``result`` to ``None`` — ADR-009 section
+    2: "a workflow that returns a result is not broken because its envelope is". It
+    only means ``correlation_available`` is ``False``.
+
+    ``correlation_available`` is ``True`` iff a well-formed envelope carrying a
+    non-null ``execution_id`` was found — the one condition under which
+    reconciliation and ``get_execution_log`` node traces are possible at all.
     """
 
     kind: Literal["success", "error", "indeterminate"]
     http_status: int | None
-    body: Any | None
+    result: Any | None
     execution_id: str | None
+    correlation_available: bool
 
 
 def _safe_message(default: str) -> str:
@@ -349,9 +363,13 @@ class N8nClient:
     def get_execution(self, execution_id: str) -> ExecutionSummary:
         """``GET /api/v1/executions/{id}`` — **never** with ``includeData=true``. The
         full per-node ``runData`` tree (including a webhook trigger's raw inbound
-        request) is deliberately never fetched by this client at all — see
-        ``n8n/types.py``'s ``ExecutionSummary`` docstring. There is nothing this method
-        could accidentally leak that it never read in the first place.
+        request) is never fetched *by this method* — see ``n8n/types.py``'s
+        ``ExecutionSummary`` docstring. There is nothing this method could
+        accidentally leak that it never read in the first place.
+
+        :meth:`get_execution_node_trace` is the one narrow, deliberate exception to
+        "never ``includeData=true``" this client makes, for ``get_execution_log``
+        specifically — see that method's own docstring for how it stays safe anyway.
         """
         response = self._request(
             endpoint_template="/api/v1/executions/{id}",
@@ -366,6 +384,105 @@ class N8nClient:
             raise ProviderError(
                 _safe_message("The n8n instance returned a malformed execution record.")
             ) from exc
+
+    def get_execution_node_trace(self, execution_id: str) -> dict[str, Any] | None:
+        """``GET /api/v1/executions/{id}?includeData=true`` — the *one* place this
+        client ever requests full run data, scoped as narrowly as physically possible:
+        this method reads exactly five scalar fields per node run (name, type,
+        execution status, duration, and — for the first failed node only — a
+        best-effort error message) and discards everything else immediately.
+
+        **What is never read into a Python value, let alone returned:** each node
+        run's own ``data`` field — its actual input/output — which can carry a webhook
+        trigger's raw inbound request verbatim (headers, query, body —
+        docs/N8N_COMPATIBILITY.md section 8, the empirical basis for this method's
+        shape). Every value below comes from ``dict.get`` on a *named* key, built into
+        a *new* dict of primitives; there is no code path through which a nested
+        object from the response is forwarded wholesale, so a surprise in n8n's exact
+        schema can make a field come back missing, never leak something unintended.
+
+        Node order comes from n8n's own ``executionIndex`` (confirmed present on every
+        run in the empirical fixture this shape is based on), not dict insertion order
+        — ``runData`` is keyed by node name, unordered.
+
+        Returns ``None`` (never a partial guess) if the response cannot be confidently
+        read as this shape at all: an unreachable instance, a 404, or a response body
+        that isn't the expected structure.
+        """
+        try:
+            response = self._request(
+                endpoint_template="/api/v1/executions/{id}",
+                method="GET",
+                path=f"/api/v1/executions/{execution_id}",
+                params={"includeData": "true"},
+                read_timeout_seconds=self._connect_timeout_seconds,
+            )
+            body = self._parse_json(response, not_found_message="execution not found")
+        except ProviderError:
+            return None
+        if not isinstance(body, dict):
+            return None
+
+        data = body.get("data")
+        result_data = data.get("resultData") if isinstance(data, dict) else None
+        run_data = result_data.get("runData") if isinstance(result_data, dict) else None
+        if not isinstance(run_data, dict):
+            return None
+
+        node_types: dict[str, str] = {}
+        workflow_data = body.get("workflowData")
+        if isinstance(workflow_data, dict):
+            for node in workflow_data.get("nodes") or []:
+                if isinstance(node, dict) and isinstance(node.get("name"), str):
+                    node_types[node["name"]] = str(node.get("type", "unknown"))
+
+        ordered: list[tuple[int, dict[str, Any]]] = []
+        failed_node: str | None = None
+        failed_node_error: str | None = None
+        for name, attempts in run_data.items():
+            if not isinstance(attempts, list) or not attempts or not isinstance(name, str):
+                continue
+            last = attempts[-1]
+            if not isinstance(last, dict):
+                continue
+            status = last.get("executionStatus")
+            status_str = status if isinstance(status, str) else "unknown"
+            duration = last.get("executionTime")
+            duration_ms = duration if isinstance(duration, int) else None
+            index = last.get("executionIndex")
+            order = index if isinstance(index, int) else len(ordered)
+            ordered.append(
+                (
+                    order,
+                    {
+                        "name": name,
+                        "type": node_types.get(name, "unknown"),
+                        "status": status_str,
+                        "duration_ms": duration_ms,
+                    },
+                )
+            )
+            if status_str != "success" and failed_node is None:
+                failed_node = name
+                error = last.get("error")
+                message = error.get("message") if isinstance(error, dict) else None
+                failed_node_error = message if isinstance(message, str) else "An error occurred."
+
+        ordered.sort(key=lambda pair: pair[0])
+        return {
+            "nodes": [entry for _order, entry in ordered],
+            "failed_node": failed_node,
+            "failed_node_error": failed_node_error,
+        }
+
+    def known_secrets(self) -> tuple[str, ...]:
+        """The credential values this client holds (BUILD_PLAN section 8.1/ADR-006):
+        currently just the API key. Exposed only so the composition root can pass them
+        to ``core.redaction.scrub_secrets`` as defense in depth against a secret
+        appearing verbatim in an execution result — not a new exposure, since only
+        code that already constructed this client (and so already has the key) can
+        call it."""
+        return (self._api_key,)
 
     def dispatch_webhook(
         self,
@@ -401,27 +518,57 @@ class N8nClient:
             )
         except httpx.HTTPError:
             return DispatchOutcome(
-                kind="indeterminate", http_status=None, body=None, execution_id=None
+                kind="indeterminate",
+                http_status=None,
+                result=None,
+                execution_id=None,
+                correlation_available=False,
             )
 
         try:
             self._check_response_size(response)
         except ProviderError:
             return DispatchOutcome(
-                kind="indeterminate", http_status=response.status_code, body=None, execution_id=None
+                kind="indeterminate",
+                http_status=response.status_code,
+                result=None,
+                execution_id=None,
+                correlation_available=False,
             )
 
-        body: Any = None
-        execution_id: str | None = None
         try:
             body = response.json()
-            if isinstance(body, dict):
+        except ValueError:
+            # The response body itself could not be parsed as JSON at all — ADR-009
+            # section 1.1 treats an unparseable response the same as a lost one, not
+            # as a confirmed outcome. This is distinct from a *malformed envelope*
+            # below, where the body parses fine but doesn't carry a usable
+            # `n8n_operator` block: that case still confirms success/error from the
+            # HTTP status, only correlation is unavailable.
+            return DispatchOutcome(
+                kind="indeterminate",
+                http_status=response.status_code,
+                result=None,
+                execution_id=None,
+                correlation_available=False,
+            )
+
+        result: Any = body
+        execution_id: str | None = None
+        if isinstance(body, dict) and "n8n_operator" in body:
+            try:
                 envelope = ResponseEnvelope.model_validate(body)
+            except Exception:
+                envelope = None
+            if envelope is not None and envelope.execution_id is not None:
                 execution_id = envelope.execution_id
-        except Exception:
-            body = None
+                result = envelope.data
 
         kind: Literal["success", "error"] = "success" if response.is_success else "error"
         return DispatchOutcome(
-            kind=kind, http_status=response.status_code, body=body, execution_id=execution_id
+            kind=kind,
+            http_status=response.status_code,
+            result=result,
+            execution_id=execution_id,
+            correlation_available=execution_id is not None,
         )

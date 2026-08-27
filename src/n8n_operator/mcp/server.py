@@ -10,10 +10,11 @@ one tool's result shaping (``prepare_operation``'s ``approval_url``, invariant I
 which tools or schemas exist, so it is a parameter here rather than baked in.
 
 This module is the **composition root**: the one place ``n8n.client.N8nClient``,
-``n8n.preflight.N8nPreflight``, and ``n8n.health.N8nHealth`` are constructed and wired
-into ``core.service`` through ``core.service.PreflightPort``/``HealthPort``. No tool
-handler in ``mcp/tools.py`` touches ``n8n/`` directly (ARCHITECTURE.md section 2.1); the
-wiring that makes that possible happens exactly once, here.
+``n8n.preflight.N8nPreflight``, ``n8n.health.N8nHealth``, and ``n8n.dispatch.N8nDispatch``
+are constructed and wired into ``core.service`` through
+``core.service.PreflightPort``/``HealthPort``/``DispatchPort``. No tool handler in
+``mcp/tools.py`` touches ``n8n/`` directly (ARCHITECTURE.md section 2.1); the wiring that
+makes that possible happens exactly once, here.
 
 Phase 5 (BUILD_PLAN section 12).
 """
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.config import Settings
 from n8n_operator.core.models import (
+    DispatchOutcome,
     HealthCheckResult,
     PreflightCheck,
     PreflightResult,
@@ -35,6 +37,7 @@ from n8n_operator.core.models import (
 from n8n_operator.mcp.resources import register_resources
 from n8n_operator.mcp.tools import ToolDeps, build_tools
 from n8n_operator.n8n.client import N8nClient
+from n8n_operator.n8n.dispatch import N8nDispatch
 from n8n_operator.n8n.health import N8nHealth
 from n8n_operator.n8n.preflight import N8nPreflight
 
@@ -79,6 +82,33 @@ class _HealthAdapter:
         )
 
 
+class _DispatchAdapter:
+    """As :class:`_PreflightAdapter`/:class:`_HealthAdapter`, for ``n8n.dispatch.N8nDispatch``.
+
+    ``fetch_node_trace`` needs no conversion — ``n8n.client.get_execution_node_trace``
+    already returns the plain, allowlist-shaped ``dict[str, Any] | None`` that
+    ``core.service.DispatchPort`` expects verbatim.
+    """
+
+    def __init__(self, impl: N8nDispatch) -> None:
+        self._impl = impl
+
+    def dispatch(
+        self, workflow: WorkflowContract, arguments: dict[str, Any], *, timeout_seconds: int
+    ) -> DispatchOutcome:
+        raw = self._impl.dispatch(workflow, arguments, timeout_seconds=timeout_seconds)
+        return DispatchOutcome(
+            kind=raw.kind,
+            http_status=raw.http_status,
+            result=raw.result,
+            execution_id=raw.execution_id,
+            correlation_available=raw.correlation_available,
+        )
+
+    def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None:
+        return self._impl.fetch_node_trace(execution_id)
+
+
 def build_server(
     settings: Settings,
     session_factory: sessionmaker[Session],
@@ -96,9 +126,11 @@ def build_server(
         session_factory=session_factory,
         preflight=_PreflightAdapter(N8nPreflight(client)),
         health=_HealthAdapter(N8nHealth(client)),
+        dispatch=_DispatchAdapter(N8nDispatch(client)),
         server_max_argument_bytes=settings.max_argument_bytes,
         caller_is_local=caller_is_local,
         approval_base_url=f"http://{settings.approval_bind}",
+        known_secrets=client.known_secrets(),
     )
     server: MCPServer[Any] = MCPServer(
         "n8n-operator",

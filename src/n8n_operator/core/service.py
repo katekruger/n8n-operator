@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.audit import writer as audit_writer
 from n8n_operator.core import state_machine
@@ -45,6 +45,7 @@ from n8n_operator.core.idempotency import (
 )
 from n8n_operator.core.models import (
     ApprovalDecisionContext,
+    DispatchOutcome,
     ExecutionResult,
     HealthCheckResult,
     Operation,
@@ -59,18 +60,23 @@ from n8n_operator.errors import (
     ApprovalTokenInvalidError,
     ArgumentMismatchError,
     ArgumentsTooLargeError,
+    ConcurrencyLimitReachedError,
     DefinitionDriftError,
     HandleAlreadyUsedError,
     HandleInvalidError,
+    InstanceUnreachableError,
     InvalidArgumentsError,
     InvalidStateTransitionError,
     OperationCanceledError,
     OperationExpiredError,
     OperationNotFoundError,
     OptimisticLockError,
+    RateLimitedError,
     RegistryUnavailableError,
     ResultNotAvailableError,
     WorkflowDisabledError,
+    WorkflowInactiveError,
+    WorkflowMissingOnInstanceError,
     WorkflowNotFoundError,
 )
 from n8n_operator.registry.loader import LoadedRegistry, load_registry
@@ -94,13 +100,16 @@ from n8n_operator.storage.repository import (
     RegistrySnapshotRepository,
     WorkflowBindingRepository,
 )
+from n8n_operator.storage.session import session_scope
 
 __all__ = [
+    "DispatchPort",
     "HealthPort",
     "PreflightPort",
     "approve_operation",
     "cancel_operation",
     "describe_workflow",
+    "dispatch_operation",
     "execute_operation",
     "expire_overdue_operations",
     "get_active_snapshot",
@@ -146,6 +155,25 @@ class HealthPort(Protocol):
     """
 
     def check(self) -> HealthCheckResult: ...
+
+
+class DispatchPort(Protocol):
+    """What ``dispatch_operation`` needs from an n8n dispatcher.
+
+    Same seam as :class:`PreflightPort`/:class:`HealthPort`, for one extra concern
+    beyond the actual dispatch: ``fetch_node_trace`` is the one, deliberately narrow
+    exception to "``mcp/`` never calls ``n8n/`` directly" that ``get_execution_log``
+    needs — reached only after ``dispatch`` recorded a trustworthy execution ID
+    (``core.models.DispatchOutcome.correlation_available``) *and* the workflow's own
+    ``output.include_node_trace`` opts in. The composition root injects the real
+    ``n8n.dispatch.N8nDispatch`` adapter; tests inject a fake.
+    """
+
+    def dispatch(
+        self, workflow: WorkflowContract, arguments: dict[str, Any], *, timeout_seconds: int
+    ) -> DispatchOutcome: ...
+
+    def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None: ...
 
 
 # ----------------------------------------------------------------------------------
@@ -660,10 +688,21 @@ def prepare_operation(
     canonical_bytes = canonicalize_arguments(arguments)
     fingerprint = fingerprint_arguments(canonical_bytes)
     effective_limit = entry.limits.max_argument_bytes or server_max_argument_bytes
+    op_repo = OperationRepository(session)
 
     try:
         check_argument_size(canonical_bytes, effective_limit=effective_limit)
-    except ArgumentsTooLargeError as exc:
+        if entry.limits.rate_limit_per_minute is not None:
+            window_start = datetime.now(UTC) - timedelta(seconds=60)
+            recent_count = op_repo.count_recent(workflow_id=workflow_id, since=window_start)
+            if recent_count >= entry.limits.rate_limit_per_minute:
+                raise RateLimitedError(
+                    details={
+                        "limit_per_minute": entry.limits.rate_limit_per_minute,
+                        "recent_count": recent_count,
+                    }
+                )
+    except (ArgumentsTooLargeError, RateLimitedError) as exc:
         audit_writer.write(
             AuditLogRepository(session),
             actor=principal_id,
@@ -671,11 +710,7 @@ def prepare_operation(
             subject_type="workflow",
             subject_id=workflow_id,
             outcome="denied",
-            detail={
-                "code": exc.code,
-                "size": len(canonical_bytes),
-                "limit": effective_limit,
-            },
+            detail={"code": exc.code, **exc.details},
         )
         # ADR-011: "the attempt is still audited" even though no operation row is ever
         # written. The caller's own `session_scope` rolls back on any exception
@@ -683,11 +718,12 @@ def prepare_operation(
         # audit entry down with it, since nothing else in this call wrote anything to
         # roll back *from*. Committing here, before raising, ends the current
         # transaction with only the audit entry in it; the caller's subsequent rollback
-        # then has nothing left to undo.
+        # then has nothing left to undo. Applied identically to a rate-limit refusal
+        # (MCP_TOOLS.md section 2.6): recording the request is what's being refused
+        # either way, so neither writes an operation row.
         session.commit()
         raise
 
-    op_repo = OperationRepository(session)
     if idempotency_key is not None:
         existing = op_repo.find_by_idempotency(
             principal_id=principal_id,
@@ -713,7 +749,14 @@ def prepare_operation(
         workflow_id=workflow_id,
         definition_hash=entry.definition_hash,
         state="PREPARING",
-        arguments=redact(arguments, entry.output.redact),
+        # Raw, not redacted: phase 7's dispatch needs the real values (redacting the
+        # email before sending it to n8n would break the workflow), and the
+        # fingerprint re-verified at execute time (`execute_operation`) is computed
+        # over these same raw arguments, matching the one taken at prepare time
+        # (invariant I5). Redaction happens at the *read* boundary instead — wherever
+        # arguments are echoed to a caller (`get_operation`, `get_approval_decision_
+        # context`) — never at rest.
+        arguments=arguments,
         argument_fingerprint=fingerprint,
         argument_bytes=len(canonical_bytes),
         idempotency_key=idempotency_key,
@@ -863,7 +906,7 @@ def _approval_decision_context(
         risk=entry.risk,
         side_effects=entry.side_effects,
         state=row.state,
-        arguments=row.arguments,
+        arguments=redact(row.arguments, entry.output.redact),
         registered_definition_hash=row.definition_hash,
         current_definition_hash=current_hash,
         drifted=current_hash != row.definition_hash,
@@ -957,30 +1000,122 @@ def cancel_operation(
     return _to_domain(updated)
 
 
+def _verify_live_before_execute(preflight: PreflightPort, entry: WorkflowContract) -> None:
+    """Re-run preflight immediately before dispatch (ARCHITECTURE.md 4.3 step 4): the
+    workflow could have been edited directly in n8n's UI during the approval wait,
+    which the registry-snapshot check in :func:`execute_operation` cannot catch on its
+    own (the registry's own ``definition_hash`` is author-asserted at load time, not
+    derived from a live fetch — only a live re-check can observe a live edit). Reuses
+    the exact preflight logic ``prepare_operation`` already ran once, rather than a
+    second, parallel drift-detection path — ADR-009 section 6 keeps drift detection in
+    exactly one place for the same reason: "there is no second, later verification
+    path to get subtly wrong."
+
+    Mirrors ``prepare_operation``'s own use of this port: ``result.ready`` is the fast
+    path, exactly as it is there. Only when ``ready`` is ``False`` are the individual
+    named checks inspected, to pick the specific typed error MCP_TOOLS.md 2.8's error
+    list names — ``InstanceUnreachableError``, ``WorkflowMissingOnInstanceError``,
+    ``WorkflowInactiveError``, ``DefinitionDriftError`` — in the same severity order
+    the real adapter's own checks cascade in (a failed ``instance_reachable`` leaves
+    every check after it ``skipped``, so checking in this order and stopping at the
+    first ``fail`` naturally picks the root cause). A check this function does not
+    itself name (``compatible_version``, ``trigger_compatibility``,
+    ``credential_bindings``, …) failing still blocks execution, conservatively, as
+    ``InstanceUnreachableError`` — the most generic "can't proceed with n8n" error
+    MCP_TOOLS.md 2.8 offers.
+    """
+    result = preflight.check(entry)
+    if result.ready:
+        return
+
+    checks = {c.check: c for c in result.checks}
+    reachable = checks.get("instance_reachable")
+    if reachable is not None and reachable.status == "fail":
+        raise InstanceUnreachableError()
+    exists = checks.get("workflow_exists")
+    if exists is not None and exists.status == "fail":
+        raise WorkflowMissingOnInstanceError()
+    active = checks.get("workflow_active")
+    if active is not None and active.status == "fail":
+        raise WorkflowInactiveError()
+    unchanged = checks.get("definition_unchanged")
+    if unchanged is not None and unchanged.status == "fail":
+        detail = unchanged.detail
+        raise DefinitionDriftError(details=detail if isinstance(detail, dict) else {})
+
+    raise InstanceUnreachableError()
+
+
 def execute_operation(
-    session: Session, *, operation_id: str, handle: str, principal_id: str
+    session: Session,
+    *,
+    operation_id: str,
+    handle: str,
+    principal_id: str,
+    preflight: PreflightPort,
+    environment: str = "default",
 ) -> Operation:
     """T10: burn the handle and move to ``EXECUTING`` (ADR-003, ARCHITECTURE.md 4.3
-    steps 0-6). Dispatch to n8n and resolving to T13/T14/T15 is deliberately **not**
-    this function's job — see :func:`record_execution_outcome`, the seam Phase 4's real
-    n8n adapter calls after dispatch, without core ever importing ``n8n/``.
+    steps 0-6). Dispatching to n8n and resolving to T13/T14/T15 is deliberately **not**
+    this function's job — see :func:`dispatch_operation`, which calls this function
+    for exactly the burn-and-transition step, then dispatches, then calls
+    :func:`record_execution_outcome`.
 
-    ``handle`` is the same value as ``operation_id`` (ADR-003: the operation ID *is* the
-    handle) — the MCP tool contract carries both fields regardless, so a caller passing
-    two different values is a real error (``ARGUMENT_MISMATCH``) worth catching before
-    anything else, rather than one this function silently ignores by only ever looking
-    at ``operation_id``.
+    Every check below runs, in order, before the handle is ever burned — a caller that
+    fails any of them leaves the operation exactly as it was, still ``APPROVED``,
+    still holding its unburned handle:
 
-    The definition-hash re-check here compares against the registry's own *current*
-    active snapshot — genuine drift, catchable without n8n, e.g. from a ``registry
-    reload`` that picked up a re-hashed definition since this operation was approved.
-    It is not the *live n8n* drift check ARCHITECTURE.md 4.3 step 4 also describes; that
-    additionally requires the n8n adapter and is Phase 4's job, layered on top of this.
+    1. ``handle`` must equal ``operation_id`` (ADR-003: the operation ID *is* the
+       handle) — a caller passing two different values is a real error
+       (``ARGUMENT_MISMATCH``), not one silently ignored by only ever looking at
+       ``operation_id``.
+    2. The operation is loaded with lazy expiry applied (invariant I9) and its
+       principal verified (``_get_owned_operation_row``) — a mismatch on either reads
+       as ``OPERATION_NOT_FOUND``, the same "no signal distinguishing X from Y"
+       defense used everywhere else an operation is looked up by a caller-supplied ID.
+    3. ``environment`` must match the operation's own recorded environment. v1 has
+       exactly one (``"default"``), so this can never actually fail today — an
+       explicit, verified check standing in for what a real multi-environment v2 would
+       need to enforce for real, the same "make the structural invariant explicit"
+       reasoning as phase 6's approval-token binding.
+    4. The handle must not already be burned (``HANDLE_ALREADY_USED``).
+    5. State must be ``APPROVED`` (``APPROVAL_REQUIRED``/``OPERATION_EXPIRED``/
+       ``OPERATION_CANCELED``/``HANDLE_INVALID`` as appropriate).
+    6. The argument fingerprint is recomputed from the operation's own stored
+       (raw, unredacted) arguments and compared against the one recorded at prepare
+       time (invariant I5: "the fingerprint checked at execute is the fingerprint
+       recorded at prepare"). Structurally unreachable today — nothing ever mutates
+       ``arguments`` after creation — verified explicitly anyway, for the same reason
+       as the binding check in ``resolve_approval_token``.
+    7. The registered ``definition_hash`` is compared against the registry's own
+       *current* active snapshot — catches drift from a ``registry reload`` since
+       approval, without touching n8n.
+    8-10. The live workflow is re-fetched and re-hashed via :func:`_verify_live_before_execute`
+       — catches an edit made directly in n8n's UI, which step 7 cannot see.
+    11. The handle is burned (a compare-and-set — ``HANDLE_ALREADY_USED`` if a
+        concurrent caller already won it), *then* ``max_concurrent`` is checked: this
+        workflow's count of other operations already ``EXECUTING`` must be below its
+        configured ceiling (``CONCURRENCY_LIMIT_REACHED``).
+
+    Burning the handle before checking concurrency — rather than after, as the count
+    alone would suggest — is deliberate: SQLite allows only one writer transaction at a
+    time, and the burn's ``UPDATE`` is what makes *this* transaction acquire that write
+    lock. Checking the count first would let two threads racing on *different*
+    operations both read the same stale count before either commits, both pass, and
+    both burn — the same TOCTOU gap a plain read-then-write has no matter how the
+    count is queried. Burning first forces every concurrent caller for the same
+    workflow through SQLite's single-writer serialization before the count is read, so
+    each sees a count that already reflects every operation that burned ahead of it. A
+    refused attempt still leaves the operation exactly as it was: raising here aborts
+    the whole caller transaction (``storage.session.session_scope`` rolls back on any
+    exception), so the burn is never observed to have happened outside this function.
     """
     if handle != operation_id:
         raise ArgumentMismatchError(details={"operation_id": operation_id, "handle": handle})
 
     row = _get_owned_operation_row(session, operation_id, principal_id)
+    if row.environment != environment:
+        raise OperationNotFoundError()
 
     if row.handle_burned_at is not None:
         raise HandleAlreadyUsedError()
@@ -993,17 +1128,31 @@ def execute_operation(
     if row.state != "APPROVED":
         raise HandleInvalidError(details={"current_state": row.state})
 
+    recomputed_fingerprint = fingerprint_arguments(canonicalize_arguments(row.arguments))
+    if recomputed_fingerprint != row.argument_fingerprint:
+        raise ArgumentMismatchError(details={"operation_id": operation_id})
+
     document = _require_active_document(session)
     current_entry = _find_entry(document, row.workflow_id)
     current_hash = current_entry.definition_hash if current_entry is not None else None
-    if current_hash != row.definition_hash:
+    if current_entry is None or current_hash != row.definition_hash:
         raise DefinitionDriftError(
             details={"registered": row.definition_hash, "current": current_hash}
         )
 
+    _verify_live_before_execute(preflight, current_entry)
+
     burned = OperationRepository(session).burn_handle(operation_id=operation_id)
     if not burned:
         raise HandleAlreadyUsedError()
+
+    concurrent = OperationRepository(session).count_in_states(
+        workflow_id=row.workflow_id, states=["EXECUTING"]
+    )
+    if concurrent >= current_entry.limits.max_concurrent:
+        raise ConcurrencyLimitReachedError(
+            details={"max_concurrent": current_entry.limits.max_concurrent, "current": concurrent}
+        )
 
     updated = _apply_and_audit(session, row, "T10", actor=principal_id)
     return _to_domain(updated)
@@ -1019,6 +1168,7 @@ def record_execution_outcome(
     n8n_execution_id: str | None = None,
     result: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
+    node_trace: dict[str, Any] | None = None,
     known_secrets: Sequence[str] = (),
 ) -> Operation:
     """T13/T14/T15: record what n8n reported for an already-``EXECUTING`` operation.
@@ -1029,6 +1179,12 @@ def record_execution_outcome(
     ``output.redact``, scrubbed of any string in ``known_secrets`` (boundary B5/B6), and
     size-capped per ``output.max_bytes`` (``core/redaction.py``) before persistence — the
     same shaping ``get_execution_result`` later reads back.
+
+    ``node_trace`` is stored as-is (already allowlist-shaped and payload-free by
+    :func:`n8n_operator.n8n.client.N8nClient.get_execution_node_trace` — see that
+    method's docstring for why it is safe by construction) rather than passed through
+    ``redact``/``cap_output``: it never carries a node's ``data.main`` in the first
+    place, so there is nothing in it for the workflow's redaction rules to catch.
 
     **Never inferred to be a non-event.** ``outcome="indeterminate"`` records exactly
     what ADR-009 requires: a timeout or ambiguous response is recorded as unknown, never
@@ -1051,6 +1207,7 @@ def record_execution_outcome(
         started_at=started_at,
         finished_at=finished_at,
         redacted_payload=capped if result is not None else {},
+        node_trace=node_trace,
         error=capped if error is not None else None,
     )
 
@@ -1066,11 +1223,115 @@ def record_execution_outcome(
     return _to_domain(updated)
 
 
+def dispatch_operation(
+    session_factory: sessionmaker[Session],
+    *,
+    operation_id: str,
+    principal_id: str,
+    dispatch: DispatchPort,
+    known_secrets: Sequence[str] = (),
+) -> Operation:
+    """Dispatch an already-``EXECUTING`` operation to n8n exactly once, then record
+    whatever came back (T13/T14/T15).
+
+    The **one** function in this module that manages its own transactions rather than
+    taking a caller's open ``Session`` — every other use case here is a pure sequence
+    of writes with no I/O in between, so a single caller-managed transaction is the
+    right shape (module docstring, invariant I6). This one sandwiches a real HTTP call
+    to n8n between two separate transactions, because holding a database transaction
+    open across a network call is exactly the kind of thing that turns a slow n8n
+    instance into a database outage:
+
+    1. Read the ``EXECUTING`` row's raw (unredacted) arguments and its frozen entry.
+    2. Call ``dispatch.dispatch(...)`` and, if warranted, ``dispatch.fetch_node_trace``
+       — no session held open for either.
+    3. Record the outcome via :func:`record_execution_outcome`, in a fresh transaction.
+
+    A crash between steps 2 and 3 is exactly the "lost response" case ADR-009 already
+    requires every caller to tolerate: the operation is left in ``EXECUTING``,
+    unresolved, rather than silently reclassified — never retried, never dispatched a
+    second time to resolve the ambiguity (ADR-005). Reconciling it is an out-of-band
+    operator action, not something this function attempts on its own.
+
+    ``fetch_node_trace`` is called only when the dispatch outcome itself reports a
+    trustworthy correlation (``correlation_available``) *and* the workflow's own
+    contract opts in (``output.include_node_trace``) — never guessed from a nearby
+    execution.
+    """
+    with session_scope(session_factory) as session:
+        row = _get_owned_operation_row(session, operation_id, principal_id)
+        if row.state != "EXECUTING":
+            raise InvalidStateTransitionError(details={"current_state": row.state})
+        entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+        arguments = row.arguments
+        timeout_seconds = entry.limits.timeout_seconds or 60
+        started_at = row.updated_at  # the T10 timestamp: when EXECUTING began
+
+    outcome = dispatch.dispatch(entry, arguments, timeout_seconds=timeout_seconds)
+    finished_at = datetime.now(UTC) if outcome.kind != "indeterminate" else None
+
+    node_trace: dict[str, Any] | None = None
+    if (
+        outcome.correlation_available
+        and outcome.execution_id is not None
+        and entry.output.include_node_trace
+    ):
+        node_trace = dispatch.fetch_node_trace(outcome.execution_id)
+
+    with session_scope(session_factory) as session:
+        if outcome.kind == "success":
+            result = (
+                outcome.result if isinstance(outcome.result, dict) else {"value": outcome.result}
+            )
+            return record_execution_outcome(
+                session,
+                operation_id=operation_id,
+                outcome="success",
+                started_at=started_at,
+                finished_at=finished_at,
+                n8n_execution_id=outcome.execution_id,
+                result=result,
+                node_trace=node_trace,
+                known_secrets=known_secrets,
+            )
+        if outcome.kind == "error":
+            return record_execution_outcome(
+                session,
+                operation_id=operation_id,
+                outcome="error",
+                started_at=started_at,
+                finished_at=finished_at,
+                n8n_execution_id=outcome.execution_id,
+                error={"http_status": outcome.http_status, "body": outcome.result},
+                node_trace=node_trace,
+                known_secrets=known_secrets,
+            )
+        return record_execution_outcome(
+            session,
+            operation_id=operation_id,
+            outcome="indeterminate",
+            started_at=started_at,
+            finished_at=finished_at,
+            n8n_execution_id=outcome.execution_id,
+            error={"http_status": outcome.http_status} if outcome.http_status is not None else None,
+            node_trace=node_trace,
+            known_secrets=known_secrets,
+        )
+
+
 def get_operation(session: Session, *, operation_id: str, principal_id: str) -> Operation:
     """Current state of one operation, applying any overdue expiry first (invariant I9,
-    MCP_TOOLS.md section 2.7)."""
+    MCP_TOOLS.md section 2.7).
+
+    Arguments are echoed **post-redaction** (MCP_TOOLS.md 2.7's own example: an email
+    address shown as ``"[REDACTED]"``) — the row itself holds the raw values phase 7's
+    dispatch and fingerprint re-verification need, so redaction happens here, at the
+    read boundary, not at rest.
+    """
     row = _get_owned_operation_row(session, operation_id, principal_id)
-    return _to_domain(row)
+    entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+    operation = _to_domain(row)
+    return operation.model_copy(update={"arguments": redact(row.arguments, entry.output.redact)})
 
 
 def list_operations(

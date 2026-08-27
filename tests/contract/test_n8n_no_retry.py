@@ -13,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 N8N_CLIENT_SOURCE = REPO_ROOT / "src" / "n8n_operator" / "n8n" / "client.py"
+CORE_SERVICE_SOURCE = REPO_ROOT / "src" / "n8n_operator" / "core" / "service.py"
 
 FORBIDDEN_SUBSTRINGS = (
     "retries=",
@@ -49,6 +50,31 @@ def test_no_retry_machinery_anywhere_under_the_n8n_package() -> None:
         text = path.read_text(encoding="utf-8")
         for forbidden in FORBIDDEN_SUBSTRINGS:
             assert forbidden not in text, f"{forbidden!r} found in {path.relative_to(REPO_ROOT)}"
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("forbidden", FORBIDDEN_SUBSTRINGS)
+def test_no_retry_machinery_in_dispatch_operation(forbidden: str) -> None:
+    """Phase 7's ``core.service.dispatch_operation`` is the one place that calls
+    ``DispatchPort.dispatch`` — the same "never retried, never dispatched a second time"
+    guarantee ADR-005 makes for the n8n client itself applies here, statically."""
+    text = CORE_SERVICE_SOURCE.read_text(encoding="utf-8")
+    for forbidden_substr in FORBIDDEN_SUBSTRINGS:
+        assert forbidden_substr not in text, (
+            f"{forbidden_substr!r} found in core/service.py — no retry logic is permitted (ADR-005)"
+        )
+
+
+@pytest.mark.contract
+def test_dispatch_is_called_at_most_once_per_dispatch_operation_call() -> None:
+    """A narrower, textual check that ``dispatch_operation`` calls ``dispatch.dispatch``
+    exactly once in its source — not zero (the whole point of the function), and not
+    twice (which would mean a retry or a duplicate-dispatch path)."""
+    text = CORE_SERVICE_SOURCE.read_text(encoding="utf-8")
+    start = text.index("def dispatch_operation(")
+    end = text.index("\ndef ", start + 1)
+    body = text[start:end]
+    assert body.count("outcome = dispatch.dispatch(") == 1
 
 
 @pytest.mark.contract

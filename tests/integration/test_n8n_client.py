@@ -8,7 +8,9 @@ key redaction.
 
 from __future__ import annotations
 
+import json
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -282,7 +284,10 @@ def test_dispatch_success_returns_success_kind_and_correlation(
     )
     assert outcome.kind == "success"
     assert outcome.execution_id == "999"
-    assert outcome.body == {"n8n_operator": {"execution_id": "999"}, "data": {"ok": True}}
+    assert outcome.correlation_available is True
+    # The envelope is unwrapped (ADR-009 section 2): `result` is `data`, not the
+    # wrapper — `n8n_operator`/`execution_id` never appear inside it.
+    assert outcome.result == {"ok": True}
 
 
 @pytest.mark.integration
@@ -320,19 +325,41 @@ def test_dispatch_connection_error_returns_indeterminate(
 
 
 @pytest.mark.integration
-def test_dispatch_malformed_body_is_success_kind_with_no_correlation(
+def test_dispatch_unparseable_body_is_indeterminate(mock_n8n: MockN8n, client: N8nClient) -> None:
+    """A response body that isn't valid JSON at all is indeterminate, not success —
+    ADR-009 section 1.1 lists "a timeout, connection loss, or unparseable response"
+    together as the three EXECUTING -> UNKNOWN (T15) triggers. This is distinct from a
+    *malformed envelope* (valid JSON, wrong shape): that case still confirms
+    success/error from the HTTP status (see
+    ``test_dispatch_malformed_envelope_is_still_success_with_no_correlation`` below) —
+    only a body that fails to parse as JSON at all falls back to indeterminate."""
+    mock_n8n.add_webhook_malformed("/webhook/abc", status=200, raw_body="not json at all {{{")
+    outcome = client.dispatch_webhook(
+        path="/webhook/abc", method="POST", json_body={}, timeout_seconds=5
+    )
+    assert outcome.kind == "indeterminate"
+    assert outcome.execution_id is None
+    assert outcome.correlation_available is False
+    assert outcome.result is None
+
+
+@pytest.mark.integration
+def test_dispatch_malformed_envelope_is_still_success_with_no_correlation(
     mock_n8n: MockN8n, client: N8nClient
 ) -> None:
-    """A 200 response with an unparseable body is not indeterminate — n8n responded.
-    It is a successful dispatch with no correlation available (ADR-009: "a workflow
-    that returns a result is not broken because its envelope is")."""
-    mock_n8n.add_webhook_malformed("/webhook/abc", status=200, raw_body="not json at all {{{")
+    """Valid JSON, present ``n8n_operator`` key, but the wrong shape (a string where
+    the envelope needs a dict) — ADR-009 section 2: "a workflow that returns a result
+    is not broken because its envelope is". Outcome is still classified from the HTTP
+    status; only correlation is unavailable."""
+    mock_n8n.add_webhook_response(
+        "/webhook/abc", status=200, body={"n8n_operator": "not-a-dict", "data": {"ok": True}}
+    )
     outcome = client.dispatch_webhook(
         path="/webhook/abc", method="POST", json_body={}, timeout_seconds=5
     )
     assert outcome.kind == "success"
     assert outcome.execution_id is None
-    assert outcome.body is None
+    assert outcome.correlation_available is False
 
 
 @pytest.mark.integration
@@ -536,6 +563,144 @@ def test_list_executions_raises_on_a_malformed_execution_record(
     )
     with pytest.raises(ProviderError):
         broken_client.list_executions(workflow_id="wf-a")
+
+
+# --------------------------------------------------------------------------------------
+# get_execution_node_trace — allowlisted, empirically-shaped extraction only.
+# --------------------------------------------------------------------------------------
+
+# A trimmed version of the real captured shape at
+# tests/fixtures/canonicalization/execution_detail_shape.json (Phase 4's live spike),
+# with the raw per-node `data` payloads replaced by an unmistakable sentinel — if any
+# of it ever leaked through `get_execution_node_trace`, these tests would catch it.
+_SUCCESS_EXECUTION_RECORD: dict[str, Any] = {
+    "id": "exec-1",
+    "status": "success",
+    "data": {
+        "resultData": {
+            "lastNodeExecuted": "Respond Success",
+            "runData": {
+                "Webhook": [
+                    {
+                        "executionStatus": "success",
+                        "executionTime": 0,
+                        "executionIndex": 0,
+                        "data": {"main": [[{"json": {"LEAK_SENTINEL": "webhook-raw-body"}}]]},
+                    }
+                ],
+                "Process": [
+                    {
+                        "executionStatus": "success",
+                        "executionTime": 5,
+                        "executionIndex": 1,
+                        "data": {"main": [[{"json": {"LEAK_SENTINEL": "process-output"}}]]},
+                    }
+                ],
+            },
+        }
+    },
+    "workflowData": {
+        "nodes": [
+            {"name": "Webhook", "type": "n8n-nodes-base.webhook"},
+            {"name": "Process", "type": "n8n-nodes-base.code"},
+        ]
+    },
+}
+
+
+@pytest.mark.integration
+def test_get_execution_node_trace_extracts_ordered_nodes_and_never_leaks_payloads(
+    mock_n8n: MockN8n, client: N8nClient
+) -> None:
+    mock_n8n.add_execution("exec-1", _SUCCESS_EXECUTION_RECORD)
+    trace = client.get_execution_node_trace("exec-1")
+    assert trace is not None
+    assert trace["failed_node"] is None
+    assert trace["failed_node_error"] is None
+    assert [n["name"] for n in trace["nodes"]] == ["Webhook", "Process"]  # executionIndex order
+    assert trace["nodes"][0] == {
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "status": "success",
+        "duration_ms": 0,
+    }
+    assert trace["nodes"][1]["type"] == "n8n-nodes-base.code"
+    assert trace["nodes"][1]["duration_ms"] == 5
+    serialized = json.dumps(trace)
+    assert "LEAK_SENTINEL" not in serialized
+    assert "webhook-raw-body" not in serialized
+    assert "process-output" not in serialized
+
+
+@pytest.mark.integration
+def test_get_execution_node_trace_identifies_the_failed_node(
+    mock_n8n: MockN8n, client: N8nClient
+) -> None:
+    """The failure shape is not empirically confirmed (Phase 4's live spike captured
+    an all-success execution) — this asserts the module's own documented, defensive
+    assumption: an `error` sub-object with a `message` key, extracted the same
+    allowlisted way as everything else."""
+    record: dict[str, Any] = {
+        "id": "exec-2",
+        "status": "error",
+        "data": {
+            "resultData": {
+                "lastNodeExecuted": "HTTP Call",
+                "runData": {
+                    "Webhook": [
+                        {"executionStatus": "success", "executionTime": 0, "executionIndex": 0}
+                    ],
+                    "HTTP Call": [
+                        {
+                            "executionStatus": "error",
+                            "executionTime": 12,
+                            "executionIndex": 1,
+                            "error": {
+                                "message": "Request failed with status 422",
+                                "LEAK": "stack-trace",
+                            },
+                        }
+                    ],
+                },
+            }
+        },
+        "workflowData": {
+            "nodes": [
+                {"name": "Webhook", "type": "n8n-nodes-base.webhook"},
+                {"name": "HTTP Call", "type": "n8n-nodes-base.httpRequest"},
+            ]
+        },
+    }
+    mock_n8n.add_execution("exec-2", record)
+    trace = client.get_execution_node_trace("exec-2")
+    assert trace is not None
+    assert trace["failed_node"] == "HTTP Call"
+    assert trace["failed_node_error"] == "Request failed with status 422"
+    assert "stack-trace" not in json.dumps(trace)
+
+
+@pytest.mark.integration
+def test_get_execution_node_trace_returns_none_for_unreachable_or_missing(
+    mock_n8n: MockN8n, client: N8nClient
+) -> None:
+    assert client.get_execution_node_trace("does-not-exist") is None
+    mock_n8n.unreachable = True
+    assert client.get_execution_node_trace("exec-1") is None
+
+
+@pytest.mark.integration
+def test_get_execution_node_trace_returns_none_for_unrecognized_shape(
+    mock_n8n: MockN8n, client: N8nClient
+) -> None:
+    mock_n8n.add_execution(
+        "exec-3", {"id": "exec-3", "status": "success"}
+    )  # no data.resultData.runData
+    assert client.get_execution_node_trace("exec-3") is None
+
+
+@pytest.mark.integration
+def test_known_secrets_returns_the_configured_api_key(client: N8nClient) -> None:
+    assert client.known_secrets() == (API_KEY,)
 
 
 @pytest.mark.integration

@@ -209,7 +209,11 @@ def test_full_cli_only_stdio_flow_prepare_to_approve_to_execute(
     try:
         with session_scope(session_factory) as session:
             operation = service.execute_operation(
-                session, operation_id=prepared, handle=prepared, principal_id="local"
+                session,
+                operation_id=prepared,
+                handle=prepared,
+                principal_id="local",
+                preflight=FakePreflight(),
             )
         assert operation.state == "EXECUTING"
     finally:

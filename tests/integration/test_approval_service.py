@@ -143,7 +143,13 @@ def test_ac09_execute_refused_until_approved_then_allowed(
     op_id, _state, token = _prepare(session_factory, env)
 
     with session_scope(session_factory) as session, pytest.raises(ApprovalRequiredError):
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
     with session_scope(session_factory) as session:
         resolved = service.resolve_approval_token(session, token=token)
@@ -151,7 +157,11 @@ def test_ac09_execute_refused_until_approved_then_allowed(
 
     with session_scope(session_factory) as session:
         operation = service.execute_operation(
-            session, operation_id=op_id, handle=op_id, principal_id="local"
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
         )
     assert operation.state == "EXECUTING"
 
@@ -177,7 +187,13 @@ def test_ac12_expired_on_next_read_with_no_sweeper(
     assert operation.state == "EXPIRED"
 
     with session_scope(session_factory) as session, pytest.raises(OperationExpiredError):
-        service.execute_operation(session, operation_id=op_id, handle=op_id, principal_id="local")
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
 
     with session_scope(session_factory) as session, pytest.raises(ApprovalNotPendingError):
         service.resolve_approval_token(session, token=token)

@@ -64,6 +64,14 @@ class _FakeHealth:
         return HealthCheckResult(reachable=True, checked_at=datetime.now(UTC))
 
 
+class _FakeDispatch:
+    def dispatch(self, workflow: Any, arguments: dict[str, Any], *, timeout_seconds: int) -> Any:
+        raise NotImplementedError  # never invoked — this module tests shape, not behavior
+
+    def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+
 def _make_deps(*, caller_is_local: bool = True) -> ToolDeps:
     # No test in this module touches a database; `session_factory` is unused.
     unused_session_factory = cast("sessionmaker[Any]", None)
@@ -71,6 +79,7 @@ def _make_deps(*, caller_is_local: bool = True) -> ToolDeps:
         session_factory=unused_session_factory,
         preflight=_FakePreflight(),
         health=_FakeHealth(),
+        dispatch=_FakeDispatch(),
         server_max_argument_bytes=262_144,
         caller_is_local=caller_is_local,
         approval_base_url="http://127.0.0.1:8765",

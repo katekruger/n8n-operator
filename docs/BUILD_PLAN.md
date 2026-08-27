@@ -249,6 +249,7 @@ n8n-operator/
 │       │   ├── canonicalization.py # versioned, evidence-driven hashing (ADR-008)
 │       │   ├── preflight.py        # liveness, active, drift, credential checks
 │       │   ├── health.py           # reachability adapter (HealthPort)
+│       │   ├── dispatch.py         # webhook dispatch adapter (DispatchPort)
 │       │   └── types.py            # n8n API response models
 │       ├── storage/                # section 8 — persistence
 │       │   ├── __init__.py
@@ -1495,14 +1496,110 @@ it touches are updated in the same change.
 
 ### Phase 7 — Execution and debugging
 
-- [ ] `execute_operation`: handle burn, re-check drift, dispatch, deadline enforcement
-- [ ] Outcome mapping to `SUCCEEDED`, `FAILED`, or `UNKNOWN`, with no inference that a
-      timed-out dispatch did not run (ADR-009)
-- [ ] Execution-ID capture from the response envelope where declared
-- [ ] `execution_results` persistence with redaction and size capping
-- [ ] `get_execution_result`, `get_execution_log`
-- [ ] `cancel_operation`, `list_operations`, `get_operation`
-- [ ] Tests: AC-10, AC-11, AC-13, AC-14, AC-15, AC-16, AC-19, AC-29, AC-33
+- [x] `execute_operation` extended with the full pre-burn verification chain (ARCHITECTURE.md
+      4.3): handle/operation-ID equality, lazy expiry + principal + environment binding,
+      unburned-handle and state checks, an argument-fingerprint re-verification against
+      the operation's own stored (raw) arguments (invariant I5), the registry's own
+      current-snapshot drift check, then a *live* re-check against n8n
+      (`_verify_live_before_execute`, reusing `PreflightPort` rather than a second
+      drift-detection path — ADR-009 section 6), and finally `max_concurrent`. The
+      handle is burned *before* the concurrency count is read, deliberately: SQLite is
+      single-writer, and the burn's `UPDATE` is what makes a caller's transaction
+      acquire that write lock — checking the count first would let two threads racing
+      on *different* operations of the same workflow both read a stale count and both
+      pass; burning first serializes every concurrent caller through SQLite itself, and
+      a refused attempt still leaves nothing behind because raising rolls back the
+      whole transaction. `environment` is a new, currently-always-satisfied parameter
+      (v1 has exactly one) — explicit and verified for the same "make the structural
+      invariant real" reason as phase 6's approval-token binding.
+- [x] `core.service.dispatch_operation(session_factory, ...)`: the one function in this
+      module that manages its own transactions rather than taking a caller's open
+      `Session` — a real HTTP call to n8n cannot happen inside a held database
+      transaction. Reads the `EXECUTING` row's raw arguments in one transaction, calls
+      `DispatchPort.dispatch` with no session open, and records the outcome
+      (`record_execution_outcome`, extended with a `started_at`/`finished_at` pair
+      derived from the T10 timestamp and wall-clock completion, and a new `node_trace`
+      parameter) in a second transaction. A crash between dispatch and recording is
+      exactly ADR-009's "lost response" case: the operation is left `EXECUTING`,
+      unresolved, for an operator to reconcile — never retried, never dispatched a
+      second time (ADR-005).
+- [x] Outcome mapping, conservative by construction: a confirmed 2xx response is
+      `SUCCEEDED`; a confirmed non-2xx response is `FAILED`; a timeout, a lost
+      response, or an unparseable response body is `UNKNOWN` — a *malformed but
+      parseable* correlation envelope does not, by itself, demote a real success/error
+      to `UNKNOWN` (ADR-009 section 2's own distinction, already fixed at the source in
+      `n8n/client.py::dispatch_webhook` this phase — a pre-existing test from phase 4
+      had this backwards and was corrected along with it). No code path transitions
+      `UNKNOWN` to anything (invariant I7).
+- [x] Execution-ID capture from the response envelope where declared
+      (`trigger.correlation: response_envelope`); `fetch_node_trace` is called only
+      when the dispatch outcome itself reports a trustworthy correlation *and* the
+      workflow's own `output.include_node_trace` opts in — never guessed from a nearby
+      execution.
+- [x] `n8n/client.py::get_execution_node_trace`: the one, deliberately narrow exception
+      to "never fetch `includeData=true`" (docs/N8N_COMPATIBILITY.md section 8) —
+      allowed to call it, but reads only five named scalar fields per node via `.get()`
+      and builds a brand-new dict of primitives, never forwarding any nested object
+      (especially `data.main`, which can carry a webhook trigger's raw inbound
+      request). Safe by construction regardless of whether the assumed n8n response
+      shape is exactly right; grounded in the real fixture phase 4's live spike
+      captured, not a guessed schema. `n8n/dispatch.py::N8nDispatch` is the adapter
+      satisfying `core.service.DispatchPort`; `mcp/server.py` wires it and
+      `N8nClient.known_secrets()` into `ToolDeps` alongside the existing preflight and
+      health adapters.
+- [x] `execution_results` persistence extended with `node_trace`, stored as-is (already
+      allowlist-shaped, never carrying `data.main`) rather than passed through
+      `redact`/`cap_output` — there is nothing in it those rules would catch.
+      `operations.arguments` is now stored **raw** at prepare time (previously
+      redacted, which made dispatch and fingerprint re-verification structurally
+      impossible); redaction moved to the read boundary — `get_operation` and phase
+      6's `_approval_decision_context` are the only two places that ever echo
+      arguments to a caller, and both now redact there instead of at rest.
+- [x] `get_execution_result`, `get_execution_log` — both already existed structurally
+      from phase 5; `get_execution_log`'s handler already read `result.node_trace` in
+      anticipation of this phase and needed no change. A missing/unavailable trace
+      reads as `nodes: []`, `failed_node: null` — never a guess at which nearby
+      execution the caller meant.
+- [x] `cancel_operation`, `list_operations`, `get_operation` — unchanged in shape;
+      `get_operation` gained the redact-at-read-boundary change above.
+- [x] `mcp/tools.py::execute_operation` orchestrates `service.execute_operation` (burn
+      + T10) then `service.dispatch_operation` (dispatch + resolve) as two separate
+      calls, then shapes the result per MCP_TOOLS.md 2.8: `SUCCEEDED`/`FAILED` carry
+      `started_at`/`finished_at`/`duration_ms` and a `result`/`error` object with
+      `truncated` merged in (matching the doc's own example shape); `UNKNOWN` carries
+      `code: "DISPATCH_INDETERMINATE"` (sourced from `errors.DispatchIndeterminateError`,
+      never a bare string literal — the error-taxonomy contract test forbids that), a
+      do-not-retry `message`, and a `correlation` block reporting whether an execution
+      ID is available for reconciliation.
+- [x] Tests: AC-10 (dispatches exactly once; a reused handle dispatches nothing
+      further, proven by a call counter), AC-11 (unchanged, still green), AC-13
+      (registry-snapshot drift, already covered in phase 3, plus a new *live* drift
+      re-check via a fake preflight reporting `definition_unchanged: fail` after
+      approval — nothing dispatched either way), AC-14 (a `read_only`/`approval: none`
+      operation dispatches without any human decision), AC-15 (a workflow that errors
+      in n8n leaves the operation `FAILED`, and `get_execution_log` names the failing
+      node and its error — both at the `core.service` level and through the MCP tool),
+      AC-16 (timeout, before-any-response and after-n8n-received-the-request variants,
+      and a bare lost response all map identically to `UNKNOWN`, dispatch nothing
+      further, and the audit log records the indeterminacy exactly once), AC-19
+      (configured `output.redact` paths absent from the persisted, then read-back,
+      result). Also: a malformed-but-parseable correlation envelope does not block
+      success and never triggers a node-trace fetch; an oversized result is truncated
+      and reported; a tampered argument fingerprint (written directly to the row,
+      bypassing every use case) is caught at execute; cancellation cannot interrupt an
+      `EXECUTING` operation (no such edge in the state machine); concurrent execute
+      calls on the *same* operation still burn the handle exactly once (extended to
+      tolerate either `HANDLE_ALREADY_USED` or `CONCURRENCY_LIMIT_REACHED` for the
+      loser, depending on interleaving — both correctly mean "did not run twice");
+      concurrent execute calls on *different* approved operations of a
+      `max_concurrent: 1` workflow, under genuine thread concurrency, let exactly one
+      through; rate limiting is enforced at prepare time, per workflow, across
+      principals; no automatic retry, both statically (a grep-based contract test
+      extended to cover `core/service.py`, plus a check that `dispatch_operation`'s
+      source calls `dispatch.dispatch` exactly once) and behaviorally (a fake dispatch
+      call counter stays at 1 regardless of outcome kind). 40 new tests (875 total),
+      93% coverage overall; `core/` (96%) and `registry/` (94-98%) remain above the 90%
+      gate.
 
 ### Phase 8 — Operator surface
 

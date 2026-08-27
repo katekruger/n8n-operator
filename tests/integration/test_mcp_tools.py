@@ -25,7 +25,12 @@ from mcp_types import CallToolResult, InputRequiredResult
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.core import service
-from n8n_operator.core.models import HealthCheckResult, PreflightCheck, PreflightResult
+from n8n_operator.core.models import (
+    DispatchOutcome,
+    HealthCheckResult,
+    PreflightCheck,
+    PreflightResult,
+)
 from n8n_operator.mcp.resources import register_resources
 from n8n_operator.mcp.tools import ToolDeps, build_tools
 from n8n_operator.storage.repository import PrincipalRepository
@@ -57,6 +62,8 @@ workflows:
         email: {{type: string}}
       required: [email]
       additionalProperties: false
+    output:
+      include_node_trace: true
     limits:
       approval_ttl_seconds: 900
       execution_ttl_seconds: 300
@@ -140,6 +147,40 @@ class FakeHealth:
         )
 
 
+class FakeDispatch:
+    """A configurable stand-in for the real (phase 7) n8n dispatch adapter — never
+    actually invoked by tests that raise before ``core.service.dispatch_operation``,
+    and unused by tests that simulate a completed operation via
+    ``service.record_execution_outcome`` directly rather than through this tool."""
+
+    def __init__(
+        self,
+        *,
+        outcome: DispatchOutcome | None = None,
+        node_trace: dict[str, Any] | None = None,
+    ) -> None:
+        self.outcome = outcome or DispatchOutcome(
+            kind="success",
+            http_status=200,
+            result={},
+            execution_id=None,
+            correlation_available=False,
+        )
+        self.node_trace = node_trace
+        self.dispatch_calls = 0
+        self.fetch_node_trace_calls = 0
+
+    def dispatch(
+        self, workflow: Any, arguments: dict[str, Any], *, timeout_seconds: int
+    ) -> DispatchOutcome:
+        self.dispatch_calls += 1
+        return self.outcome
+
+    def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None:
+        self.fetch_node_trace_calls += 1
+        return self.node_trace
+
+
 @pytest.fixture
 def registry_path(tmp_path: Path) -> Path:
     path = tmp_path / "workflows.yaml"
@@ -161,12 +202,14 @@ def make_server(
     caller_is_local: bool = True,
     preflight: FakePreflight | None = None,
     health: FakeHealth | None = None,
+    dispatch: FakeDispatch | None = None,
     server_max_argument_bytes: int = 262_144,
 ) -> MCPServer[Any]:
     deps = ToolDeps(
         session_factory=session_factory,
         preflight=preflight or FakePreflight(),
         health=health or FakeHealth(),
+        dispatch=dispatch or FakeDispatch(),
         server_max_argument_bytes=server_max_argument_bytes,
         caller_is_local=caller_is_local,
         approval_base_url="http://127.0.0.1:8765",
@@ -613,13 +656,25 @@ async def test_audit_operation_resource_unknown_id_raises_resource_not_found(
 async def _complete_an_operation(
     loaded: sessionmaker[Session], server: MCPServer[Any], *, outcome: str
 ) -> str:
+    """Prepares, approves, and burns the handle via ``core.service`` directly — not
+    through the ``execute_operation`` *tool*, which (phase 7) also dispatches and fully
+    resolves the operation in one call. Bypassing the tool for the burn step keeps this
+    helper's original design intact: simulate a completed ``EXECUTING`` operation via
+    ``service.record_execution_outcome`` with no network, and no ``FakeDispatch``
+    outcome to keep in sync with the ``outcome`` parameter below."""
     prepared = await call(
         server, "prepare_operation", workflow_id="wf.approval", arguments={"email": "a@b.com"}
     )
     op_id: str = prepared["operation_id"]
     with session_scope(loaded) as session:
         service.approve_operation(session, operation_id=op_id, decided_by="local")
-    await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+        service.execute_operation(
+            session,
+            operation_id=op_id,
+            handle=op_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+        )
     with session_scope(loaded) as session:
         if outcome == "success":
             service.record_execution_outcome(
@@ -658,5 +713,135 @@ async def test_get_execution_log_after_completion(loaded: sessionmaker[Session])
     op_id = await _complete_an_operation(loaded, server, outcome="success")
     result = await call(server, "get_execution_log", operation_id=op_id)
     assert result["state"] == "SUCCEEDED"
-    assert result["nodes"] == []  # output.include_node_trace defaults false
+    # No node trace was ever recorded — this helper simulates completion via
+    # service.record_execution_outcome directly, with no node_trace argument, rather
+    # than through a real (or fake) dispatch. See the tests below for a real dispatch.
+    assert result["nodes"] == []
     assert result["truncated"] is False
+
+
+# --------------------------------------------------------------------------------------
+# Phase 7: the execute_operation tool's own dispatch orchestration and result shapes
+# (MCP_TOOLS.md 2.8), and get_execution_log naming a failing node (AC-15) — both
+# through a real (fake) DispatchPort, unlike _complete_an_operation above.
+# --------------------------------------------------------------------------------------
+
+
+async def test_execute_operation_tool_succeeded_shape(loaded: sessionmaker[Session]) -> None:
+    dispatch = FakeDispatch(
+        outcome=DispatchOutcome(
+            kind="success",
+            http_status=200,
+            result={"contact_id": "c_1", "created": False},
+            execution_id="exec-1",
+            correlation_available=True,
+        )
+    )
+    server = make_server(loaded, dispatch=dispatch)
+    prepared = await call(
+        server, "prepare_operation", workflow_id="wf.approval", arguments={"email": "a@b.com"}
+    )
+    op_id = prepared["operation_id"]
+    with session_scope(loaded) as session:
+        service.approve_operation(session, operation_id=op_id, decided_by="local")
+
+    result = await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+    assert result["operation_id"] == op_id
+    assert result["state"] == "SUCCEEDED"
+    assert result["result"]["contact_id"] == "c_1"
+    assert result["result"]["truncated"] is False
+    assert result["started_at"] is not None
+    assert result["finished_at"] is not None
+    assert result["duration_ms"] is not None
+    assert dispatch.dispatch_calls == 1
+
+    # A reused handle dispatches nothing further.
+    second = await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+    assert second["error"]["code"] == "HANDLE_ALREADY_USED"
+    assert dispatch.dispatch_calls == 1
+
+
+async def test_execute_operation_tool_unknown_shape_on_indeterminate_dispatch(
+    loaded: sessionmaker[Session],
+) -> None:
+    dispatch = FakeDispatch(
+        outcome=DispatchOutcome(
+            kind="indeterminate",
+            http_status=None,
+            result=None,
+            execution_id=None,
+            correlation_available=False,
+        )
+    )
+    server = make_server(loaded, dispatch=dispatch)
+    prepared = await call(
+        server, "prepare_operation", workflow_id="wf.approval", arguments={"email": "a@b.com"}
+    )
+    op_id = prepared["operation_id"]
+    with session_scope(loaded) as session:
+        service.approve_operation(session, operation_id=op_id, decided_by="local")
+
+    result = await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+    assert result["operation_id"] == op_id
+    assert result["state"] == "UNKNOWN"
+    assert result["code"] == "DISPATCH_INDETERMINATE"
+    assert "do not retry" in result["message"].lower() or "never retry" in result["message"].lower()
+    assert result["correlation"] == {"available": False, "reason": "NO_EXECUTION_CORRELATION"}
+
+    # UNKNOWN is terminal — the handle was already burned before dispatch, so a second
+    # attempt is refused, not re-dispatched.
+    second = await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+    assert second["error"]["code"] == "HANDLE_ALREADY_USED"
+    assert dispatch.dispatch_calls == 1
+
+
+async def test_execute_operation_tool_failed_shape_and_get_execution_log_names_the_node(
+    loaded: sessionmaker[Session],
+) -> None:
+    """AC-15, through the MCP layer: a workflow that errors in n8n leaves the
+    operation FAILED, and get_execution_log names the failing node and its error."""
+    node_trace = {
+        "nodes": [
+            {
+                "name": "Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "status": "success",
+                "duration_ms": 3,
+            },
+            {
+                "name": "HTTP Request",
+                "type": "n8n-nodes-base.httpRequest",
+                "status": "error",
+                "duration_ms": 812,
+            },
+        ],
+        "failed_node": "HTTP Request",
+        "failed_node_error": "Request failed with status 422",
+    }
+    dispatch = FakeDispatch(
+        outcome=DispatchOutcome(
+            kind="error",
+            http_status=422,
+            result={"message": "Request failed with status 422"},
+            execution_id="exec-2",
+            correlation_available=True,
+        ),
+        node_trace=node_trace,
+    )
+    server = make_server(loaded, dispatch=dispatch)
+    prepared = await call(
+        server, "prepare_operation", workflow_id="wf.approval", arguments={"email": "a@b.com"}
+    )
+    op_id = prepared["operation_id"]
+    with session_scope(loaded) as session:
+        service.approve_operation(session, operation_id=op_id, decided_by="local")
+
+    result = await call(server, "execute_operation", operation_id=op_id, handle=op_id)
+    assert result["state"] == "FAILED"
+    assert result["error"]["body"] == {"message": "Request failed with status 422"}
+
+    log = await call(server, "get_execution_log", operation_id=op_id)
+    assert log["state"] == "FAILED"
+    assert log["failed_node"] == "HTTP Request"
+    node_names = [n["name"] for n in log["nodes"]]
+    assert node_names == ["Webhook", "HTTP Request"]

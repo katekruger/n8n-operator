@@ -32,6 +32,7 @@ __all__ = [
     "Approval",
     "ApprovalDecisionContext",
     "AuditEvent",
+    "DispatchOutcome",
     "Environment",
     "ExecutionResult",
     "HealthCheckResult",
@@ -250,3 +251,23 @@ class HealthCheckResult(BaseModel):
     latency_ms: int | None = None
     reason: str | None = None
     checked_at: datetime
+
+
+class DispatchOutcome(BaseModel):
+    """The result of one webhook dispatch attempt (ADR-005, ADR-009), converted from
+    ``n8n.client.DispatchOutcome`` by the composition root — the same real-type-behind-
+    a-port pattern ``PreflightResult``/``HealthCheckResult`` already establish.
+
+    ``result`` is already unwrapped (the envelope's own ``data`` field, when a
+    well-formed envelope was found) — see ``n8n/client.py``'s ``DispatchOutcome``
+    docstring for exactly what "well-formed" requires and why a malformed one still
+    counts as ``success``/``error``, never demotes to ``indeterminate``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["success", "error", "indeterminate"]
+    http_status: int | None
+    result: Any | None
+    execution_id: str | None
+    correlation_available: bool

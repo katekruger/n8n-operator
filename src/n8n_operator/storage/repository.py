@@ -27,7 +27,7 @@ import builtins
 from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, Select, select, update
+from sqlalchemy import CursorResult, Select, func, select, update
 from sqlalchemy.orm import Session
 
 from n8n_operator.errors import OptimisticLockError
@@ -302,6 +302,31 @@ class OperationRepository:
             )
         )
         return list(self._session.scalars(stmt))
+
+    def count_recent(self, *, workflow_id: str, since: datetime) -> int:
+        """How many operations for ``workflow_id`` — across every principal — were
+        created at or after ``since`` (phase 7's ``rate_limit_per_minute``,
+        MCP_TOOLS.md section 2.6). Rate limiting is a property of the *workflow*, not
+        of one principal's own history, so this is deliberately not scoped to a
+        principal the way :meth:`list` is."""
+        stmt = (
+            select(func.count())
+            .select_from(Operation)
+            .where(Operation.workflow_id == workflow_id, Operation.created_at >= since)
+        )
+        return self._session.scalar(stmt) or 0
+
+    def count_in_states(self, *, workflow_id: str, states: builtins.list[str]) -> int:
+        """How many operations for ``workflow_id`` currently sit in one of ``states`` —
+        phase 7's ``max_concurrent`` check (MCP_TOOLS.md section 2.8), evaluated at
+        execute time against the live count of ``EXECUTING`` operations. Not
+        principal-scoped, for the same reason as :meth:`count_recent`."""
+        stmt = (
+            select(func.count())
+            .select_from(Operation)
+            .where(Operation.workflow_id == workflow_id, Operation.state.in_(states))
+        )
+        return self._session.scalar(stmt) or 0
 
     def compare_and_set_state(
         self,
