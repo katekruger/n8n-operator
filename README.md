@@ -7,26 +7,26 @@
 [![MCP](https://img.shields.io/badge/MCP-2.x-6f42c1)](https://modelcontextprotocol.io/)
 [![License: Apache--2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-<sub>The CodeQL badge reads "skipped," not "passing" or "failing," while this
-repository is private — GitHub's native code scanning is unavailable on a private repo
-without GitHub Advanced Security. The job (`.github/workflows/codeql.yml`) is gated to
-activate automatically the moment the repository becomes public
-(`if: github.event.repository.visibility == 'public'`); the Secret scan badge above
-(full-history Gitleaks, `.github/workflows/secret-scan.yml`) is the enforced security
-check while private.</sub>
+<sub>This repository is public. Native secret scanning, push protection, private
+vulnerability reporting, CodeQL, and branch protection (four required checks, no force
+pushes or branch deletion) are all enabled — see
+[.github/PUBLIC_RELEASE_CHECKLIST.md](.github/PUBLIC_RELEASE_CHECKLIST.md) for exactly
+what was verified and when.</sub>
 
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: v1 release candidate.** All nine product phases are implemented and the
-> local release gate is green: registry, MCP server (stdio + Streamable HTTP), n8n
-> integration, execution, and the full operator CLI (`db`, `registry`, `operations`,
-> `audit`, `health`, `serve`). A reproducible, Docker-based live-n8n harness exists
+> **Status: v1 release candidate, public repository, not yet tagged or published.**
+> All nine product phases are implemented and the local release gate is green:
+> registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
+> full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). A
+> reproducible, Docker-based live-n8n harness exists
 > ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) — actually running it against a
-> real instance, and a hosted OpenAI connector check, remain before the public v1
-> release. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
-> checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately
-> does not do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
+> real instance, and a real hosted OpenAI connector call, remain before the first
+> GitHub Release and PyPI publish. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md)
+> section 12 for the phase checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md)
+> for what v1 deliberately does not do, and [CHANGELOG.md](CHANGELOG.md) for the full
+> history.
 
 | Client / target | Transport | Evidence |
 |---|---|---|
@@ -104,8 +104,9 @@ thing happened."
 
 ## Quickstart
 
-Requires Python 3.12. While the release candidate is private, install it from a local
-checkout. PyPI publishing is intentionally deferred until the public-release gate passes.
+Requires Python 3.12. No tagged release exists yet — install from a clone of `main`.
+PyPI publishing is intentionally deferred until the live-n8n and hosted OpenAI-connector
+checks above pass for real.
 
 ```bash
 git clone https://github.com/katekruger/n8n-operator.git
@@ -113,8 +114,8 @@ cd n8n-operator
 uv tool install .
 ```
 
-<sub>Private-repository access is required. Contributors can instead run commands from
-the checkout with `uv run n8n-operator ...`.</sub>
+<sub>Contributors can instead run commands from the checkout with
+`uv run n8n-operator ...`.</sub>
 
 **1. Initialize the database.** This also seeds the v1 default principal — do this
 before anything else.
