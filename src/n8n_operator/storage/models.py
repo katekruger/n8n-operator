@@ -276,7 +276,16 @@ class OperationEvent(Base):
 
 class Approval(Base):
     """Out-of-band human decisions (BUILD_PLAN 8.1). The token itself is never stored —
-    only its hash, computed by the caller before this row is written."""
+    only its hash, computed by the caller before this row is written.
+
+    ``binding_hash`` (phase 6, ADR-010) is a sha256 over the operation's own
+    ``(id, principal_id, argument_fingerprint, snapshot_id, definition_hash)`` at mint
+    time (``core/handles.py``'s ``compute_approval_binding``) — none of those columns
+    is ever updated after an operation is created, so this is a structural invariant
+    that already holds; storing and re-checking it at redemption is defense in depth
+    against a future regression (e.g. a v2 retry path that reuses a row) rather than a
+    condition reachable through any v1 code path today.
+    """
 
     __tablename__ = "approvals"
     __table_args__ = (
@@ -287,6 +296,7 @@ class Approval(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
     operation_id: Mapped[str] = mapped_column(ForeignKey("operations.id"), nullable=False)
     token_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    binding_hash: Mapped[str] = mapped_column(String, nullable=False)
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)

@@ -310,12 +310,14 @@ def test_approval_token_hash_is_unique(
         ApprovalRepository(session).create(
             operation_id="op_for_approval",
             token_hash="sha256:" + "1" * 64,
+            binding_hash="sha256:" + "b" * 64,
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
         )
     with pytest.raises(IntegrityError), session_scope(session_factory) as session:
         ApprovalRepository(session).create(
             operation_id="op_for_approval",
             token_hash="sha256:" + "1" * 64,
+            binding_hash="sha256:" + "b" * 64,
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
         )
 
@@ -718,6 +720,7 @@ def test_approval_record_decision(
         approval = ApprovalRepository(session).create(
             operation_id="op_approval1",
             token_hash="sha256:" + "2" * 64,
+            binding_hash="sha256:" + "b" * 64,
             expires_at=datetime.now(UTC) + timedelta(minutes=15),
         )
         approval_id = approval.id

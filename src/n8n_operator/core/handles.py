@@ -47,6 +47,8 @@ from n8n_operator.storage.models import new_ulid
 
 __all__ = [
     "MintedApprovalToken",
+    "compute_approval_binding",
+    "hash_approval_token",
     "mint_approval_token",
     "mint_operation_handle",
 ]
@@ -86,3 +88,38 @@ def mint_approval_token() -> MintedApprovalToken:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     return MintedApprovalToken(token=token, token_hash=token_hash)
+
+
+def hash_approval_token(token: str) -> str:
+    """The same sha256 hash :func:`mint_approval_token` computes, exposed separately so
+    a caller *verifying* a token a human or a browser presents back (rather than
+    minting a fresh one) can compute the hash to look up without duplicating the
+    algorithm. Never logged, and never itself persisted — only the hash it returns is."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def compute_approval_binding(
+    *,
+    operation_id: str,
+    principal_id: str,
+    argument_fingerprint: str,
+    snapshot_id: str,
+    definition_hash: str,
+) -> str:
+    """The approval token's binding fingerprint (phase 6, ADR-010): a stable digest over
+    exactly the operation identity an approval must never silently drift from.
+
+    None of these five values is ever updated on an ``operations`` row after creation —
+    the binding therefore already holds structurally, by construction, for the whole of
+    v1. Recording it at mint time (``prepare_operation``) and recomputing and comparing
+    it at redemption (``resolve_approval_token``) turns that implicit invariant into an
+    explicit, verified one: defense in depth against a future regression (a v2 retry
+    path that reuses a row, a bug that repoints ``approvals.operation_id``) rather than
+    a condition any current code path can actually trigger.
+
+    Field order is fixed and each field is length-prefixed before concatenation, so
+    ``("ab", "c")`` and ``("a", "bc")`` never collide onto the same digest.
+    """
+    parts = (operation_id, principal_id, argument_fingerprint, snapshot_id, definition_hash)
+    preimage = "".join(f"{len(part)}:{part}|" for part in parts).encode("utf-8")
+    return "sha256:" + hashlib.sha256(preimage).hexdigest()

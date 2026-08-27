@@ -139,6 +139,30 @@ def resolve_registry_path(explicit: str | None = None) -> Path:
     return Path(raw)
 
 
+def resolve_approval_bind(explicit: str | None = None) -> str:
+    """The approval app's bind address, resolved *without* requiring the rest of
+    :class:`Settings` — the same "orthogonal concern" reasoning as
+    :func:`resolve_database_url`, applied here so ``n8n-operator serve approval`` and
+    the ``operations`` CLI commands never need ``N8N_OPERATOR_N8N_BASE_URL``/
+    ``N8N_OPERATOR_N8N_API_KEY`` just to approve or reject an operation — neither
+    touches n8n. Precedence: an explicit value, then ``N8N_OPERATOR_APPROVAL_BIND``,
+    then :data:`DEFAULT_APPROVAL_BIND`.
+
+    Raises :class:`ValueError` if the resolved bind is not a loopback address —
+    boundary B10 admits no exception, so this is checked here too, not only inside
+    :class:`Settings`' own validator.
+    """
+    raw = explicit or os.environ.get("N8N_OPERATOR_APPROVAL_BIND", DEFAULT_APPROVAL_BIND)
+    host, _, port = raw.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(f"{raw!r} is not a HOST:PORT address")
+    if not _is_loopback(raw):
+        raise ValueError(
+            f"approval_bind must be a loopback address in v1 (boundary B10); got {raw!r}"
+        )
+    return raw
+
+
 def resolve_max_argument_bytes(explicit: int | None = None) -> int:
     """The server argument-size ceiling (ADR-011), resolved *without* requiring the
     rest of :class:`Settings`. Precedence: an explicit value, then
@@ -311,6 +335,7 @@ __all__ = [
     "DEFAULT_REGISTRY_PATH",
     "Settings",
     "load_settings",
+    "resolve_approval_bind",
     "resolve_database_url",
     "resolve_max_argument_bytes",
     "resolve_registry_path",

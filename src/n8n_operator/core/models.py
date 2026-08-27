@@ -30,6 +30,7 @@ from n8n_operator.registry.schema import WorkflowEntry as WorkflowContract
 
 __all__ = [
     "Approval",
+    "ApprovalDecisionContext",
     "AuditEvent",
     "Environment",
     "ExecutionResult",
@@ -129,6 +130,46 @@ class Approval(BaseModel):
     decision: Literal["approved", "rejected"] | None
     decided_by: str | None
     client_fingerprint: str | None
+
+
+class ApprovalDecisionContext(BaseModel):
+    """Everything a human needs to make an approve/reject decision, or to check one
+    already made — the one shape both approval channels render from (ADR-010: "the CLI
+    must now render arguments, risk, side-effect class, and drift status well enough to
+    support a real decision"), so the CLI's ``operations approve``/``reject``/
+    ``approval-status`` and the web page's ``GET /approve/{token}`` can never disagree
+    about what a pending operation looked like when it was decided.
+
+    Workflow fields (``title``, ``description``, ``risk``, ``side_effects``) are read
+    from the operation's own frozen registry snapshot, not the current one — exactly
+    what was true when this operation was offered for approval, even if the registry
+    has since been reloaded. ``current_definition_hash`` and ``drifted`` compare that
+    frozen hash against the *current* active snapshot's hash for the same workflow ID;
+    ``current_definition_hash`` is ``None`` when the workflow is no longer registered
+    or enabled at all, which is itself reported as drift.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    operation_id: str
+    workflow_id: str
+    title: str
+    description: str
+    risk: Literal["low", "medium", "high"]
+    side_effects: Literal["read_only", "external_write", "irreversible"]
+    state: str
+    arguments: dict[str, Any]
+    registered_definition_hash: str
+    current_definition_hash: str | None
+    drifted: bool
+    created_at: datetime
+    approval_expires_at: datetime | None
+    execution_deadline: datetime | None
+    approval_required: bool
+    decided: bool
+    decision: Literal["approved", "rejected"] | None
+    decided_at: datetime | None
+    decided_by: str | None
 
 
 class ExecutionResult(BaseModel):

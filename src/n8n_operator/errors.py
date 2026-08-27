@@ -255,6 +255,38 @@ class HandleAlreadyUsedError(AuthorizationError):
 
 
 # --------------------------------------------------------------------------------------
+# Approval-channel errors (phase 6, ADR-010) — raised only by the loopback approval web
+# page's own token-verification path (``core.service.resolve_approval_token``). The CLI
+# approval channel identifies an operation by ID directly and has no token to verify, so
+# it never raises these; both channels still apply the identical PENDING_APPROVAL check
+# through the shared ``approve_operation``/``reject_operation`` use case. Never returned
+# by an MCP tool (there is no tool that approves, boundary B4) — deliberately not part
+# of MCP_TOOLS.md's tool-facing taxonomy or the ``TAXONOMY`` registry below.
+# --------------------------------------------------------------------------------------
+
+
+class ApprovalTokenInvalidError(AuthorizationError):
+    code = "APPROVAL_TOKEN_INVALID"
+    retryable = False
+    remediation = "Ask the operator to re-run n8n-operator operations approve/reject."
+    default_message = "This approval link is not valid."
+
+
+class ApprovalTokenAlreadyUsedError(AuthorizationError):
+    code = "APPROVAL_TOKEN_ALREADY_USED"
+    retryable = False
+    remediation = "Check n8n-operator operations approval-status; a decision was already recorded."
+    default_message = "This approval link has already been used."
+
+
+class ApprovalNotPendingError(AuthorizationError):
+    code = "APPROVAL_NOT_PENDING"
+    retryable = False
+    remediation = "Check n8n-operator operations approval-status for the operation's current state."
+    default_message = "This operation is no longer awaiting approval."
+
+
+# --------------------------------------------------------------------------------------
 # Provider — the n8n instance's own state (ADR-009).
 # --------------------------------------------------------------------------------------
 
@@ -417,7 +449,10 @@ parses that table and asserts this dict's keys match it exactly, and that each c
 
 __all__ = [
     "TAXONOMY",
+    "ApprovalNotPendingError",
     "ApprovalRequiredError",
+    "ApprovalTokenAlreadyUsedError",
+    "ApprovalTokenInvalidError",
     "ArgumentMismatchError",
     "ArgumentsTooLargeError",
     "AuthorizationError",

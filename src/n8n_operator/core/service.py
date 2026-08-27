@@ -30,7 +30,12 @@ from sqlalchemy.orm import Session
 
 from n8n_operator.audit import writer as audit_writer
 from n8n_operator.core import state_machine
-from n8n_operator.core.handles import mint_approval_token, mint_operation_handle
+from n8n_operator.core.handles import (
+    compute_approval_binding,
+    hash_approval_token,
+    mint_approval_token,
+    mint_operation_handle,
+)
 from n8n_operator.core.idempotency import (
     IdempotencyResolution,
     canonicalize_arguments,
@@ -39,6 +44,7 @@ from n8n_operator.core.idempotency import (
     resolve_idempotency,
 )
 from n8n_operator.core.models import (
+    ApprovalDecisionContext,
     ExecutionResult,
     HealthCheckResult,
     Operation,
@@ -47,7 +53,10 @@ from n8n_operator.core.models import (
 )
 from n8n_operator.core.redaction import cap_output, redact, scrub_secrets
 from n8n_operator.errors import (
+    ApprovalNotPendingError,
     ApprovalRequiredError,
+    ApprovalTokenAlreadyUsedError,
+    ApprovalTokenInvalidError,
     ArgumentMismatchError,
     ArgumentsTooLargeError,
     DefinitionDriftError,
@@ -58,6 +67,7 @@ from n8n_operator.errors import (
     OperationCanceledError,
     OperationExpiredError,
     OperationNotFoundError,
+    OptimisticLockError,
     RegistryUnavailableError,
     ResultNotAvailableError,
     WorkflowDisabledError,
@@ -72,6 +82,7 @@ from n8n_operator.registry.schema import (
 )
 from n8n_operator.registry.validation import ArgumentError, validate_arguments
 from n8n_operator.storage.models import STATES, RegistrySnapshot
+from n8n_operator.storage.models import Approval as ApprovalRow
 from n8n_operator.storage.models import ExecutionResult as ExecutionResultRow
 from n8n_operator.storage.models import Operation as OperationRow
 from n8n_operator.storage.repository import (
@@ -91,7 +102,9 @@ __all__ = [
     "cancel_operation",
     "describe_workflow",
     "execute_operation",
+    "expire_overdue_operations",
     "get_active_snapshot",
+    "get_approval_decision_context",
     "get_execution_result",
     "get_instance_health",
     "get_operation",
@@ -102,6 +115,7 @@ __all__ = [
     "record_execution_outcome",
     "reject_operation",
     "reload_registry",
+    "resolve_approval_token",
     "validate_input",
     "validate_registry",
 ]
@@ -191,19 +205,48 @@ def _apply_and_audit(
 
     Not used for T01 (:func:`_record_creation`) — that transition creates the row rather
     than moving one, so there is no prior ``state_version`` to compare-and-set against.
+
+    Race-safe against a concurrent writer that moved this row between our read and our
+    write (two channels racing to decide the same operation — CLI and web page, or two
+    web tabs; ADR-010's "both approval channels" are only safe together because of
+    this): a lost compare-and-set is re-validated against the row's *current* state
+    rather than left to leak a bare storage-layer :class:`OptimisticLockError` past
+    ``core/`` — the loser gets the honest, taxonomy-mapped
+    :class:`~n8n_operator.errors.InvalidStateTransitionError` naming what the operation
+    actually is now, exactly as if it had read that state to begin with.
     """
     transition = state_machine.validate_transition(transition_id, from_state=operation_row.state)
     resolved_detail = detail or {}
-    updated, _event = OperationRepository(session).apply_transition(
-        operation_id=operation_row.id,
-        expected_version=operation_row.state_version,
-        new_state=transition.to_state,
-        transition=transition_id,
-        from_state=operation_row.state,
-        actor=actor,
-        detail=resolved_detail,
-        **field_updates,
-    )
+    try:
+        updated, _event = OperationRepository(session).apply_transition(
+            operation_id=operation_row.id,
+            expected_version=operation_row.state_version,
+            new_state=transition.to_state,
+            transition=transition_id,
+            from_state=operation_row.state,
+            actor=actor,
+            detail=resolved_detail,
+            **field_updates,
+        )
+    except OptimisticLockError:
+        current = OperationRepository(session).get(operation_row.id)
+        assert current is not None  # the row cannot have been deleted between read and write
+        # Raises InvalidStateTransitionError if `current.state` no longer permits this
+        # transition — the expected outcome for a genuine decision race. If it is
+        # somehow still legal (no v1 transition changes `state_version` without also
+        # changing `.state`, so this is defensive rather than reachable today), retry
+        # once against the row's current version.
+        state_machine.validate_transition(transition_id, from_state=current.state)
+        updated, _event = OperationRepository(session).apply_transition(
+            operation_id=current.id,
+            expected_version=current.state_version,
+            new_state=transition.to_state,
+            transition=transition_id,
+            from_state=current.state,
+            actor=actor,
+            detail=resolved_detail,
+            **field_updates,
+        )
     audit_writer.write(
         AuditLogRepository(session),
         actor=actor,
@@ -251,7 +294,18 @@ def _apply_lazy_expiry(session: Session, operation_row: OperationRow) -> Operati
     unchanged (invariant I9, ADR-010). ``actor="clock"`` — one of the three documented
     ``operation_events.actor`` values (principal ID, ``system``, or ``clock``,
     BUILD_PLAN section 8.1) — names this as a deadline firing, not a human or the
-    system's own orchestration."""
+    system's own orchestration.
+
+    Race-safe against a concurrent caller expiring the same row (phase 6's best-effort
+    sweeper racing a request's own lazy expiry, or two overlapping sweeps): when
+    ``_apply_and_audit`` finds someone else already moved this row between our read and
+    our write, it re-validates against the row's current state and raises
+    :class:`~n8n_operator.errors.InvalidStateTransitionError` if T08/T11 no longer
+    applies there — exactly the "someone already resolved this" case, so the caller's
+    precondition ("this row's overdue-ness has been resolved") still holds. A fresh
+    read returns the now-settled row rather than propagating that error, and no second
+    event or audit row is ever written for a transition that already landed once.
+    """
     now = datetime.now(UTC)
     transition = state_machine.overdue_expiry_transition(
         state=operation_row.state,
@@ -261,7 +315,12 @@ def _apply_lazy_expiry(session: Session, operation_row: OperationRow) -> Operati
     )
     if transition is None:
         return operation_row
-    return _apply_and_audit(session, operation_row, transition.id, actor="clock")
+    try:
+        return _apply_and_audit(session, operation_row, transition.id, actor="clock")
+    except InvalidStateTransitionError:
+        refreshed = OperationRepository(session).get(operation_row.id)
+        assert refreshed is not None  # the row cannot have been deleted between read and write
+        return refreshed
 
 
 def _get_operation_row(session: Session, operation_id: str) -> OperationRow:
@@ -710,19 +769,40 @@ def prepare_operation(
             approval_expires_at=approval_expires_at,
         )
         minted = mint_approval_token()
+        binding_hash = compute_approval_binding(
+            operation_id=operation.id,
+            principal_id=principal_id,
+            argument_fingerprint=fingerprint,
+            snapshot_id=snapshot.id,
+            definition_hash=entry.definition_hash,
+        )
         ApprovalRepository(session).create(
-            operation_id=operation.id, token_hash=minted.token_hash, expires_at=approval_expires_at
+            operation_id=operation.id,
+            token_hash=minted.token_hash,
+            binding_hash=binding_hash,
+            expires_at=approval_expires_at,
         )
         approval_token = minted.token
 
     return _to_domain(operation), False, approval_token
 
 
-def approve_operation(session: Session, *, operation_id: str, decided_by: str) -> Operation:
+def approve_operation(
+    session: Session,
+    *,
+    operation_id: str,
+    decided_by: str,
+    client_fingerprint: str | None = None,
+) -> Operation:
     """T06: a human approves (ADR-010; both the CLI and the approval-page channel call
     this one use case). Not scoped to a preparing principal — in v1's single-principal
     model the approver and preparer are always the same ``local`` identity; v2's RBAC
-    would gate this differently, but that gate is not this function's job."""
+    would gate this differently, but that gate is not this function's job.
+
+    ``client_fingerprint`` is coarse request provenance for the audit trail
+    (BUILD_PLAN section 8.1) — set by the web approval channel, left ``None`` by the
+    CLI, which has no request to fingerprint.
+    """
     row = _get_operation_row(session, operation_id)
     entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
     execution_deadline = datetime.now(UTC) + timedelta(
@@ -734,21 +814,121 @@ def approve_operation(session: Session, *, operation_id: str, decided_by: str) -
     approval = ApprovalRepository(session).get_by_operation_id(operation_id)
     if approval is not None:
         ApprovalRepository(session).record_decision(
-            approval_id=approval.id, decision="approved", decided_by=decided_by
+            approval_id=approval.id,
+            decision="approved",
+            decided_by=decided_by,
+            client_fingerprint=client_fingerprint,
         )
     return _to_domain(updated)
 
 
-def reject_operation(session: Session, *, operation_id: str, decided_by: str) -> Operation:
-    """T07: a human rejects (ADR-010)."""
+def reject_operation(
+    session: Session,
+    *,
+    operation_id: str,
+    decided_by: str,
+    client_fingerprint: str | None = None,
+) -> Operation:
+    """T07: a human rejects (ADR-010). ``client_fingerprint`` as :func:`approve_operation`."""
     row = _get_operation_row(session, operation_id)
     updated = _apply_and_audit(session, row, "T07", actor=decided_by)
     approval = ApprovalRepository(session).get_by_operation_id(operation_id)
     if approval is not None:
         ApprovalRepository(session).record_decision(
-            approval_id=approval.id, decision="rejected", decided_by=decided_by
+            approval_id=approval.id,
+            decision="rejected",
+            decided_by=decided_by,
+            client_fingerprint=client_fingerprint,
         )
     return _to_domain(updated)
+
+
+def _approval_decision_context(
+    session: Session, row: OperationRow, approval_row: ApprovalRow | None
+) -> ApprovalDecisionContext:
+    """Build the shared decision-surface shape from an already-fetched, already-lazily-
+    expired operation row. Not exported — both public entry points below fetch and
+    lazy-expire the row their own way (one by operation ID, one by token), then share
+    this one assembly step, so the two can never render the workflow/drift/deadline
+    fields differently."""
+    entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+    current_document = _require_active_document(session)
+    current_entry = _find_entry(current_document, row.workflow_id)
+    current_hash = current_entry.definition_hash if current_entry is not None else None
+    return ApprovalDecisionContext(
+        operation_id=row.id,
+        workflow_id=row.workflow_id,
+        title=entry.title,
+        description=entry.description,
+        risk=entry.risk,
+        side_effects=entry.side_effects,
+        state=row.state,
+        arguments=row.arguments,
+        registered_definition_hash=row.definition_hash,
+        current_definition_hash=current_hash,
+        drifted=current_hash != row.definition_hash,
+        created_at=row.created_at,
+        approval_expires_at=row.approval_expires_at,
+        execution_deadline=row.execution_deadline,
+        approval_required=approval_row is not None,
+        decided=approval_row is not None and approval_row.decision is not None,
+        decision=approval_row.decision if approval_row is not None else None,  # type: ignore[arg-type]
+        decided_at=approval_row.decided_at if approval_row is not None else None,
+        decided_by=approval_row.decided_by if approval_row is not None else None,
+    )
+
+
+def get_approval_decision_context(
+    session: Session, *, operation_id: str, principal_id: str
+) -> ApprovalDecisionContext:
+    """Everything needed to render or review an approval decision by operation ID
+    (ADR-010) — the CLI's ``operations approve``/``reject`` (before confirming) and
+    ``operations approval-status`` both call this."""
+    row = _get_owned_operation_row(session, operation_id, principal_id)
+    approval_row = ApprovalRepository(session).get_by_operation_id(operation_id)
+    return _approval_decision_context(session, row, approval_row)
+
+
+def resolve_approval_token(session: Session, *, token: str) -> ApprovalDecisionContext:
+    """Verify a raw approval token and return the same decision-surface shape
+    :func:`get_approval_decision_context` does — the web approval channel's own entry
+    point, reached only from there (the CLI names an operation ID directly and never
+    holds a token to verify).
+
+    Raises :class:`~n8n_operator.errors.ApprovalTokenInvalidError` for a token whose
+    hash matches no approval row, :class:`~n8n_operator.errors.ApprovalTokenAlreadyUsedError`
+    for one a decision was already recorded against, and
+    :class:`~n8n_operator.errors.ApprovalNotPendingError` if the operation — after lazy
+    expiry is applied — is no longer ``PENDING_APPROVAL`` for any other reason (expired,
+    canceled by the CLI in the meantime, or otherwise moved on). The raw token is never
+    logged: only its hash is ever compared, and only against what is already at rest.
+    """
+    token_hash = hash_approval_token(token)
+    approval_row = ApprovalRepository(session).get_by_token_hash(token_hash)
+    if approval_row is None:
+        raise ApprovalTokenInvalidError()
+    if approval_row.decision is not None:
+        raise ApprovalTokenAlreadyUsedError()
+
+    row = _get_operation_row(session, approval_row.operation_id)
+    if row.state != "PENDING_APPROVAL":
+        raise ApprovalNotPendingError(details={"current_state": row.state})
+
+    expected_binding = compute_approval_binding(
+        operation_id=row.id,
+        principal_id=row.principal_id,
+        argument_fingerprint=row.argument_fingerprint,
+        snapshot_id=row.snapshot_id,
+        definition_hash=row.definition_hash,
+    )
+    # Structurally unreachable in v1 (none of the five bound fields is ever updated
+    # after an operation row is created) — an explicit, verified check rather than a
+    # silently-trusted assumption; see `compute_approval_binding`'s docstring.
+    assert expected_binding == approval_row.binding_hash, (
+        "approval token binding mismatch — operation identity changed after mint"
+    )
+
+    return _approval_decision_context(session, row, approval_row)
 
 
 def cancel_operation(
@@ -941,3 +1121,28 @@ def get_execution_result(
     if result_row is None:
         raise ResultNotAvailableError()
     return _execution_result_to_domain(result_row)
+
+
+def expire_overdue_operations(session: Session) -> int:
+    """Apply every overdue T08/T11 transition, across every principal (ADR-010): the
+    system-wide maintenance sweep ``n8n-operator operations expire`` and the approval
+    app's best-effort sweeper both call. Not a substitute for lazy expiry — every read
+    and action already applies T08/T11 to the one row it touches (invariant I9) — this
+    is purely an audit-timeline-fidelity improvement, so an ``EXPIRED`` event lands near
+    the deadline instead of at whatever moment something next reads the row.
+
+    Returns the number of operations whose state actually changed. Concurrent callers
+    (another sweep tick, a request's own lazy expiry landing on the same row first) are
+    safe: :func:`_apply_lazy_expiry` treats a lost compare-and-set race as "already
+    handled", not an error, so a row two callers reach at once is counted at most once
+    in total, split however the race falls, never double-transitioned and never raised.
+    """
+    now = datetime.now(UTC)
+    candidates = OperationRepository(session).list_overdue(now=now)
+    changed = 0
+    for row in candidates:
+        before = row.state
+        after = _apply_lazy_expiry(session, row)
+        if after.state != before:
+            changed += 1
+    return changed

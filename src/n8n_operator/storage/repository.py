@@ -23,6 +23,7 @@ Phase 1 (BUILD_PLAN section 12).
 
 from __future__ import annotations
 
+import builtins
 from datetime import datetime
 from typing import Any, cast
 
@@ -274,6 +275,34 @@ class OperationRepository:
         stmt = stmt.order_by(Operation.created_at.desc()).limit(limit)
         return list(self._session.scalars(stmt))
 
+    def list_overdue(self, *, now: datetime) -> builtins.list[Operation]:
+        """Every operation, across every principal, whose deadline has passed while it
+        sits in a state lazy expiry would move (``PENDING_APPROVAL`` past
+        ``approval_expires_at``, or ``APPROVED`` past ``execution_deadline`` — T08/T11,
+        ADR-010). Not principal-scoped: this is what a system-wide maintenance sweep
+        (``operations expire``, the approval app's best-effort sweeper) needs, unlike
+        :meth:`list`, which is always one principal's own history.
+
+        Return type is spelled ``builtins.list`` rather than bare ``list``: this class
+        already defines a method named ``list``, which shadows the builtin in this
+        class's namespace for annotation resolution (``from __future__ import
+        annotations`` makes every annotation here a forward reference, resolved against
+        this scope).
+        """
+        stmt: Select[tuple[Operation]] = select(Operation).where(
+            (
+                (Operation.state == "PENDING_APPROVAL")
+                & (Operation.approval_expires_at.is_not(None))
+                & (Operation.approval_expires_at < now)
+            )
+            | (
+                (Operation.state == "APPROVED")
+                & (Operation.execution_deadline.is_not(None))
+                & (Operation.execution_deadline < now)
+            )
+        )
+        return list(self._session.scalars(stmt))
+
     def compare_and_set_state(
         self,
         *,
@@ -430,6 +459,7 @@ class ApprovalRepository:
         *,
         operation_id: str,
         token_hash: str,
+        binding_hash: str,
         expires_at: datetime,
         id: str | None = None,  # noqa: A002
     ) -> Approval:
@@ -437,6 +467,7 @@ class ApprovalRepository:
             id=id or new_ulid(),
             operation_id=operation_id,
             token_hash=token_hash,
+            binding_hash=binding_hash,
             expires_at=expires_at,
         )
         self._session.add(approval)
@@ -462,6 +493,7 @@ class ApprovalRepository:
         decision: str,
         decided_by: str,
         decided_at: datetime | None = None,
+        client_fingerprint: str | None = None,
     ) -> Approval:
         approval = self._session.get(Approval, approval_id)
         if approval is None:
@@ -469,6 +501,8 @@ class ApprovalRepository:
         approval.decision = decision
         approval.decided_by = decided_by
         approval.decided_at = decided_at or utc_now()
+        if client_fingerprint is not None:
+            approval.client_fingerprint = client_fingerprint
         self._session.flush()
         return approval
 

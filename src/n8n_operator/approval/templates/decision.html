@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>n8n Operator — Approval</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #1a1d21;
+    --muted: #5b6472;
+    --border: #dfe3e8;
+    --danger: #b3261e;
+    --danger-bg: #fdecea;
+    --warn: #8a5300;
+    --warn-bg: #fff4e0;
+    --ok: #1e6b3a;
+    --accent: #2054c9;
+    --accent-contrast: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1rem;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .card {
+    max-width: 640px;
+    margin: 0 auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem 1.75rem;
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; color: var(--muted); font-weight: 600; }
+  h2 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+  .field { margin: 0.9rem 0; }
+  .label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 0.2rem; }
+  .value { word-break: break-word; }
+  pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    margin: 0.2rem 0 0;
+  }
+  .badges { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.2rem 0 0.4rem; }
+  .badge {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    border: 1px solid var(--border);
+  }
+  .badge.risk-high, .badge.side_effects-irreversible { color: var(--danger); background: var(--danger-bg); border-color: var(--danger); }
+  .badge.risk-medium, .badge.side_effects-external_write { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); }
+  .badge.risk-low, .badge.side_effects-read_only { color: var(--ok); background: #e7f5ec; border-color: var(--ok); }
+  .banner {
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 1.1rem;
+    font-weight: 600;
+  }
+  .banner.error { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
+  .banner.drift { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
+  .banner.decided { background: #e7f5ec; color: var(--ok); border: 1px solid var(--ok); }
+  .actions { display: flex; gap: 0.6rem; margin-top: 1.5rem; }
+  .actions form { flex: 1; margin: 0; }
+  button {
+    width: 100%;
+    padding: 0.65rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.approve { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+  button.reject { background: var(--panel); color: var(--danger); border-color: var(--danger); }
+  .hint { font-size: 0.8rem; color: var(--muted); margin-top: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>n8n Operator — Approval</h1>
+
+  {% if error %}
+    <div class="banner error">{{ error }}</div>
+    <p class="hint">You can also decide from the Operator machine: <code>n8n-operator operations approval-status &lt;operation_id&gt;</code>.</p>
+  {% else %}
+    <h2>{{ context.title }}</h2>
+    <p class="value">{{ context.description }}</p>
+
+    <div class="badges">
+      <span class="badge risk-{{ context.risk }}">risk: {{ context.risk }}</span>
+      <span class="badge side_effects-{{ context.side_effects }}">{{ context.side_effects }}</span>
+    </div>
+
+    {% if context.drifted %}
+      <div class="banner drift">
+        Definition drift detected — the live workflow no longer matches what was registered.
+        Registered: {{ context.registered_definition_hash }}<br>
+        Current: {{ context.current_definition_hash or "(workflow no longer registered)" }}
+      </div>
+    {% endif %}
+
+    <div class="field">
+      <div class="label">Operation ID</div>
+      <div class="value">{{ context.operation_id }}</div>
+    </div>
+    <div class="field">
+      <div class="label">Workflow ID</div>
+      <div class="value">{{ context.workflow_id }}</div>
+    </div>
+    <div class="field">
+      <div class="label">Arguments (redacted)</div>
+      <pre>{{ arguments_json }}</pre>
+    </div>
+    <div class="field">
+      <div class="label">Created</div>
+      <div class="value">{{ context.created_at.isoformat() }}</div>
+    </div>
+    {% if context.approval_expires_at %}
+      <div class="field">
+        <div class="label">Approval expires</div>
+        <div class="value">{{ context.approval_expires_at.isoformat() }}</div>
+      </div>
+    {% endif %}
+
+    {% if context.decided %}
+      <div class="banner decided">
+        Decision recorded: {{ context.decision }} by {{ context.decided_by }}
+        {% if context.decided_at %}at {{ context.decided_at.isoformat() }}{% endif %}
+      </div>
+    {% elif context.state != "PENDING_APPROVAL" %}
+      <div class="banner error">This operation is {{ context.state }}, not awaiting approval.</div>
+    {% else %}
+      <div class="actions">
+        <form method="post" action="/approve/{{ token }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="approve">Approve</button>
+        </form>
+        <form method="post" action="/reject/{{ token }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="reject">Reject</button>
+        </form>
+      </div>
+    {% endif %}
+
+    <p class="hint">You can also decide from the Operator machine: <code>n8n-operator operations approve {{ context.operation_id }}</code>.</p>
+  {% endif %}
+</div>
+</body>
+</html>
