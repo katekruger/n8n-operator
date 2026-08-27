@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UV_FROZEN: "0"
+  UV_FROZEN: "1"
 
 jobs:
   check:
@@ -44,4 +44,41 @@ jobs:
 
       - name: Tests
         # Live-n8n tests are opt-in and never run in CI (BUILD_PLAN section 10.1).
-        run: uv run pytest -m "not live_n8n"
+        run: >-
+          uv run pytest -m "not live_n8n"
+          --cov=src/n8n_operator
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=90
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  package:
+    name: build · clean-install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Verify the built wheel in isolation
+        run: scripts/release_smoke.sh
+
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: n8n-operator-${{ github.sha }}
+          path: dist/

@@ -8,11 +8,12 @@ the project's own [threat model](docs/THREAT_MODEL.md), not just patched ad hoc.
 
 **Do not open a public GitHub issue for a security vulnerability.**
 
-Report it privately using GitHub's
+Once this repository is public, report it privately using GitHub's
 [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability)
 feature on this repository (**Security** tab → **Report a vulnerability**). If that is
-unavailable to you, open a regular issue asking a maintainer to reach out — do not
-include exploit details in it.
+not visible, open a regular issue containing only a request for private maintainer
+contact—never include vulnerability or exploit details. While the release candidate is
+private, existing collaborators should use the repository's private issue tracker.
 
 Include, as applicable:
 

@@ -21,9 +21,14 @@ if [[ "${1:-}" == "--keep" ]]; then
   KEEP=1
 fi
 
-if ! command -v n8n-operator >/dev/null 2>&1; then
-  echo "error: 'n8n-operator' is not on PATH. Install it first:" >&2
-  echo "  uv tool install n8n-operator   # or: pip install n8n-operator" >&2
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if command -v n8n-operator >/dev/null 2>&1; then
+  OPERATOR=(n8n-operator)
+elif command -v uv >/dev/null 2>&1 && [[ -f "$REPO_ROOT/pyproject.toml" ]]; then
+  OPERATOR=(uv run n8n-operator)
+else
+  echo "error: install n8n Operator from the repository checkout first:" >&2
+  echo "  uv tool install ." >&2
   exit 1
 fi
 
@@ -39,7 +44,6 @@ cleanup() {
 trap cleanup EXIT
 
 export N8N_OPERATOR_DATABASE_URL="sqlite+pysqlite:///$DEMO_DIR/n8n-operator.db"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGISTRY_PATH="$DEMO_DIR/workflows.yaml"
 cp "$REPO_ROOT/examples/registry/workflows.example.yaml" "$REGISTRY_PATH"
 
@@ -49,26 +53,26 @@ step() {
 }
 
 step "1. Initialize a scratch database"
-n8n-operator db init
+"${OPERATOR[@]}" db init
 
 step "2. Validate the example registry (no database involved)"
-n8n-operator registry validate --path "$REGISTRY_PATH"
+"${OPERATOR[@]}" registry validate --path "$REGISTRY_PATH"
 
 step "3. Load it — this is the only step that writes to the database"
-n8n-operator registry reload --path "$REGISTRY_PATH"
+"${OPERATOR[@]}" registry reload --path "$REGISTRY_PATH"
 
 step "4. List what's registered"
-n8n-operator registry list --path "$REGISTRY_PATH"
+"${OPERATOR[@]}" registry list --path "$REGISTRY_PATH"
 
 step "5. Inspect one workflow in detail"
-n8n-operator registry show crm.sync_contact --path "$REGISTRY_PATH"
+"${OPERATOR[@]}" registry show crm.sync_contact --path "$REGISTRY_PATH"
 
 step "6. Operator's own history — empty, nothing has been prepared yet"
-n8n-operator operations list
+"${OPERATOR[@]}" operations list
 
 step "7. The audit trail — one entry so far, the registry load itself"
-n8n-operator audit verify
-n8n-operator audit export | head -30
+"${OPERATOR[@]}" audit verify
+"${OPERATOR[@]}" audit export | head -30
 echo "  ... (truncated; run 'n8n-operator audit export' yourself for the full record)"
 
 echo

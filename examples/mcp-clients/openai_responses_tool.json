@@ -1,0 +1,11 @@
+{
+  "type": "mcp",
+  "server_label": "n8n_operator",
+  "server_description": "Governed access to explicitly approved n8n workflows.",
+  "server_url": "https://operator.example.com/mcp",
+  "headers": {
+    "Authorization": "Bearer REPLACE_WITH_YOUR_BEARER_TOKEN",
+    "Origin": "https://platform.openai.com"
+  },
+  "require_approval": "never"
+}

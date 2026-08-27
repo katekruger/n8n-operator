@@ -123,23 +123,18 @@ performance characteristics, and browser-level testing of the approval page (its
 is tested through the FastAPI test client, not a real browser) — BUILD_PLAN section
 10.5.
 
-## The `live_n8n` test layer is planned but not yet built
+## The `live_n8n` layer requires an operator-provided test instance
 
-BUILD_PLAN section 10.1 documents a fourth test layer — `tests/integration/` tests
-marked `live_n8n`, run opt-in against a real n8n instance in Docker, nightly rather than
-in every CI run. The `live_n8n` pytest marker itself is registered
-(`pyproject.toml`) and CI already excludes it (`pytest -m "not live_n8n"`), but **no
-test in the repository actually carries that marker** — this layer exists as
-infrastructure and intent, not as a runnable suite, found during the phase 9 release
-audit (`pytest -m live_n8n --collect-only` returns zero tests). The compatibility
-evidence that does exist is a one-time manual empirical spike from phase 4
-([N8N_COMPATIBILITY.md](N8N_COMPATIBILITY.md), summarized in
-[COMPATIBILITY_MATRIX.md](COMPATIBILITY_MATRIX.md)), not a repeatable, CI-adjacent
-suite. Building the actual `live_n8n` suite — encoding that spike's checks as real,
-markable tests runnable against any Docker-provisioned n8n instance — is unimplemented
-v1 work, not a v2 feature; it just wasn't built in phase 9's own verification pass
-(no Docker was available in the environment doing that verification either — see
-`docs/BUILD_PLAN.md`'s phase 9 checklist entry for exactly what was and wasn't run).
+BUILD_PLAN section 10.1's fourth layer now exists in `tests/live/` and is runnable
+locally or through the manual `Live n8n compatibility` workflow. It verifies health,
+workflow retrieval, webhook dispatch, response correlation, and execution retrieval
+against the isolated synthetic workflow. It is excluded from ordinary CI because the
+repository does not provision or retain a credential-bearing n8n instance. See
+[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md) for the exact setup and evidence procedure.
+
+Practical consequence: ordinary pull requests prove the full deterministic and mocked
+contract but cannot prove a hosted n8n target is currently reachable or unchanged. A
+release operator must run the manual live workflow and retain its successful run URL.
 
 ---
 

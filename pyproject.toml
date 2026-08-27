@@ -1,14 +1,14 @@
 [project]
 name = "n8n-operator"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 description = "A governed MCP control plane for discovering, validating, executing, and debugging approved n8n workflows."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
-authors = [{ name = "n8n Operator maintainers" }]
+authors = [{ name = "Kathleen Stumph" }]
 keywords = ["mcp", "n8n", "workflow", "governance", "automation"]
 classifiers = [
-  "Development Status :: 1 - Planning",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3.12",
@@ -47,8 +47,10 @@ postgres = ["psycopg[binary]>=3.2,<4"]   # v2 (ADR-004); unused in v1
 keyring = ["keyring>=25,<26"]            # optional secret-indirection backend (ADR-006)
 
 [project.urls]
-Homepage = "https://github.com/n8n-operator/n8n-operator"
-Documentation = "https://github.com/n8n-operator/n8n-operator/tree/main/docs"
+Homepage = "https://github.com/katekruger/n8n-operator"
+Documentation = "https://github.com/katekruger/n8n-operator/tree/main/docs"
+Issues = "https://github.com/katekruger/n8n-operator/issues"
+Changelog = "https://github.com/katekruger/n8n-operator/blob/main/CHANGELOG.md"
 
 [project.scripts]
 n8n-operator = "n8n_operator.cli.main:app"

@@ -6,6 +6,7 @@ Two files here, matching Operator's two transports (BUILD_PLAN section 7.2):
 |---|---|---|
 | [`claude_desktop_config.json`](claude_desktop_config.json) | stdio | Claude Desktop, or any MCP host that launches Operator as a local subprocess. This is the default transport and needs no network configuration at all. |
 | [`streamable_http_client.json`](streamable_http_client.json) | Streamable HTTP | A remote MCP client (a hosted agent, a browser-based client, ChatGPT/OpenAI's MCP connector) that cannot spawn a local subprocess and must reach Operator over the network. |
+| [`openai_responses_tool.json`](openai_responses_tool.json) | Streamable HTTP | The MCP tool object for an OpenAI Responses API request. |
 
 Both were verified against a real build of this package during phase 9 release
 testing — a full stdio session and a full Streamable HTTP session, each confirming the
@@ -14,8 +15,9 @@ starts. See `docs/BUILD_PLAN.md`'s phase 9 checklist entry for what was run.
 
 ## stdio (Claude Desktop)
 
-1. Install: `uv tool install n8n-operator` (or `pip install n8n-operator` — see the
-   [README quickstart](../../README.md#quickstart)).
+1. Install from a local checkout with `uv tool install .` — see the
+   [README quickstart](../../README.md#quickstart). PyPI publishing is intentionally
+   deferred while this release candidate remains private.
 2. `n8n-operator db init`, then `n8n-operator registry reload --path <your registry>`
    — do this once, outside Claude Desktop, so the database and registry snapshot exist
    before the first launch.
@@ -52,6 +54,17 @@ Requires the server to actually be running as a network listener — this is not
    as a template: the `url` is `https://<your-host>/mcp`, and the `Authorization`
    header carries the exact bearer token from step 1.
 
+For OpenAI's Responses API, use
+[`openai_responses_tool.json`](openai_responses_tool.json) as the object inside the
+request's `tools` array. Add its explicit `Origin` value to the server-side
+`N8N_OPERATOR_HTTP_ALLOWED_ORIGINS` list. The official API supports optional custom
+headers for remote MCP authentication, which lets this profile satisfy Operator's
+bearer-token and DNS-rebinding controls without weakening either one.
+
+The example sets OpenAI's `require_approval` to `never` because Operator applies its
+own risk-classified, out-of-band approval after the tool call. Set it to `always` if you
+also want OpenAI's client-side confirmation; that produces two independent gates.
+
 A loopback bind (the default, `127.0.0.1:8000`) needs none of this — it's only
 reachable from the same machine, which is the same trust level as stdio, so no bearer
 token or Origin allowlist is required (and none is enforced).
@@ -63,7 +76,8 @@ most remote MCP connectors expect, OpenAI's included. The exact place to paste i
 (a connector settings page, a `mcp_servers` block in an API request, etc.) is specific
 to whichever client you're using; consult that client's own MCP documentation for
 where the `url` and `Authorization` header go. Phase 9 release testing did not have
-credentials for a live OpenAI/remote-connector run — the transport itself (bearer
+credentials and a publicly reachable TLS endpoint for a live OpenAI/remote-connector
+run — the transport itself (bearer
 token enforcement, Origin allowlist, the 12-tool surface) was verified directly against
 the Streamable HTTP protocol instead; see `docs/BUILD_PLAN.md`'s phase 9 notes for
 exactly what that covered and what it didn't.

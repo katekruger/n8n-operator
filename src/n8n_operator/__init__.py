@@ -12,6 +12,6 @@ Layering (ADR-001, enforced by a contract test):
 ``core`` must not import any adapter package, ``fastapi``, ``typer``, or the MCP SDK.
 """
 
-__version__ = "1.0.0rc1"
+__version__ = "1.0.0rc2"
 
 __all__ = ["__version__"]

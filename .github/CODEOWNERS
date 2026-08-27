@@ -1,0 +1,9 @@
+* @katekruger
+
+/.github/ @katekruger
+/docs/ @katekruger
+/src/n8n_operator/core/ @katekruger
+/src/n8n_operator/mcp/ @katekruger
+/src/n8n_operator/n8n/ @katekruger
+/src/n8n_operator/approval/ @katekruger
+/src/n8n_operator/audit/ @katekruger

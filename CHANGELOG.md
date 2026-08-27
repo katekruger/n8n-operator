@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format follows
 
 Nothing yet.
 
+## [1.0.0-rc2] - 2026-08-27
+
+### Fixed
+
+- Corrected the CI-only strict-mypy failure found after the rc1 tag.
+- Aligned package, runtime, changelog, and repository metadata on rc2.
+- Replaced the unpublished PyPI quickstart with a source-install path that works while
+  the release candidate remains private.
+
+### Changed
+
+- Release status now says "release candidate" until repeatable live-n8n and real remote
+  connector verification are complete.
+- Added automated packaging, clean-install, coverage, security, and compatibility gates
+  for public-release readiness.
+
 ## [1.0.0-rc1] - 2026-08-27
 
 ### Added — phase 9: v1 release preparation

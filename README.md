@@ -1,14 +1,56 @@
 # n8n Operator
 
+[![CI](https://github.com/katekruger/n8n-operator/actions/workflows/ci.yml/badge.svg)](https://github.com/katekruger/n8n-operator/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/katekruger/n8n-operator/actions/workflows/codeql.yml/badge.svg)](https://github.com/katekruger/n8n-operator/actions/workflows/codeql.yml)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-2.x-6f42c1)](https://modelcontextprotocol.io/)
+[![License: Apache--2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: v1 complete.** All nine build phases are implemented and verified —
+> **Status: v1 release candidate.** All nine product phases are implemented and the
+> local release gate is green. Repeatable live-n8n and hosted OpenAI connector checks
+> remain before the public v1 release —
 > registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
 > full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). See
 > [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
 > [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
 > do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
+
+| Client / target | Transport | Evidence |
+|---|---|---|
+| Claude Desktop | stdio | ✅ Built-wheel MCP session verified |
+| Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified |
+| OpenAI hosted connector | Streamable HTTP | 🟡 Configuration documented; live connector verification pending |
+| n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; repeatable live gate available |
+
+## Who this is for
+
+n8n Operator is for GTM engineers, revenue-operations teams, and agent builders who
+want an AI client to run a small, reviewed set of automations—not inherit unrestricted
+access to an entire n8n instance. It is especially useful when a workflow can write to
+a CRM, contact a customer, mutate production data, or otherwise needs an approval and
+an audit trail.
+
+## How it works
+
+```mermaid
+flowchart LR
+    Client["Claude, ChatGPT, Codex<br/>or another MCP client"]
+    Operator["n8n Operator<br/>validate · preflight · approve · audit"]
+    Registry["Reviewed workflow registry"]
+    Human["Human approver"]
+    N8N["n8n workflow engine"]
+
+    Client -->|"MCP tool call"| Operator
+    Registry -->|"allowlisted contract"| Operator
+    Operator -->|"decision context"| Human
+    Human -->|"approve / reject"| Operator
+    Operator -->|"one governed dispatch"| N8N
+    N8N -->|"correlated result"| Operator
+    Operator -->|"redacted result"| Client
+```
 
 ---
 
@@ -45,13 +87,17 @@ thing happened."
 
 ## Quickstart
 
-Requires Python 3.12. Installs the `n8n-operator` command.
+Requires Python 3.12. While the release candidate is private, install it from a local
+checkout. PyPI publishing is intentionally deferred until the public-release gate passes.
 
 ```bash
-uv tool install n8n-operator
+git clone https://github.com/katekruger/n8n-operator.git
+cd n8n-operator
+uv tool install .
 ```
 
-<sub>Or `pip install n8n-operator` / `pipx install n8n-operator` if you're not using uv.</sub>
+<sub>Private-repository access is required. Contributors can instead run commands from
+the checkout with `uv run n8n-operator ...`.</sub>
 
 **1. Initialize the database.** This also seeds the v1 default principal — do this
 before anything else.
@@ -96,8 +142,8 @@ scripts/demo.sh
 ### Connecting a client
 
 [`examples/mcp-clients/`](examples/mcp-clients/) has ready-to-copy configs for Claude
-Desktop (stdio) and a remote Streamable HTTP client (OpenAI's MCP connector and
-similar) — both verified against a real build of this package. See
+Desktop (stdio) and a generic remote Streamable HTTP client. Both transports were
+verified against a real build; hosted OpenAI connector verification is still pending. See
 [examples/mcp-clients/README.md](examples/mcp-clients/README.md) for the details each
 one needs (a non-loopback `serve http` bind requires a bearer token and an Origin
 allowlist — boundary B9 — the server refuses to start otherwise).
@@ -126,6 +172,7 @@ decision — never the only way to decide an operation.
 | [MCP_TOOLS.md](docs/MCP_TOOLS.md) | **Normative** for tool arguments, results, and the error taxonomy. |
 | [N8N_COMPATIBILITY.md](docs/N8N_COMPATIBILITY.md) | Empirical n8n API findings behind ADR-008/ADR-009. |
 | [COMPATIBILITY_MATRIX.md](docs/COMPATIBILITY_MATRIX.md) | Tested n8n versions and feature support, at a glance. |
+| [LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md) | How to run the real-instance compatibility gate. |
 | [V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) | Plain-language index of what v1 deliberately doesn't do. |
 | [RECONCILING_UNKNOWN.md](docs/RECONCILING_UNKNOWN.md) | Step-by-step manual procedure for resolving an `UNKNOWN` operation. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |

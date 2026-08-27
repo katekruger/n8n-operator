@@ -55,6 +55,10 @@ Full detail on all of the above: [N8N_COMPATIBILITY.md §13](N8N_COMPATIBILITY.m
 Adding a version means re-running the same evidence-gathering pass ADR-008 requires
 before any canonicalization exclusion, against the new version:
 
+The repeatable smoke contract is documented in
+[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md). It covers the stable runtime path; the
+broader field-by-field canonicalization pass below remains required for a new version.
+
 1. Stand up the target n8n version, isolated (no Docker required — see
    [N8N_COMPATIBILITY.md §1](N8N_COMPATIBILITY.md#1-test-environment) for how the phase-4
    spike ran without it).

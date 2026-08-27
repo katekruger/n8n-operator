@@ -1,0 +1,40 @@
+name: Bug report
+description: Report reproducible incorrect behavior that is not a security vulnerability.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not report security vulnerabilities here. Follow SECURITY.md instead.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and the actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe reproduction with all credentials redacted.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Surface
+      options: [CLI, MCP stdio, MCP Streamable HTTP, Approval page, n8n integration, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, n8n version, and client. Never paste tokens or URLs containing secrets.

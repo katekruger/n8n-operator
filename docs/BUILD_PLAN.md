@@ -198,8 +198,12 @@ n8n-operator/
 ├── .gitignore
 ├── .python-version
 ├── .github/
+│   ├── dependabot.yml              # weekly Python and Actions updates
 │   └── workflows/
-│       └── ci.yml                  # lint, type-check, test
+│       ├── ci.yml                  # lint, types, coverage, package smoke
+│       ├── codeql.yml              # static security analysis
+│       ├── live-n8n.yml            # manual real-instance compatibility gate
+│       └── secret-scan.yml         # full-history Gitleaks scan
 ├── docs/
 │   ├── BUILD_PLAN.md               # this file — normative
 │   ├── ARCHITECTURE.md             # components, boundaries, data flow
@@ -208,6 +212,7 @@ n8n-operator/
 │   ├── MCP_TOOLS.md                # tool contracts — normative for tool I/O
 │   ├── N8N_COMPATIBILITY.md        # phase 4 empirical findings (ADR-008, ADR-009)
 │   ├── COMPATIBILITY_MATRIX.md     # tested n8n versions and feature support (v1 release)
+│   ├── LIVE_N8N_TESTING.md         # repeatable real-instance smoke contract
 │   ├── V1_LIMITATIONS.md           # plain-language index of v1 boundaries (phase 9)
 │   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
 │   └── adr/
@@ -230,10 +235,12 @@ n8n-operator/
 │   └── mcp-clients/                       # ready-to-copy client configs (phase 9)
 │       ├── README.md
 │       ├── claude_desktop_config.json     # stdio
-│       └── streamable_http_client.json    # remote / Streamable HTTP
+│       ├── streamable_http_client.json    # generic remote / Streamable HTTP
+│       └── openai_responses_tool.json     # OpenAI Responses MCP tool object
 ├── scripts/
 │   ├── check_docs_consistency.py   # doc invariants enforced in CI
-│   └── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
+│   ├── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
+│   └── release_smoke.sh            # isolated built-wheel release verification
 ├── src/
 │   └── n8n_operator/
 │       ├── __init__.py             # version only
@@ -307,7 +314,8 @@ n8n-operator/
     ├── unit/                       # pure logic, no I/O
     ├── property/                   # Hypothesis invariants (section 10.2)
     ├── contract/                   # MCP tool schema + error taxonomy contracts
-    └── integration/                # real SQLite, mock n8n, live-n8n (opt-in)
+    ├── integration/                # real SQLite and mock n8n
+    └── live/                       # real n8n, explicitly opt-in
 ```
 
 **Layering rule (enforced in CI):** dependencies point inward only.
@@ -1761,7 +1769,7 @@ it touches are updated in the same change.
       risk RR-10 and out-of-scope item 10 record this honestly, with the manual
       emergency procedure in `docs/RECONCILING_UNKNOWN.md`. Every other `mitigated`
       entry was spot-checked against the phase that implements it and found accurate.
-- [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc1` —
+- [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc2` —
       `pyproject.toml` and `n8n_operator.__version__`), install instructions (README
       quickstart, verified per above).
 

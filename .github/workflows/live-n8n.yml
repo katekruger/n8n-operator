@@ -1,0 +1,27 @@
+name: Live n8n compatibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: real instance contract
+    runs-on: ubuntu-latest
+    environment: live-n8n
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --frozen --all-extras --dev
+      - name: Run live compatibility contract
+        env:
+          N8N_LIVE_BASE_URL: ${{ vars.N8N_LIVE_BASE_URL }}
+          N8N_LIVE_WORKFLOW_ID: ${{ vars.N8N_LIVE_WORKFLOW_ID }}
+          N8N_LIVE_WEBHOOK_PATH: ${{ vars.N8N_LIVE_WEBHOOK_PATH }}
+          N8N_LIVE_API_KEY: ${{ secrets.N8N_LIVE_API_KEY }}
+        run: uv run pytest -m live_n8n -v
