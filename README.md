@@ -1,24 +1,32 @@
 # n8n Operator
 
 [![CI](https://github.com/katekruger/n8n-operator/actions/workflows/ci.yml/badge.svg)](https://github.com/katekruger/n8n-operator/actions/workflows/ci.yml)
+[![Secret scan](https://github.com/katekruger/n8n-operator/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/katekruger/n8n-operator/actions/workflows/secret-scan.yml)
 [![CodeQL](https://github.com/katekruger/n8n-operator/actions/workflows/codeql.yml/badge.svg)](https://github.com/katekruger/n8n-operator/actions/workflows/codeql.yml)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-2.x-6f42c1)](https://modelcontextprotocol.io/)
 [![License: Apache--2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
+<sub>The CodeQL badge reads "skipped," not "passing" or "failing," while this
+repository is private — GitHub's native code scanning is unavailable on a private repo
+without GitHub Advanced Security. The job (`.github/workflows/codeql.yml`) is gated to
+activate automatically the moment the repository becomes public
+(`if: github.event.repository.visibility == 'public'`); the Secret scan badge above
+(full-history Gitleaks, `.github/workflows/secret-scan.yml`) is the enforced security
+check while private.</sub>
+
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
 > **Status: v1 release candidate.** All nine product phases are implemented and the
-> local release gate is green. A reproducible, Docker-based live-n8n harness exists
+> local release gate is green: registry, MCP server (stdio + Streamable HTTP), n8n
+> integration, execution, and the full operator CLI (`db`, `registry`, `operations`,
+> `audit`, `health`, `serve`). A reproducible, Docker-based live-n8n harness exists
 > ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) — actually running it against a
 > real instance, and a hosted OpenAI connector check, remain before the public v1
-> release —
-> registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
-> full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). See
-> [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
-> [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
-> do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
+> release. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase
+> checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately
+> does not do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 | Client / target | Transport | Evidence |
 |---|---|---|
