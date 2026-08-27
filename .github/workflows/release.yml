@@ -1,0 +1,178 @@
+name: Release
+
+# Runs ONLY on a pushed version tag (v*) — never a pull request, never an arbitrary
+# branch push, and workflow_dispatch is deliberately NOT a trigger here: a release must
+# be traceable to a real annotated tag on a real commit, not a button press against
+# whatever ref happens to be checked out.
+#
+# `environment: release` (the GitHub Release job) and `environment: pypi` (the PyPI
+# publish job) are GitHub Environments — create them in Settings > Environments with
+# required reviewers before this workflow can ever actually publish anything (this
+# repository has none configured yet; environment protection rules that require
+# reviewers need a paid plan on a private repo, same constraint already documented for
+# branch protection in .github/PUBLIC_RELEASE_CHECKLIST.md). Until an environment
+# named `release`/`pypi` exists, a run reaching that job fails at the environment gate
+# rather than silently skipping it — a deliberate fail-closed default, not an
+# oversight.
+#
+# PyPI publishing uses trusted publishing (OIDC, `id-token: write`) — no long-lived
+# PyPI API token stored as a secret. This needs a matching "trusted publisher"
+# registered on the PyPI project (pypi.org supports pre-registering one, called a
+# "pending publisher," before the project's first release even exists) naming this
+# exact repository, workflow file, and `pypi` environment — a human, PyPI-account-holder
+# action this workflow cannot perform for itself.
+#
+# BUILD_PLAN section 12 phase 9 / release-readiness Phase 7: PREPARED, not executed.
+# Nothing in this file has ever run for real — see the phase 9 continuation note in
+# docs/BUILD_PLAN.md for exactly what has and hasn't been verified about it.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify · build · inspect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Release version/tag/changelog consistency
+        run: uv run python scripts/check_release_consistency.py --tag "${{ github.ref_name }}"
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Documentation consistency
+        run: uv run python scripts/check_docs_consistency.py
+
+      - name: Tests
+        run: >-
+          uv run pytest -m "not live_n8n"
+          --cov=src/n8n_operator
+          --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Verify the built wheel in isolation (CLI, migration, registry, audit, MCP stdio)
+        run: scripts/release_smoke.sh
+
+      - name: Streamable HTTP MCP compatibility
+        run: uv run pytest tests/integration/test_mcp_http_openai_compat.py -v
+
+      - name: Inspect release artifacts for anything that must never ship
+        run: scripts/inspect_release_artifacts.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  provenance:
+    name: attest build provenance
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Attest build provenance (Sigstore-backed)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*"
+
+  github-release:
+    name: publish GitHub Release
+    needs: [verify, provenance]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Extract this version's changelog section as release notes
+        run: python3 scripts/extract_changelog_section.py --tag "${{ github.ref_name }}" > release-notes.md
+
+      - name: Determine prerelease flag
+        id: prerelease
+        run: |
+          if [[ "${{ github.ref_name }}" =~ (a|b|rc)[0-9]+$ ]]; then
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --notes-file release-notes.md \
+            ${{ steps.prerelease.outputs.flag }}
+
+  pypi:
+    name: publish to PyPI
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # trusted publishing (OIDC) — no PyPI token secret needed
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/

@@ -203,7 +203,8 @@ n8n-operator/
 │       ├── ci.yml                  # lint, types, coverage, package smoke
 │       ├── codeql.yml              # static security analysis
 │       ├── live-n8n.yml            # manual real-instance compatibility gate
-│       └── secret-scan.yml         # full-history Gitleaks scan
+│       ├── secret-scan.yml         # full-history Gitleaks scan
+│       └── release.yml             # tag-triggered: verify, attest, GitHub Release, PyPI (prepared, not executed)
 ├── docs/
 │   ├── BUILD_PLAN.md               # this file — normative
 │   ├── ARCHITECTURE.md             # components, boundaries, data flow
@@ -215,6 +216,7 @@ n8n-operator/
 │   ├── LIVE_N8N_TESTING.md         # repeatable real-instance smoke contract
 │   ├── V1_LIMITATIONS.md           # plain-language index of v1 boundaries (phase 9)
 │   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
+│   ├── RELEASE_ROLLBACK.md         # rollback/yank procedure for a bad release (phase 9)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -246,7 +248,10 @@ n8n-operator/
 │   ├── release_smoke.sh            # isolated built-wheel release verification
 │   ├── mcp_session_smoke.py        # real MCP client session over stdio, built wheel
 │   ├── live_n8n_up.sh              # bring up + import/activate the live-n8n harness
-│   └── live_n8n_down.sh            # scoped teardown of the live-n8n harness
+│   ├── live_n8n_down.sh            # scoped teardown of the live-n8n harness
+│   ├── check_release_consistency.py # version/tag/changelog agreement, release.yml
+│   ├── inspect_release_artifacts.sh # wheel/sdist must ship no credential/DB file
+│   └── extract_changelog_section.py # one version's CHANGELOG.md section as release notes
 ├── src/
 │   └── n8n_operator/
 │       ├── __init__.py             # version only
@@ -1812,6 +1817,30 @@ it touches are updated in the same change.
 - [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc2` —
       `pyproject.toml` and `n8n_operator.__version__`), install instructions (README
       quickstart, verified per above).
+
+      **Phase 9 continuation — release-readiness Phase 7 (prepared, not executed):**
+      `.github/workflows/release.yml` is a complete, tag-triggered (`push: tags: v*`
+      only — never a PR, never workflow_dispatch against an arbitrary ref) release
+      pipeline: `verify` (the full local gate, `scripts/check_release_consistency.py`
+      for version/tag/changelog agreement, `uv build`, `scripts/release_smoke.sh`, the
+      Streamable HTTP compatibility suite, `scripts/inspect_release_artifacts.sh` for
+      no-credentials-shipped) → `provenance` (Sigstore-backed build attestation,
+      `actions/attest-build-provenance`) → `github-release` (release notes extracted
+      directly from the matching `CHANGELOG.md` section via
+      `scripts/extract_changelog_section.py`, never hand-typed separately) →
+      `pypi` (trusted publishing / OIDC, `pypa/gh-action-pypi-publish`, no long-lived
+      token). The last two jobs each target a GitHub Environment (`release`, `pypi`)
+      that does not exist yet in this repository — creating one with required
+      reviewers needs a paid plan while private, the same constraint already
+      documented for branch protection — so a run reaching either job fails closed at
+      the environment gate rather than silently publishing. `docs/RELEASE_ROLLBACK.md`
+      documents the rollback (GitHub Release/tag deletion) and yank (PyPI has no
+      delete; yanking is the only correction mechanism, and needs a human with PyPI
+      account access) procedures for either surface. Nothing in this workflow has
+      run for real: doing so needs an actual tag push, which per the release-readiness
+      task's own rules requires explicit approval immediately before it happens — not
+      granted, not attempted here. `.github/PUBLIC_RELEASE_CHECKLIST.md`'s
+      "Release identity" section was updated to point at this automation.
 
 ### Phase 10 — v2
 

@@ -29,10 +29,26 @@ a package. Visibility and publication are separate, explicit operator decisions.
 
 ## Release identity
 
-- [ ] `pyproject.toml`, `n8n_operator.__version__`, changelog, tag, and release title agree
-- [ ] Wheel and source archive contain no credentials, database, or local registry
-- [ ] GitHub Release notes name limitations and upgrade/rollback steps
-- [ ] PyPI trusted publishing configured only for the protected release environment
+- [ ] `pyproject.toml`, `n8n_operator.__version__`, changelog, tag, and release title
+      agree — `scripts/check_release_consistency.py --tag <tag>`, run automatically by
+      `.github/workflows/release.yml`'s `verify` job
+- [ ] Wheel and source archive contain no credentials, database, or local registry —
+      `scripts/inspect_release_artifacts.sh`, run automatically by the same job
+- [ ] GitHub Release notes name limitations and upgrade/rollback steps — the `verify`
+      job's own gate output plus `docs/RELEASE_ROLLBACK.md`; notes are generated from
+      the matching `CHANGELOG.md` section (`scripts/extract_changelog_section.py`),
+      never hand-typed separately at release time
+- [ ] Build provenance attested (`actions/attest-build-provenance`, Sigstore-backed) —
+      the `provenance` job, before either publish step runs
+- [ ] `release` and `pypi` GitHub Environments exist with required reviewers configured
+      (Settings → Environments — not yet created; needs a paid plan on this repository
+      while private, same constraint as branch protection above) — `release.yml`'s
+      `github-release` and `pypi` jobs each target one and fail closed if it is absent
+- [ ] PyPI trusted publishing configured only for the protected `pypi` environment — a
+      "trusted publisher" naming this exact repository, `release.yml`, and the `pypi`
+      environment must be registered on the PyPI project first (a human,
+      PyPI-account-holder action; PyPI supports registering one before the project's
+      first release, as a "pending publisher")
 
 ## Stop conditions
 

@@ -184,6 +184,7 @@ decision — never the only way to decide an operation.
 | [LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md) | How to run the real-instance compatibility gate. |
 | [V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) | Plain-language index of what v1 deliberately doesn't do. |
 | [RECONCILING_UNKNOWN.md](docs/RECONCILING_UNKNOWN.md) | Step-by-step manual procedure for resolving an `UNKNOWN` operation. |
+| [RELEASE_ROLLBACK.md](docs/RELEASE_ROLLBACK.md) | How to roll back a bad GitHub Release or yank a bad PyPI package. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the PR gate, and house conventions. |
 
