@@ -248,6 +248,7 @@ n8n-operator/
 │       │   ├── client.py           # httpx client, timeouts, no retries (ADR-005)
 │       │   ├── canonicalization.py # versioned, evidence-driven hashing (ADR-008)
 │       │   ├── preflight.py        # liveness, active, drift, credential checks
+│       │   ├── health.py           # reachability adapter (HealthPort)
 │       │   └── types.py            # n8n API response models
 │       ├── storage/                # section 8 — persistence
 │       │   ├── __init__.py
@@ -1221,7 +1222,7 @@ it touches are updated in the same change.
       `core` imports none of `mcp`/`cli`/`approval`/`fastapi`/`typer`). 619 tests total,
       97% coverage on `core/` and `registry/` against the 90% gate.
 
-### Phase 4 — n8n integration *(this phase)*
+### Phase 4 — n8n integration
 
 - [x] **Empirical spike first, against a real running n8n** — Docker was unavailable on
       the build machine (no `docker`/`podman`/`colima`/`lima`); with explicit user
@@ -1297,16 +1298,110 @@ it touches are updated in the same change.
       86 new tests (705 total), 97% coverage on `core/` and `registry/` against the 90%
       gate (`n8n/` itself, not gated, at 95%).
 
-### Phase 5 — MCP adapter
+### Phase 5 — MCP adapter *(this phase)*
 
-- [ ] `mcp/server.py`: `MCPServer` wiring over `core.service`
-- [ ] `mcp/tools.py`: the 12 v1 tools (section 7.1) with Pydantic v2 argument models
-- [ ] `mcp/resources.py`: `registry://workflows`, `audit://operations/{id}`
-- [ ] `mcp/transports.py`: stdio + Streamable HTTP, with the B9 bind guard
-- [ ] Response-shaping allowlist enforcing B5, and caller-locality gating for
-      `approval_url` enforcing B13 and invariant I12
-- [ ] `cli serve stdio | serve http`
-- [ ] Tests: contract tests (section 10.3), AC-01, AC-03, AC-04, AC-20, AC-23, AC-31
+- [x] Built against the installed **MCP Python SDK v2.1.1** (`mcp>=2.1,<3`), verified
+      directly from the installed package rather than assumed from prior SDK
+      familiarity — v2's ergonomic `mcp.server.mcpserver.MCPServer` (not the v1
+      `mcp.server.fastmcp` compatibility shim, never imported anywhere in this phase).
+- [x] `mcp/tools.py`: the 12 v1 tools (section 7.1), each with its own explicit
+      Pydantic v2 argument model (`extra="forbid"`, subclassing the SDK's own
+      `ArgModelBase` so it *is* the model actually validated at call time, not just
+      advertised). `Tool` objects are constructed by hand rather than through
+      `MCPServer.tool()`'s signature-introspection, which builds its argument model
+      from the handler's own parameters with permissive `extra` handling — verified
+      directly against the installed SDK's `func_metadata.py` that this SILENTLY
+      DROPS an unknown top-level field rather than rejecting it, which cannot satisfy
+      "additionalProperties: false, unknown fields are a hard error" (boundary B2) no
+      matter how the handler itself is written. The explicit model is both
+      `Tool.parameters` (the published schema) and `fn_metadata.arg_model` (what
+      `Tool.run` validates against), so the two can never drift apart.
+- [x] `mcp/resources.py`: `registry://workflows`, `audit://operations/{operation_id}` —
+      registered onto an already-built `MCPServer` via the ergonomic `@server.resource`
+      decorator (no `extra=forbid` concern here: a resource URI template parameter is a
+      path substitution, not a client-supplied JSON blob).
+- [x] `mcp/server.py`: the composition root. Builds one `MCPServer` per call, wiring the
+      real `n8n.client.N8nClient`/`n8n.preflight.N8nPreflight`/`n8n.health.N8nHealth`
+      into `core.service.PreflightPort`/`HealthPort` — `core.service.get_instance_health`
+      and its `HealthPort` protocol are new this phase, the exact seam
+      `PreflightPort` already established in phase 3/4 for the identical reason
+      (testability without a network in the loop, ADR-001). `_PreflightAdapter`/
+      `_HealthAdapter` convert `n8n/`'s locally-defined, duck-typed result dataclasses
+      into the real `core.models.PreflightResult`/`HealthCheckResult` — the one place
+      allowed to import both sides, since `n8n/` may not import `core/`
+      (ARCHITECTURE.md section 2.1) and `mcp/tools.py` handlers never call `n8n/`
+      directly. `execute_operation` stays exactly what `core.service.execute_operation`
+      already does (burn the handle, move to `EXECUTING`) — dispatching to n8n and
+      resolving to `SUCCEEDED`/`FAILED`/`UNKNOWN` is Phase 7's extension of that same
+      function (ARCHITECTURE.md section 4.3 steps 7-10); this phase's handler is
+      written to need no change when that lands, since it always reports whatever
+      state the use case returns.
+- [x] `mcp/transports.py`: stdio (`server.run(transport="stdio")`, always local — the
+      parent process is the boundary) and Streamable HTTP (`server.streamable_http_app`
+      + `uvicorn`), with the B9 bind guard. `config.Settings` already refuses to
+      *construct* on a non-loopback `http_bind` without a bearer token and a non-empty
+      Origin allowlist (phase 1's own `_validate_http_bind_guard` — that half of B9 was
+      already done); this phase adds `_TransportSecurityMiddleware`, the *per-request*
+      enforcement of both — verified necessary because the installed SDK's own
+      `TransportSecuritySettings` treats a **missing** `Origin` header as same-origin
+      and lets it through, the wrong default for a listener that must reject exactly
+      that (AC-20's "reject missing or invalid Origin").
+- [x] `core.service` additions this phase needed: `HealthPort`/`get_instance_health`
+      (new); `prepare_operation` now returns the one-time raw approval token as a third
+      tuple element (`None` on an idempotent replay) — the only point in the codebase
+      the raw value is ever available, since only its hash is persisted
+      (`core/handles.py`), and the MCP adapter needs it, for a local caller only, to
+      build `approval_url`; `list_workflows` gained optional `tags`/`risk`/
+      `side_effects` filters; `list_operations` gained an opaque `cursor` (an operation
+      ID — ULID order agrees with `created_at` order, so "strictly older than the last
+      row of the previous page" needs no second sort key); `cancel_operation` gained an
+      advisory `reason`, recorded on the transition's audit detail exactly like
+      `prepare_operation`'s already does (ADR-007).
+- [x] Response-shaping allowlist enforcing B5: every handler builds its return dict
+      from an explicit key list matching MCP_TOOLS.md's documented shape — never by
+      dumping a domain object's own fields or forwarding a registry/storage row — so a
+      new internal field added elsewhere is invisible by default rather than leaked by
+      default. Caller-locality gating for `approval_url` (B13, I12) is a `ToolDeps`
+      value fixed once per transport at server-construction time (stdio is always
+      local; a Streamable HTTP bind is local only when loopback), not a per-request
+      check — a loopback bind is unreachable from anywhere but a local process to begin
+      with, and a non-loopback bind is treated as remote for every caller on it.
+- [x] Errors: every handler catches `OperatorError` and returns
+      `{"error": exc.to_dict()}` as an ordinary (non-`isError`) result, deliberately —
+      the installed SDK's own `isError` path (reached when a schema-validation failure
+      is caught before a handler runs at all) wraps only a prose string with no
+      `code`/`details`/`retryable`, verified directly from `Tool.run`'s exception
+      handling; using it for business errors too would mean returning taxonomy-shaped
+      errors two different, incompatible ways depending on which layer caught the
+      failure.
+- [x] Tool annotations: accurate `read_only_hint`/`destructive_hint`/`idempotent_hint`/
+      `open_world_hint` per tool (a contract test checks every tool against its
+      expected annotation). `execute_operation` is the one `destructive_hint: true`
+      tool; `cancel_operation` is `read_only_hint: false` (changes Operator state) but
+      not destructive; `prepare_operation` is `read_only_hint: false` (creates a
+      durable operation row) with `open_world_hint: false` (its domain of interaction
+      is the database, not n8n — it dispatches nothing). No tool is named or shaped
+      like an approval grant, and none of `core.service.approve_operation`/
+      `reject_operation` is reachable from any handler's source (boundary B4) — both
+      checked directly by a contract test.
+- [x] `cli serve stdio | serve http` — the one narrow, deliberate exception to "adapters
+      don't import each other" (ARCHITECTURE.md section 2.1): `cli/commands/serve.py`
+      is the process entrypoint that *starts* the MCP adapter, composition rather than
+      reimplementation, and the layering contract test (`test_layering.py`) now excepts
+      exactly that one file, with the reasoning recorded alongside the exception.
+- [x] Tests: contract tests (exact 12-tool inventory in both directions, every schema
+      declares `additionalProperties: false`, no schema field shaped like a raw n8n
+      identifier/secret/URL, identical schemas across a local and a remote `ToolDeps`,
+      no tool grants approval, per-tool annotation checks) plus integration tests for
+      AC-01, AC-03, AC-04, AC-31 (approval_url present/absent by caller locality),
+      secret/result shaping, the argument-size limit enforced identically through this
+      transport (B12), and `_TransportSecurityMiddleware`'s per-request Origin/bearer
+      enforcement (AC-20) — `config.Settings`' own startup-refusal half of B9/AC-20 was
+      already covered in phase 1. AC-23 (identical surface over stdio and Streamable
+      HTTP) is the cross-transport schema-identity contract test plus
+      `mcp/server.py::build_server`'s single code path for both. 92 new tests (797
+      total), 95% coverage overall; `core/` and `registry/` remain above the 90% gate
+      (`mcp/`, `cli/serve.py` themselves not gated).
 
 ### Phase 6 — Approval
 

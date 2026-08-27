@@ -119,7 +119,7 @@ class _Env:
         server_max_argument_bytes: int = 262_144,
     ) -> tuple[Operation, bool]:
         with session_scope(self.session_factory) as session:
-            return service.prepare_operation(
+            operation, replay, _token = service.prepare_operation(
                 session,
                 principal_id=principal_id,
                 environment=environment,
@@ -129,6 +129,7 @@ class _Env:
                 server_max_argument_bytes=server_max_argument_bytes,
                 idempotency_key=idempotency_key,
             )
+            return operation, replay
 
     def operation_count(self) -> int:
         """Counts every operation for the ``local`` principal across every

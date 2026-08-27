@@ -33,6 +33,7 @@ __all__ = [
     "AuditEvent",
     "Environment",
     "ExecutionResult",
+    "HealthCheckResult",
     "Operation",
     "OperationEvent",
     "PreflightCheck",
@@ -186,4 +187,25 @@ class PreflightResult(BaseModel):
 
     ready: bool
     checks: list[PreflightCheck]
+    checked_at: datetime
+
+
+class HealthCheckResult(BaseModel):
+    """Whether the configured n8n instance is reachable (MCP_TOOLS.md section 2.3).
+
+    Carries no URL and no credential — ``get_instance_health`` is a discovery tool, not
+    a way to learn where the instance lives (ADR-006). ``n8n_version`` is best-effort:
+    n8n exposes no endpoint that returns its own release version
+    (docs/N8N_COMPATIBILITY.md section 10), so this is the n8n Public API's own spec
+    version when one could be determined — a coarse proxy, not a release number — and
+    ``None`` otherwise. ``reason`` is a taxonomy code (never a raw connection error
+    string, which could carry the host) and is only set when ``reachable`` is ``False``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reachable: bool
+    n8n_version: str | None = None
+    latency_ms: int | None = None
+    reason: str | None = None
     checked_at: datetime

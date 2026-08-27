@@ -40,6 +40,7 @@ from n8n_operator.core.idempotency import (
 )
 from n8n_operator.core.models import (
     ExecutionResult,
+    HealthCheckResult,
     Operation,
     PreflightResult,
     WorkflowContract,
@@ -84,6 +85,7 @@ from n8n_operator.storage.repository import (
 )
 
 __all__ = [
+    "HealthPort",
     "PreflightPort",
     "approve_operation",
     "cancel_operation",
@@ -91,6 +93,7 @@ __all__ = [
     "execute_operation",
     "get_active_snapshot",
     "get_execution_result",
+    "get_instance_health",
     "get_operation",
     "list_operations",
     "list_workflows",
@@ -116,6 +119,19 @@ class PreflightPort(Protocol):
     """
 
     def check(self, workflow: WorkflowContract) -> PreflightResult: ...
+
+
+class HealthPort(Protocol):
+    """What ``get_instance_health`` needs from a reachability checker.
+
+    Same seam as :class:`PreflightPort` for the same reason: Phase 5's MCP adapter
+    never calls ``n8n/`` directly (ARCHITECTURE.md section 2.1 — an adapter "must not
+    ... call n8n"); it calls ``core.service.get_instance_health``, which calls this
+    port. The composition root (``mcp/server.py``) injects the real
+    ``n8n.health.N8nHealth`` adapter; tests inject a fake.
+    """
+
+    def check(self) -> HealthCheckResult: ...
 
 
 # ----------------------------------------------------------------------------------
@@ -465,10 +481,31 @@ def reload_registry(
     return snapshot, False
 
 
-def list_workflows(session: Session) -> list[WorkflowSummary]:
-    """Every enabled workflow in the active snapshot (MCP_TOOLS.md section 2.1)."""
+def list_workflows(
+    session: Session,
+    *,
+    tags: Sequence[str] | None = None,
+    risk: str | None = None,
+    side_effects: str | None = None,
+) -> list[WorkflowSummary]:
+    """Every enabled workflow in the active snapshot (MCP_TOOLS.md section 2.1).
+
+    ``tags`` matches a workflow that carries **all** listed tags; ``risk`` and
+    ``side_effects`` match exactly. All three are optional and compose by intersection.
+    Filtering, not authorization: an unmatched filter narrows what is *listed*, the same
+    way it would for a caller who scrolled through the unfiltered list by hand — it is
+    not a second gate alongside ``enabled`` (ADR-002 default-deny already is that gate).
+    """
     document = _require_active_document(session)
-    return [WorkflowSummary.from_entry(entry) for entry in document.workflows if entry.enabled]
+    summaries = [WorkflowSummary.from_entry(entry) for entry in document.workflows if entry.enabled]
+    if tags:
+        wanted = set(tags)
+        summaries = [s for s in summaries if wanted <= set(s.tags)]
+    if risk is not None:
+        summaries = [s for s in summaries if s.risk == risk]
+    if side_effects is not None:
+        summaries = [s for s in summaries if s.side_effects == side_effects]
+    return summaries
 
 
 def describe_workflow(session: Session, *, workflow_id: str) -> WorkflowDetail:
@@ -507,6 +544,18 @@ def preflight_workflow(
     return preflight.check(entry)
 
 
+def get_instance_health(health: HealthPort) -> HealthCheckResult:
+    """Whether the configured n8n instance is reachable (MCP_TOOLS.md section 2.3).
+
+    Unlike every other use case here, this touches neither the registry nor storage —
+    reachability is a property of the n8n instance alone, not of any one workflow or
+    operation — so it takes no ``Session``. A thin pass-through over ``health.check()``,
+    kept as a named use case (rather than the MCP adapter calling the port directly) so
+    the "MCP calls core.service" rule (ADR-001) has no exception.
+    """
+    return health.check()
+
+
 # ----------------------------------------------------------------------------------
 # The operation lifecycle (BUILD_PLAN sections 5, 8.1; ARCHITECTURE.md section 4).
 # ----------------------------------------------------------------------------------
@@ -523,15 +572,26 @@ def prepare_operation(
     server_max_argument_bytes: int,
     idempotency_key: str | None = None,
     reason: str | None = None,
-) -> tuple[Operation, bool]:
+) -> tuple[Operation, bool, str | None]:
     """Validate, preflight, and mint an operation handle (ADR-003, ARCHITECTURE.md 4.1).
 
-    Returns ``(operation, idempotent_replay)`` — mirrors :func:`reload_registry`'s
-    ``(result, reused)`` shape. ``INVALID`` and ``BLOCKED`` are *results*, not
-    exceptions: the call succeeded and produced a governed, audited outcome
-    (MCP_TOOLS.md section 2.6). Only a failure to interpret the request at all
-    (``WORKFLOW_NOT_FOUND``, ``WORKFLOW_DISABLED``, ``IDEMPOTENCY_CONFLICT``) or a
-    refusal to record it (``ARGUMENTS_TOO_LARGE``) raises.
+    Returns ``(operation, idempotent_replay, approval_token)`` — extends
+    :func:`reload_registry`'s ``(result, reused)`` shape with the one-time raw approval
+    token, when a new one was minted (``entry.approval == "required"`` and this was not
+    an idempotent replay). Only ``storage.repository.ApprovalRepository`` ever persists
+    the token's *hash* (``core/handles.py``); this is the only point in the codebase
+    where the raw value is available at all, so a caller that wants to build an
+    approval URL (the MCP adapter, for a local caller only — invariant I12, boundary
+    B13) must capture it *here*, from this return value, or never again. An idempotent
+    replay never re-mints, so it always returns ``None`` here even if the original
+    ``prepare`` call minted one — reusing or reconstructing another call's token would
+    make it not single-use.
+
+    ``INVALID`` and ``BLOCKED`` are *results*, not exceptions: the call succeeded and
+    produced a governed, audited outcome (MCP_TOOLS.md section 2.6). Only a failure to
+    interpret the request at all (``WORKFLOW_NOT_FOUND``, ``WORKFLOW_DISABLED``,
+    ``IDEMPOTENCY_CONFLICT``) or a refusal to record it (``ARGUMENTS_TOO_LARGE``)
+    raises — and in both cases the returned token is necessarily ``None``.
     """
     snapshot = _require_active_snapshot(session)
     document = RegistryDocument.model_validate(snapshot.document)
@@ -583,7 +643,7 @@ def prepare_operation(
         if resolution is IdempotencyResolution.REPLAY:
             assert existing is not None
             existing = _apply_lazy_expiry(session, existing)
-            return _to_domain(existing), True
+            return _to_domain(existing), True, None
 
     handle = mint_operation_handle()
     operation = op_repo.create(
@@ -612,7 +672,7 @@ def prepare_operation(
             actor="system",
             detail={"errors": [e.to_dict() for e in errors]},
         )
-        return _to_domain(operation), False
+        return _to_domain(operation), False, None
 
     preflight_result = preflight.check(entry)
     checks_detail = {"checks": [c.model_dump(mode="json") for c in preflight_result.checks]}
@@ -620,9 +680,10 @@ def prepare_operation(
         operation = _apply_and_audit(
             session, operation, "T03", actor="system", detail=checks_detail
         )
-        return _to_domain(operation), False
+        return _to_domain(operation), False, None
 
     now = datetime.now(UTC)
+    approval_token: str | None = None
     if entry.approval == "none":
         # R5 guarantees side_effects == "read_only" whenever approval == "none".
         execution_deadline = now + timedelta(
@@ -652,8 +713,9 @@ def prepare_operation(
         ApprovalRepository(session).create(
             operation_id=operation.id, token_hash=minted.token_hash, expires_at=approval_expires_at
         )
+        approval_token = minted.token
 
-    return _to_domain(operation), False
+    return _to_domain(operation), False, approval_token
 
 
 def approve_operation(session: Session, *, operation_id: str, decided_by: str) -> Operation:
@@ -689,8 +751,15 @@ def reject_operation(session: Session, *, operation_id: str, decided_by: str) ->
     return _to_domain(updated)
 
 
-def cancel_operation(session: Session, *, operation_id: str, principal_id: str) -> Operation:
-    """T09/T12: the originating caller withdraws before execution (MCP_TOOLS.md 2.9)."""
+def cancel_operation(
+    session: Session, *, operation_id: str, principal_id: str, reason: str | None = None
+) -> Operation:
+    """T09/T12: the originating caller withdraws before execution (MCP_TOOLS.md 2.9).
+
+    ``reason`` is advisory only, exactly like ``prepare_operation``'s (ADR-007) — it is
+    recorded on the transition's audit detail for a human reading the trail later, and
+    never affects whether the cancellation is allowed.
+    """
     row = _get_owned_operation_row(session, operation_id, principal_id)
     if row.state == "PENDING_APPROVAL":
         transition_id = "T09"
@@ -698,7 +767,13 @@ def cancel_operation(session: Session, *, operation_id: str, principal_id: str) 
         transition_id = "T12"
     else:
         raise InvalidStateTransitionError(details={"current_state": row.state})
-    updated = _apply_and_audit(session, row, transition_id, actor=principal_id)
+    updated = _apply_and_audit(
+        session,
+        row,
+        transition_id,
+        actor=principal_id,
+        detail={"reason": reason} if reason else {},
+    )
     return _to_domain(updated)
 
 
@@ -827,9 +902,18 @@ def list_operations(
     states: list[str] | None = None,
     since: datetime | None = None,
     limit: int = 20,
+    cursor: str | None = None,
 ) -> list[Operation]:
     """Filterable history (MCP_TOOLS.md section 2.10) — applies lazy expiry to every
-    returned row, since a list is a read like any other (invariant I9)."""
+    returned row, since a list is a read like any other (invariant I9).
+
+    ``cursor`` is opaque to the caller (MCP_TOOLS.md 2.10: "Opaque pagination cursor")
+    but is, concretely, the ``operation_id`` of the last row a previous page returned:
+    operation IDs are ULIDs, so ``id`` order and ``created_at`` order agree, and
+    "everything strictly older than this ID" is a stable page boundary without a
+    separate offset concept. The MCP adapter mints the next page's cursor from the
+    last operation in a full page and omits it once a page comes back short.
+    """
     if not (1 <= limit <= 100):
         raise InvalidArgumentsError(details={"limit": limit})
     if states is not None:
@@ -843,6 +927,7 @@ def list_operations(
         states=states,
         since=since,
         limit=limit,
+        before_id=cursor,
     )
     return [_to_domain(_apply_lazy_expiry(session, row)) for row in rows]
 

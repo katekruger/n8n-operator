@@ -245,8 +245,14 @@ class OperationRepository:
         states: list[str] | None = None,
         since: datetime | None = None,
         limit: int = 20,
+        before_id: str | None = None,
     ) -> list[Operation]:
         """Filtered, most-recent-first history for one principal (MCP_TOOLS.md 2.10).
+
+        ``before_id`` pages backward through the same ordering: operation IDs are
+        ``op_<ULID>``, lexicographically sortable the same way ``created_at`` is, so
+        "strictly older than the last row of the previous page" is ``id < before_id``
+        without a second sort key or an offset that shifts under concurrent inserts.
 
         Applies no policy of its own (per the module docstring) — including no lazy
         expiry, which is a state-machine concern; a caller that needs every returned row
@@ -263,6 +269,8 @@ class OperationRepository:
             stmt = stmt.where(Operation.state.in_(states))
         if since is not None:
             stmt = stmt.where(Operation.created_at >= since)
+        if before_id is not None:
+            stmt = stmt.where(Operation.id < before_id)
         stmt = stmt.order_by(Operation.created_at.desc()).limit(limit)
         return list(self._session.scalars(stmt))
 

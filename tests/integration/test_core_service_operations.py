@@ -172,7 +172,7 @@ def _prepare(
 ) -> tuple[str, str]:
     """Prepare an operation and return ``(operation_id, state)``."""
     with session_scope(session_factory) as session:
-        operation, _replay = service.prepare_operation(
+        operation, _replay, _token = service.prepare_operation(
             session,
             principal_id=env["principal_id"],
             environment=env["environment"],

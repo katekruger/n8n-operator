@@ -100,12 +100,26 @@ def test_capability_packages_do_not_import_core_or_each_other(package_name: str)
 @pytest.mark.contract
 def test_adapters_do_not_import_each_other() -> None:
     """``mcp/``, ``cli/``, and ``approval/`` all sit at the same layer over ``core`` —
-    none should reach sideways into another adapter (ARCHITECTURE.md section 2.1)."""
+    none should reach sideways into another adapter to *implement* anything
+    (ARCHITECTURE.md section 2.1): no MCP-protocol shaping in the CLI, no CLI/argument
+    parsing in the MCP tool handlers, no request handling in ``approval/``.
+
+    ``cli/commands/serve.py`` is the one narrow, deliberate exception: ``n8n-operator
+    serve stdio|http`` is the process entrypoint that *starts* the MCP adapter (and,
+    from phase 6, ``serve approval`` starts the approval app) — composition, not
+    reimplementation. It calls exactly one function per transport
+    (``mcp.transports.serve_stdio``/``serve_http``) and contains no protocol or
+    governance logic of its own; every other file in ``cli/``, ``mcp/``, and
+    ``approval/`` remains fully isolated from its siblings.
+    """
     adapters = ("mcp", "cli", "approval")
+    exempt = {SRC / "cli" / "commands" / "serve.py"}
     for package_name in adapters:
         package_dir = SRC / package_name
         forbidden = {f"n8n_operator.{name}" for name in adapters if name != package_name}
         for path in sorted(package_dir.rglob("*.py")):
+            if path in exempt:
+                continue
             imported = _imported_module_names(path)
             violations = {
                 name for name in imported for target in forbidden if _violates(name, target)
