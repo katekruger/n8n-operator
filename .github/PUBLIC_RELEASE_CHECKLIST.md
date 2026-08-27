@@ -11,7 +11,10 @@ a package. Visibility and publication are separate, explicit operator decisions.
 - [ ] CodeQL and Secret scan workflows green on the release commit
 - [ ] Confirm the visibility-triggered CodeQL job ran (it is intentionally skipped while private)
 - [ ] Dependabot alerts reviewed; no unresolved critical or high-risk finding
-- [ ] Branch protection requires CI, CodeQL, and Secret scan
+- [ ] Branch protection requires CI, CodeQL, and Secret scan (unavailable on this
+      repository's current GitHub plan while private — `GET .../branches/main/protection`
+      and `.../rulesets` both 403 with "Upgrade to GitHub Pro or make this repository
+      public." Configure this *after* the visibility change below, not before.)
 - [ ] Repository topics, description, homepage, and social preview reviewed
 
 ## Product evidence
