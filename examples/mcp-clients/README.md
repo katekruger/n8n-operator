@@ -22,7 +22,7 @@ remains the one-time result from phase 9 release testing. See
 
 1. Install from a local checkout with `uv tool install .` — see the
    [README quickstart](../../README.md#quickstart). PyPI publishing is intentionally
-   deferred while this release candidate remains private.
+   deferred until the live-n8n and hosted OpenAI-connector checks pass for real.
 2. `n8n-operator db init`, then `n8n-operator registry reload --path <your registry>`
    — do this once, outside Claude Desktop, so the database and registry snapshot exist
    before the first launch.

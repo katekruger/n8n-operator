@@ -6,7 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Repository visibility changed to public. Immediately before, confirmed full-history
+  Gitleaks was green on the exact commit exposed. Immediately after: enabled native
+  secret scanning, push protection, and private vulnerability reporting; configured
+  branch protection on `main` (four required checks, strict, `enforce_admins` on, no
+  force pushes or branch deletion — all newly available the moment visibility changed,
+  no plan upgrade needed); created the `release` and `pypi` GitHub Environments
+  `.github/workflows/release.yml` targets.
+- Reworded README.md, `examples/mcp-clients/README.md`, and
+  `.github/PUBLIC_RELEASE_CHECKLIST.md` to describe the repository's actual current
+  state (public, not yet tagged or published) rather than the private-repository
+  framing that preceded this change.
 
 ## [1.0.0-rc2] - 2026-08-27
 
