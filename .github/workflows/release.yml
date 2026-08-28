@@ -6,14 +6,9 @@ name: Release
 # whatever ref happens to be checked out.
 #
 # `environment: release` (the GitHub Release job) and `environment: pypi` (the PyPI
-# publish job) are GitHub Environments — create them in Settings > Environments with
-# required reviewers before this workflow can ever actually publish anything (this
-# repository has none configured yet; environment protection rules that require
-# reviewers need a paid plan on a private repo, same constraint already documented for
-# branch protection in .github/PUBLIC_RELEASE_CHECKLIST.md). Until an environment
-# named `release`/`pypi` exists, a run reaching that job fails at the environment gate
-# rather than silently skipping it — a deliberate fail-closed default, not an
-# oversight.
+# publish job) are GitHub Environments. Both exist and are restricted to main; neither
+# currently has a required reviewer. Repository owners may add reviewers in Settings >
+# Environments when a manual publication gate is desired.
 #
 # PyPI publishing uses trusted publishing (OIDC, `id-token: write`) — no long-lived
 # PyPI API token stored as a secret. This needs a matching "trusted publisher"
@@ -22,9 +17,10 @@ name: Release
 # exact repository, workflow file, and `pypi` environment — a human, PyPI-account-holder
 # action this workflow cannot perform for itself.
 #
-# BUILD_PLAN section 12 phase 9 / release-readiness Phase 7: PREPARED, not executed.
-# Nothing in this file has ever run for real — see the phase 9 continuation note in
-# docs/BUILD_PLAN.md for exactly what has and hasn't been verified about it.
+# First exercised end-to-end by v1.0.0rc3: verification, artifact inspection,
+# provenance, and GitHub prerelease publication completed successfully. PyPI remains
+# deliberately disabled until its trusted publisher is configured (see the `if: false`
+# publish job and the public release checklist).
 
 on:
   push:

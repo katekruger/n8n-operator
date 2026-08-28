@@ -12,10 +12,10 @@ a package. Visibility and publication are separate, explicit operator decisions.
 - [x] Private vulnerability reporting enabled (`PUT .../private-vulnerability-reporting`
       → `{"enabled": true}`) — test the public Security tab's "Report a vulnerability"
       button once, manually, from a signed-in GitHub session (not automatable)
-- [ ] CodeQL and Secret scan workflows green on the release commit — CodeQL's
-      visibility gate means the first *real* (non-skipped) run only fires on the next
-      push after visibility changed; confirm it went green, not skipped, before
-      checking this box
+- [x] CodeQL and Gitleaks workflows green on the `v1.0.0rc3` release commit. CodeQL
+      alert 1 reviewed as a false positive: the SHA-256 value is a deterministic
+      integrity/equality binding, not credential protection; the v1 threat boundary and
+      future keyed-HMAC trigger are recorded in ADR-003
 - [x] Confirm the visibility-triggered CodeQL job now actually runs (no longer skipped)
 - [x] Dependabot alerts reviewed; zero open alerts, zero open PRs
 - [x] Branch protection configured on `main`: `lint · types · tests · docs`,
@@ -30,26 +30,28 @@ a package. Visibility and publication are separate, explicit operator decisions.
 
 ## Product evidence
 
-- [ ] Non-live suite, documentation contract, and 90% coverage gate green
-- [ ] Distribution built and installed successfully in a clean environment
-- [ ] Fresh database migration and CLI smoke test green
-- [ ] Claude Desktop stdio smoke test retained as evidence
-- [ ] Generic Streamable HTTP smoke test retained as evidence
+- [x] Non-live suite, documentation contract, and 90% coverage gate green in the
+      `v1.0.0rc3` release workflow
+- [x] Distribution built and installed successfully in a clean environment
+- [x] Fresh database migration and CLI smoke test green
+- [x] Built-wheel MCP stdio protocol session retained as automated evidence (this does
+      not claim that the Claude Desktop GUI itself was launched)
+- [x] OpenAI-compatible Streamable HTTP protocol test retained as automated evidence
 - [ ] Live n8n compatibility workflow green against every version claimed in the matrix
 - [ ] Hosted OpenAI connector claim matches a retained real-client test
 
 ## Release identity
 
-- [ ] `pyproject.toml`, `n8n_operator.__version__`, changelog, tag, and release title
+- [x] `pyproject.toml`, `n8n_operator.__version__`, changelog, tag, and release title
       agree — `scripts/check_release_consistency.py --tag <tag>`, run automatically by
       `.github/workflows/release.yml`'s `verify` job
-- [ ] Wheel and source archive contain no credentials, database, or local registry —
+- [x] Wheel and source archive contain no credentials, database, or local registry —
       `scripts/inspect_release_artifacts.sh`, run automatically by the same job
-- [ ] GitHub Release notes name limitations and upgrade/rollback steps — the `verify`
+- [x] GitHub Release notes name limitations and upgrade/rollback steps — the `verify`
       job's own gate output plus `docs/RELEASE_ROLLBACK.md`; notes are generated from
       the matching `CHANGELOG.md` section (`scripts/extract_changelog_section.py`),
       never hand-typed separately at release time
-- [ ] Build provenance attested (`actions/attest-build-provenance`, Sigstore-backed) —
+- [x] Build provenance attested (`actions/attest-build-provenance`, Sigstore-backed) —
       the `provenance` job, before either publish step runs
 - [x] `release` and `pypi` GitHub Environments exist, each restricted to protected
       branches only (`main`) — created 2026-08-27. Required-reviewer protection is

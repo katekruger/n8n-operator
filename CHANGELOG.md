@@ -6,7 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Closed the v1 release-readiness documentation drift: the public checklist and build
+  plan now reflect the successful `v1.0.0rc3` GitHub release, and the rollback runbook
+  uses a fail-closed, operator-verified tag variable instead of a stale hardcoded tag.
+- Documented why the deterministic SHA-256 argument fingerprint is an integrity/equality
+  binding rather than credential hashing, including the storage-model change that would
+  require revisiting it with a versioned keyed HMAC. The corresponding CodeQL false
+  positive was reviewed and dismissed with that rationale.
 
 ## [1.0.0-rc3] - 2026-08-28
 

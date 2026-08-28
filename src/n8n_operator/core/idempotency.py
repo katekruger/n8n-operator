@@ -1,7 +1,12 @@
 """Canonical JSON and argument fingerprints.
 
 ``argument_fingerprint`` is sha256 over the canonical JSON serialization of the
-arguments as submitted. Canonicalization must be idempotent and insensitive to key
+arguments as submitted. This is an integrity/equality fingerprint, not a password or
+credential hash: it is deliberately deterministic so prepare-time and execute-time
+payloads can be compared. It provides no confidentiality, and callers must not treat it
+as redaction or encryption (ADR-003).
+
+Canonicalization must be idempotent and insensitive to key
 order and insignificant whitespace, and sensitive to every structural difference —
 both are Hypothesis properties (BUILD_PLAN section 10.2).
 
@@ -61,7 +66,12 @@ def canonicalize_arguments(arguments: dict[str, Any]) -> bytes:
 
 
 def fingerprint_arguments(canonical_bytes: bytes) -> str:
-    """``sha256:<hex>`` over ``canonical_bytes`` — the operation's ``argument_fingerprint``."""
+    """Return the operation's deterministic integrity/equality fingerprint.
+
+    SHA-256 is used here for stable collision-resistant comparison, not for password
+    storage or confidentiality. The preimage is the operation payload already retained
+    by v1 for dispatch and execute-time verification; see ADR-003.
+    """
     return "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
 
 

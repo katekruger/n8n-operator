@@ -204,7 +204,7 @@ n8n-operator/
 │       ├── codeql.yml              # static security analysis
 │       ├── live-n8n.yml            # manual real-instance compatibility gate
 │       ├── secret-scan.yml         # full-history Gitleaks scan
-│       └── release.yml             # tag-triggered: verify, attest, GitHub Release, PyPI (prepared, not executed)
+│       └── release.yml             # tag-triggered: verify, attest, GitHub Release; PyPI gated
 ├── docs/
 │   ├── BUILD_PLAN.md               # this file — normative
 │   ├── ARCHITECTURE.md             # components, boundaries, data flow
@@ -1814,11 +1814,11 @@ it touches are updated in the same change.
       risk RR-10 and out-of-scope item 10 record this honestly, with the manual
       emergency procedure in `docs/RECONCILING_UNKNOWN.md`. Every other `mitigated`
       entry was spot-checked against the phase that implements it and found accurate.
-- [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc2` —
+- [x] `CHANGELOG.md` (all nine phases, newest first), version tag (`1.0.0rc3` —
       `pyproject.toml` and `n8n_operator.__version__`), install instructions (README
       quickstart, verified per above).
 
-      **Phase 9 continuation — release-readiness Phase 7 (prepared, not executed):**
+      **Phase 9 continuation — release-readiness Phase 7 (GitHub release executed):**
       `.github/workflows/release.yml` is a complete, tag-triggered (`push: tags: v*`
       only — never a PR, never workflow_dispatch against an arbitrary ref) release
       pipeline: `verify` (the full local gate, `scripts/check_release_consistency.py`
@@ -1835,11 +1835,12 @@ it touches are updated in the same change.
       only the repository owner can make). `docs/RELEASE_ROLLBACK.md`
       documents the rollback (GitHub Release/tag deletion) and yank (PyPI has no
       delete; yanking is the only correction mechanism, and needs a human with PyPI
-      account access) procedures for either surface. Nothing in this workflow has
-      run for real: doing so needs an actual tag push, which per the release-readiness
-      task's own rules requires explicit approval immediately before it happens — not
-      granted, not attempted here. `.github/PUBLIC_RELEASE_CHECKLIST.md`'s
-      "Release identity" section was updated to point at this automation.
+      account access) procedures for either surface. The `v1.0.0rc3` tag exercised the
+      verification, build, clean-install smoke, Streamable HTTP compatibility, artifact
+      inspection, provenance, and GitHub prerelease jobs successfully. PyPI publishing
+      remains deliberately disabled until its trusted publisher is configured.
+      `.github/PUBLIC_RELEASE_CHECKLIST.md` records the retained evidence and remaining
+      live-client gates.
 
 ### Phase 10 — v2
 
