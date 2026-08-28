@@ -72,9 +72,18 @@ def test_codeql_only_runs_once_the_repository_is_public() -> None:
 @pytest.mark.unit
 def test_ci_excludes_live_n8n_tests() -> None:
     """The live-n8n suite needs a real instance and must never block a normal push —
-    `docs/LIVE_N8N_TESTING.md` and `docs/BUILD_PLAN.md` section 10.1 both say so."""
+    `docs/LIVE_N8N_TESTING.md` and `docs/BUILD_PLAN.md` section 10.1 both say so. Every
+    pytest invocation in ci.yml excludes it, whichever other markers a given job also
+    excludes or includes (the `check` job additionally excludes `postgres`, run
+    separately in its own job; the `postgres` job runs only `postgres`-marked tests)."""
     text = (WORKFLOWS_DIR / "ci.yml").read_text()
-    assert '-m "not live_n8n"' in text
+    invocations = re.findall(r"pytest\s+-m\s+\"([^\"]*)\"", text)
+    assert invocations, 'expected at least one `pytest -m "..."` invocation in ci.yml'
+    for expression in invocations:
+        assert "live_n8n" in expression, f"pytest -m {expression!r} does not mention live_n8n"
+        assert "not live_n8n" in expression, (
+            f"pytest -m {expression!r} mentions live_n8n but does not exclude it"
+        )
 
 
 @pytest.mark.unit
