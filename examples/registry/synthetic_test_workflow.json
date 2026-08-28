@@ -5,6 +5,7 @@
     {
       "id": "webhook-node-1",
       "name": "Webhook",
+      "webhookId": "5da7f672-93d8-4dd5-9f82-9789450e584a",
       "parameters": {
         "httpMethod": "POST",
         "options": {},
