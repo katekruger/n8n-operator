@@ -44,6 +44,15 @@ DEFAULT_APPROVAL_BIND = "127.0.0.1:8765"
 DEFAULT_HTTP_BIND = "127.0.0.1:8000"
 DEFAULT_MAX_ARGUMENT_BYTES = 262_144  # 256 KiB — ADR-011's server ceiling
 
+# Postgres-only connection-pool and session defaults (ADR-004; stage 01). Meaningless on
+# SQLite and never applied there — see storage/session.py's dialect branch.
+DEFAULT_DATABASE_POOL_SIZE = 5
+DEFAULT_DATABASE_MAX_OVERFLOW = 10
+DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS = 30
+DEFAULT_DATABASE_POOL_RECYCLE_SECONDS = 1800  # 30 min — outlives most managed-Postgres idle kills
+DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS = 30
+DEFAULT_DATABASE_CONNECT_TIMEOUT_SECONDS = 10
+
 _SUPPORTED_DB_DRIVERS = frozenset({"sqlite", "sqlite+pysqlite", "postgresql", "postgresql+psycopg"})
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
@@ -129,6 +138,53 @@ def resolve_database_url(explicit: str | None = None) -> str:
     return _check_database_url(raw)
 
 
+def redact_database_url(database_url: str) -> str:
+    """``database_url`` with any embedded password replaced by SQLAlchemy's own
+    ``***`` placeholder — never the literal value.
+
+    A PostgreSQL DSN may carry a password inline (``postgresql+psycopg://user:pass@host/db``).
+    Every place that surfaces ``database_url`` to a human or a log line — ``db status``,
+    ``db migrate-to-postgres``, the health check, structured logging — must call this
+    first. Malformed input returns a fixed placeholder rather than raising, because the
+    only callers of this function are already-successful display paths for a URL that
+    validated earlier; failing to redact must never be the reason a raw secret reaches
+    a log line.
+    """
+    try:
+        return make_url(database_url).render_as_string(hide_password=True)
+    except Exception:
+        return "***"
+
+
+def resolve_database_password(explicit: str | None = None) -> str | None:
+    """The database password, resolved *without* requiring the rest of
+    :class:`Settings` — the same "orthogonal concern" reasoning as
+    :func:`resolve_database_url`. Precedence: an explicit value, then
+    ``N8N_OPERATOR_DATABASE_PASSWORD``, then ``None`` (the ``database_url`` itself may
+    already carry a password, or none is needed — e.g. local SQLite). Accepts the same
+    ``env:NAME`` / ``keyring:SERVICE/ACCOUNT`` indirection as ``n8n_api_key`` (ADR-006).
+    """
+    raw = explicit if explicit is not None else os.environ.get("N8N_OPERATOR_DATABASE_PASSWORD")
+    if raw is None:
+        return None
+    return resolve_secret_reference(raw)
+
+
+def compose_database_url(database_url: str, password: str | None) -> str:
+    """``database_url`` with ``password`` substituted as its password component.
+
+    A no-op when ``password`` is ``None`` — the URL is returned exactly as given, which
+    covers both "no password needed" (SQLite) and "the password is already embedded in
+    the URL" (an operator who prefers that shape). The composed, secret-bearing string
+    this returns must never be logged or displayed — use :func:`redact_database_url` for
+    that; this function exists only to build the value actually passed to
+    ``create_engine``.
+    """
+    if password is None:
+        return database_url
+    return make_url(database_url).set(password=password).render_as_string(hide_password=False)
+
+
 def resolve_registry_path(explicit: str | None = None) -> Path:
     """The registry file path, resolved *without* requiring the rest of
     :class:`Settings` — the same "schema/registry management is orthogonal to the rest
@@ -211,6 +267,23 @@ class Settings(BaseSettings):
 
     # --- storage -------------------------------------------------------------------------
     database_url: str = Field(default=DEFAULT_DATABASE_URL)
+    database_password: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Optional. Literal, env:NAME, or keyring:SERVICE/ACCOUNT (ADR-006). "
+            "Substituted into database_url's password component; never logged."
+        ),
+    )
+    database_pool_size: int = Field(default=DEFAULT_DATABASE_POOL_SIZE, ge=1)
+    database_max_overflow: int = Field(default=DEFAULT_DATABASE_MAX_OVERFLOW, ge=0)
+    database_pool_timeout_seconds: int = Field(default=DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS, gt=0)
+    database_pool_recycle_seconds: int = Field(default=DEFAULT_DATABASE_POOL_RECYCLE_SECONDS, gt=0)
+    database_statement_timeout_seconds: int = Field(
+        default=DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS, gt=0
+    )
+    database_connect_timeout_seconds: int = Field(
+        default=DEFAULT_DATABASE_CONNECT_TIMEOUT_SECONDS, gt=0
+    )
 
     # --- approval (loopback only in v1 — boundary B10) ------------------------------------
     approval_bind: str = Field(default=DEFAULT_APPROVAL_BIND)
@@ -233,6 +306,13 @@ class Settings(BaseSettings):
     @field_validator("n8n_api_key", mode="before")
     @classmethod
     def _resolve_n8n_api_key(cls, value: object) -> object:
+        if isinstance(value, str):
+            return resolve_secret_reference(value)
+        return value
+
+    @field_validator("database_password", mode="before")
+    @classmethod
+    def _resolve_database_password(cls, value: object) -> object:
         if isinstance(value, str):
             return resolve_secret_reference(value)
         return value
@@ -297,6 +377,17 @@ class Settings(BaseSettings):
         host, _, port = self.http_bind.rpartition(":")
         return host, int(port)
 
+    def effective_database_url(self) -> str:
+        """``database_url`` with ``database_password`` (if set) substituted in.
+
+        The one value ``storage.session.create_engine_for_url`` should actually be
+        called with. Never log or display this — it may carry the resolved secret; use
+        :func:`redact_database_url` for display, exactly as ``database_url`` itself
+        would be redacted.
+        """
+        password = self.database_password.get_secret_value() if self.database_password else None
+        return compose_database_url(self.database_url, password)
+
 
 def load_settings(**overrides: Any) -> Settings:
     """Construct :class:`Settings`, translating a validation failure safely.
@@ -329,13 +420,22 @@ def load_settings(**overrides: Any) -> Settings:
 
 __all__ = [
     "DEFAULT_APPROVAL_BIND",
+    "DEFAULT_DATABASE_CONNECT_TIMEOUT_SECONDS",
+    "DEFAULT_DATABASE_MAX_OVERFLOW",
+    "DEFAULT_DATABASE_POOL_RECYCLE_SECONDS",
+    "DEFAULT_DATABASE_POOL_SIZE",
+    "DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS",
+    "DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS",
     "DEFAULT_DATABASE_URL",
     "DEFAULT_HTTP_BIND",
     "DEFAULT_MAX_ARGUMENT_BYTES",
     "DEFAULT_REGISTRY_PATH",
     "Settings",
+    "compose_database_url",
     "load_settings",
+    "redact_database_url",
     "resolve_approval_bind",
+    "resolve_database_password",
     "resolve_database_url",
     "resolve_max_argument_bytes",
     "resolve_registry_path",
