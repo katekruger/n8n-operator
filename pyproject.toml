@@ -153,6 +153,7 @@ markers = [
   "contract: MCP tool schema, error taxonomy, and layering contracts",
   "integration: real SQLite and a mock n8n transport",
   "live_n8n: requires a real n8n instance; opt-in, not run in CI",
+  "postgres: requires a real PostgreSQL instance on loopback; pinned in CI via a service container, opt-in locally via N8N_OPERATOR_TEST_POSTGRES_URL",
 ]
 
 [tool.coverage.run]

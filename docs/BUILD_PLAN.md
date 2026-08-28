@@ -200,7 +200,7 @@ n8n-operator/
 ├── .github/
 │   ├── dependabot.yml              # weekly Python and Actions updates
 │   └── workflows/
-│       ├── ci.yml                  # lint, types, coverage, package smoke
+│       ├── ci.yml                  # lint, types, coverage, postgres harness, package smoke
 │       ├── codeql.yml              # static security analysis
 │       ├── live-n8n.yml            # manual real-instance compatibility gate
 │       ├── secret-scan.yml         # full-history Gitleaks scan
@@ -218,6 +218,7 @@ n8n-operator/
 │   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
 │   ├── RELEASE_ROLLBACK.md         # rollback/yank procedure for a bad release (phase 9)
 │   ├── V2_TRACEABILITY.md          # v2 outcome/tool -> AC/test/doc/stage matrix (stage 00)
+│   ├── POSTGRES_OPERATIONS.md      # backup/restore/rollback, capacity, dev setup (stage 01)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -248,8 +249,10 @@ n8n-operator/
 │       ├── streamable_http_client.json    # generic remote / Streamable HTTP
 │       └── openai_responses_tool.json     # OpenAI Responses MCP tool object
 ├── docker/
-│   └── live-n8n/                   # reproducible live-n8n harness (phase 9)
-│       └── docker-compose.yml      # pinned, loopback-only, project-scoped instance
+│   ├── live-n8n/                   # reproducible live-n8n harness (phase 9)
+│   │   └── docker-compose.yml      # pinned, loopback-only, project-scoped instance
+│   └── postgres-test/              # pinned, loopback-only Postgres integration harness (stage 01)
+│       └── docker-compose.yml
 ├── scripts/
 │   ├── check_docs_consistency.py   # doc invariants enforced in CI
 │   ├── demo.sh                     # five-minute no-n8n-required walkthrough (phase 9)
@@ -275,7 +278,8 @@ n8n-operator/
 │       │   ├── handles.py          # ADR-003 — mint, bind, verify, burn
 │       │   ├── idempotency.py      # canonical JSON + argument fingerprints
 │       │   ├── redaction.py        # output redaction engine
-│       │   └── service.py          # use-case orchestration (the portable core)
+│       │   ├── service.py          # use-case orchestration (the portable core)
+│       │   └── postgres_migration.py  # SQLite -> Postgres migration orchestration (stage 01)
 │       ├── registry/               # section 6 — YAML registry
 │       │   ├── __init__.py
 │       │   ├── schema.py           # Pydantic v2 models for registry entries
@@ -293,13 +297,16 @@ n8n-operator/
 │       │   ├── __init__.py
 │       │   ├── models.py           # SQLAlchemy 2.0 ORM
 │       │   ├── repository.py       # data access, portable SQL only (ADR-004)
-│       │   ├── session.py          # engine/session lifecycle
+│       │   ├── session.py          # engine/session lifecycle, pooling, retry (stage 01)
+│       │   ├── health.py           # database connectivity probe (stage 01)
+│       │   ├── postgres_migration.py  # SQLite -> PostgreSQL copy tool (stage 01)
 │       │   └── migrations/         # Alembic
 │       │       ├── env.py
 │       │       ├── script.py.mako
 │       │       └── versions/
 │       │           ├── 0001_initial.py    # AC-24: empty DB upgrades to head
-│       │           └── 0002_approval_binding_hash.py  # phase 6, ADR-010
+│       │           ├── 0002_approval_binding_hash.py  # phase 6, ADR-010
+│       │           └── 0003_v2_foundation_schema.py   # v2 data model (stage 01)
 │       ├── audit/                  # append-only, hash-chained
 │       │   ├── __init__.py
 │       │   ├── chain.py            # chain construction + verification
@@ -1016,6 +1023,7 @@ Accepted, documented, not mitigated in v1:
 | Property | `tests/property/` | Hypothesis invariants over the same pure core (section 10.2). | Every commit |
 | Contract | `tests/contract/` | MCP tool schemas, error taxonomy, response-shaping allowlist, layering rules, doc consistency. | Every commit |
 | Integration | `tests/integration/` | Real SQLite + Alembic + a mock n8n served by `httpx.MockTransport`; full lifecycle end to end. | Every commit |
+| Postgres | `tests/integration/postgres/` marked `postgres` | Against a real, pinned PostgreSQL (v2 stage 01): pooling, statement timeout, UTC handling, health checks, a real deadlock resolved via retry, and the SQLite→Postgres migration tool. | Every commit (CI service container); opt-in locally via `N8N_OPERATOR_TEST_POSTGRES_URL` |
 | Live | `tests/integration/` marked `live_n8n` | Against a real n8n in Docker. | Opt-in, nightly |
 
 ### 10.2 Property tests (Hypothesis)
@@ -1070,7 +1078,7 @@ The invariants worth generating inputs for:
 - The argument-size check is enforced in `core/`, not in an adapter (B12).
 - The canonicalization exclusion allowlist is an explicit enumerated table; no wildcard or
   regex entry exists (CAN-03).
-- Every ADR from ADR-001 to ADR-012 exists, carries a Status and a Decision, and is
+- Every ADR from ADR-001 to ADR-019 exists, carries a Status and a Decision, and is
   referenced by at least one normative document.
 - `scripts/check_docs_consistency.py` passes: state names, transition IDs, tool
   inventory, canonicalization rules, the error taxonomy, ADR wiring, and the repository
@@ -2133,12 +2141,75 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 01 — PostgreSQL production foundation
 
-- [ ] PostgreSQL support alongside SQLite; a migration path that carries existing v1
-      SQLite data forward (ADR-004)
-- [ ] Alembic migrations for every v2 table in section 8.3, verified against both
-      backends (autogenerate produces an empty diff on each, mirroring AC-24's rule)
-- [ ] The core-portability contract test (import-graph walk, ADR-001) extended to cover
-      every new storage module without new violations
+- [x] PostgreSQL support alongside SQLite; a migration path that carries existing v1
+      SQLite data forward (ADR-004). `storage/session.py`'s `create_engine_for_url`
+      builds a dialect-appropriate engine (bounded pool, `pool_pre_ping`, `pool_recycle`,
+      a per-connection `statement_timeout`, `SET TIME ZONE 'UTC'` on PostgreSQL); every
+      value is a `Settings` field. `n8n-operator db migrate-to-postgres` (a new CLI
+      command, `core/postgres_migration.py` + `storage/postgres_migration.py`) is the
+      migration path: idempotent, dry-run, preflight row counts, checkpointed and
+      resumable, fail-closed on a non-empty destination or a source-changed-underneath-a-
+      checkpoint, and independently re-verifies the destination's audit hash chain before
+      reporting success. `storage/health.py` adds a connectivity/latency probe wired into
+      `db status`; `config.redact_database_url`/`compose_database_url` keep a password
+      out of every log line and CLI output while still supporting `env:`/`keyring:`
+      indirection for `database_password` (ADR-006).
+- [x] Alembic migrations for every v2 table in section 8.3, verified against both
+      backends (autogenerate produces an empty diff on each, mirroring AC-24's rule).
+      Migration `0003_v2_foundation_schema.py`: six new tables, three widened existing
+      tables (`principals`, `operations`, `approvals`), `batch_alter_table` throughout so
+      the same migration runs on SQLite (which cannot `ALTER TABLE ADD CONSTRAINT`
+      outside batch mode) and PostgreSQL identically, and a `server_default` backfill for
+      `approvals.quorum_count` (a `NOT NULL` column added to a table v1 already writes
+      rows into) removed again immediately after so the column's only default going
+      forward is the ORM's own Python-side one. `compare_metadata` reports an empty diff
+      against both a fresh SQLite database and a fresh PostgreSQL database
+      (`tests/integration/postgres/`). `tests/contract/test_portable_sql.py` extended
+      with every new column/table's D1-D10 expectations.
+- [x] The core-portability contract test (import-graph walk, ADR-001) extended to cover
+      every new storage module without new violations. Found and fixed a real violation
+      during this stage: an early draft of `storage/postgres_migration.py` imported
+      `core.service.verify_audit_chain` directly to compose row-copy with audit-chain
+      verification — caught by `tests/contract/test_layering.py`'s existing capability-
+      package check (storage may not import core or audit). Fixed by moving the
+      composition into a new `core/postgres_migration.py` (core orchestrates capability
+      packages; `storage/postgres_migration.py` now reports only what a storage-only
+      module can honestly report — row counts), matching how `core/service.py` already
+      composes `storage` and `audit` for `verify_audit_chain` itself.
+- [x] Production-safe connection pooling, transaction isolation, health checks,
+      statement timeouts, UTC handling, and clean shutdown. Isolation: PostgreSQL's
+      default READ COMMITTED plus the existing `state_version` optimistic-concurrency
+      guard (ADR-004 rule D7, unchanged) — no `SERIALIZABLE` needed. A new
+      `run_in_session_with_retry` primitive retries a DB-only transaction on a real
+      deadlock (SQLSTATE `40P01`) or serialization failure (`40001`), proven against an
+      actual two-transaction deadlock in `tests/integration/postgres/test_engine.py`
+      (not a simulated error code) — deliberately not wired into
+      `core/service.py`'s existing `prepare_operation`/`execute_operation` in this stage
+      (a larger behavior change than "add PostgreSQL support," and ADR-005's
+      no-automatic-retry discipline deserves its own deliberate review before any new
+      exception is added near it); used instead by the migration tool's row-copy loop,
+      where retrying is unambiguously safe. Clean shutdown: every engine this codebase
+      creates is disposed in a `finally` block, unchanged pattern, audited across the new
+      modules.
+- [x] A pinned, loopback-only Postgres integration harness and CI job.
+      `docker/postgres-test/docker-compose.yml` (postgres:16, loopback port binding,
+      named volume, disposable) for local development;
+      `.github/workflows/ci.yml`'s new `postgres` job runs the identical image as a
+      GitHub Actions service container and executes `pytest -m postgres` — a new pytest
+      marker (unlike `live_n8n`, this one **does** run in CI, since it needs no external
+      credentials or a real n8n instance). `tests/integration/postgres/`: 27 tests
+      covering an empty database, a fully populated one (every v1 operation state, one
+      approval, one execution result, one registry snapshot, a real multi-entry audit
+      chain), Unicode/JSON payload fidelity, destination-not-empty refusal, a
+      conflicting-row fail-closed case, dry-run, preflight, interrupted-copy resumption,
+      a stale-checkpoint refusal, connection pooling/statement-timeout/UTC-session/health-
+      check behavior against the real server, and the CLI command end to end including
+      password redaction. `tests/unit/test_session_retry.py` covers the retry
+      primitive's control flow without needing a database at all.
+- [x] Documentation: this checklist, ARCHITECTURE.md section 6.3, and
+      [POSTGRES_OPERATIONS.md](POSTGRES_OPERATIONS.md) (backup/restore, rollback,
+      capacity assumptions and connection-pool sizing across concurrent processes,
+      diagnosing connection exhaustion, and the five-minute local setup above).
 
 #### Stage 02 — Organizations and OIDC identity
 

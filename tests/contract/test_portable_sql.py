@@ -153,6 +153,16 @@ _EXPECTED_DATETIME_COLUMNS = {
     ("operations", "updated_at"),
     ("principals", "created_at"),
     ("registry_snapshots", "loaded_at"),
+    # v2-foundational (BUILD_PLAN section 8.3, stage 01) — schema only, unused by v1.
+    ("principals", "disabled_at"),
+    ("organizations", "created_at"),
+    ("organization_memberships", "created_at"),
+    ("organization_memberships", "removed_at"),
+    ("environments", "archived_at"),
+    ("environments", "created_at"),
+    ("notification_deliveries", "last_attempted_at"),
+    ("notification_deliveries", "delivered_at"),
+    ("audit_anchors", "published_at"),
 }
 
 
@@ -202,10 +212,14 @@ def test_no_column_is_named_like_a_naive_timestamp_string_field() -> None:
 _EXPECTED_JSON_COLUMNS = {
     "registry_snapshots": {"document"},
     "workflow_bindings": {"input_schema"},
-    "operations": {"arguments"},
+    "operations": {"arguments", "approval_policy_snapshot"},
     "operation_events": {"detail"},
     "execution_results": {"redacted_payload", "node_trace", "error"},
     "audit_log": {"detail"},
+    # v2-foundational (BUILD_PLAN section 8.3, stage 01) — schema only, unused by v1.
+    "organization_memberships": {"roles", "environment_scope"},
+    "workflow_environment_overlays": {"limits_override"},
+    "audit_anchors": {"receipt"},
 }
 
 
@@ -285,6 +299,10 @@ _EXPECTED_CHECK_CONSTRAINED_COLUMNS = {
     ("approvals", "decision"),
     ("execution_results", "status"),
     ("audit_log", "outcome"),
+    # v2-foundational (BUILD_PLAN section 8.3, stage 01) — schema only, unused by v1.
+    ("notification_deliveries", "status"),
+    ("workflow_environment_overlays", "approval_override"),
+    ("audit_anchors", "implementation"),
 }
 
 
@@ -413,11 +431,51 @@ def test_migration_0001_contains_no_forbidden_constructs() -> None:
     assert not _calls_named(path, "create_all")
 
 
+_V1_TABLES = {
+    "principals",
+    "registry_snapshots",
+    "workflow_bindings",
+    "operations",
+    "operation_events",
+    "approvals",
+    "execution_results",
+    "audit_log",
+}
+
+_V2_STAGE_01_TABLES = {
+    "organizations",
+    "organization_memberships",
+    "environments",
+    "workflow_environment_overlays",
+    "notification_deliveries",
+    "audit_anchors",
+}
+
+
 @pytest.mark.contract
 def test_migration_0001_creates_every_table_and_nothing_else() -> None:
+    """0001 is v1's complete, historical schema (BUILD_PLAN section 8.1) — a fixed set,
+    not "whatever ``Base.metadata`` currently holds": that comparison was only valid
+    while 0001 was the only migration, and stopped being the right check the moment a
+    second migration (0003) started adding tables of its own."""
     text = (VERSIONS_DIR / "0001_initial.py").read_text(encoding="utf-8")
     created = set(re.findall(r"op\.create_table\(\s*[\"'](\w+)[\"']", text))
-    assert created == set(Base.metadata.tables.keys())
+    assert created == _V1_TABLES
+
+
+@pytest.mark.contract
+def test_migration_0003_creates_every_v2_foundation_table_and_nothing_else() -> None:
+    text = (VERSIONS_DIR / "0003_v2_foundation_schema.py").read_text(encoding="utf-8")
+    created = set(re.findall(r"op\.create_table\(\s*[\"'](\w+)[\"']", text))
+    assert created == _V2_STAGE_01_TABLES
+
+
+@pytest.mark.contract
+def test_every_table_in_the_orm_is_created_by_some_migration() -> None:
+    """The complement of the two checks above: no table exists in ``Base.metadata``
+    that no migration actually creates (which would mean ``create_all`` was silently
+    relied on, or a table was declared but never wired into a migration)."""
+    assert set(Base.metadata.tables.keys()) == _V1_TABLES | _V2_STAGE_01_TABLES
 
 
 @pytest.mark.contract
