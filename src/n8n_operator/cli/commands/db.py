@@ -1,4 +1,4 @@
-"""``n8n-operator db`` — init, migrate, status.
+"""``n8n-operator db`` — init, migrate, status, migrate-to-postgres.
 
 Every command resolves the database URL via
 :func:`n8n_operator.config.resolve_database_url`, deliberately *not* through the full
@@ -25,6 +25,7 @@ Phase 1 (BUILD_PLAN section 12); default-principal seeding added in phase 9.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
@@ -37,7 +38,16 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 
 import n8n_operator.storage as storage_package
-from n8n_operator.config import resolve_database_url
+from n8n_operator.config import (
+    compose_database_url,
+    redact_database_url,
+    resolve_database_password,
+    resolve_database_url,
+)
+from n8n_operator.core.postgres_migration import MigrationReport
+from n8n_operator.core.postgres_migration import migrate as run_postgres_migration
+from n8n_operator.storage.health import check_database_health
+from n8n_operator.storage.postgres_migration import DEFAULT_CHUNK_SIZE, MigrationRefusedError
 from n8n_operator.storage.repository import PrincipalRepository
 from n8n_operator.storage.session import (
     create_engine_for_url,
@@ -160,9 +170,19 @@ def status() -> None:
     finally:
         engine.dispose()
 
-    typer.echo(f"database_url:     {database_url}")
+    typer.echo(f"database_url:     {redact_database_url(database_url)}")
     typer.echo(f"current revision: {current_revision or '(none — not initialized)'}")
     typer.echo(f"head revision:    {head_revision}")
+
+    health_engine = create_engine_for_url(database_url)
+    try:
+        health = check_database_health(health_engine)
+    finally:
+        health_engine.dispose()
+    if health.reachable:
+        typer.echo(f"connectivity:     reachable ({health.dialect}, {health.latency_ms}ms)")
+    else:
+        typer.echo(f"connectivity:     unreachable ({health.error})")
 
     if current_revision == head_revision:
         typer.echo("status: up to date")
@@ -172,6 +192,125 @@ def status() -> None:
         raise typer.Exit(code=1)
     typer.echo("status: behind head — run `n8n-operator db migrate`")
     raise typer.Exit(code=1)
+
+
+def _resolve_dest_url(dest: str) -> str:
+    """Resolve a destination URL's password the same way :class:`Settings` does for
+    ``database_url`` — ``N8N_OPERATOR_DATABASE_PASSWORD`` (``env:``/``keyring:``
+    indirection, ADR-006) substituted in if the destination URL does not already carry
+    a literal one."""
+    try:
+        password = resolve_database_password()
+        return compose_database_url(dest, password)
+    except ValueError as exc:
+        typer.secho(f"Configuration error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("migrate-to-postgres")
+def migrate_to_postgres(
+    dest: str = typer.Option(
+        ...,
+        "--dest",
+        help="Destination PostgreSQL URL (e.g. postgresql+psycopg://user@host:5432/db). "
+        "A password may be embedded, or supplied via N8N_OPERATOR_DATABASE_PASSWORD.",
+    ),
+    source: str | None = typer.Option(
+        None, "--source", help="Source SQLite URL. Defaults to the configured database_url."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the plan; write nothing to the destination."
+    ),
+    chunk_size: int = typer.Option(DEFAULT_CHUNK_SIZE, "--chunk-size", min=1),
+    checkpoint: Path | None = typer.Option(
+        None, "--checkpoint", help="Checkpoint file path. Defaults to a per-destination path."
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Continue a prior interrupted run using its checkpoint."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print a machine-readable JSON report."),
+) -> None:
+    """Copy an existing v1 SQLite database's rows onto a PostgreSQL destination, once,
+    with proof it worked (BUILD_PLAN section 8.3, ADR-004; v2 stage 01).
+
+    Idempotent and checkpointed: an interrupted run's progress is on disk, and
+    ``--resume`` continues it rather than starting over. Refuses a destination that
+    already has rows in it unless resuming a checkpoint that matches the source exactly
+    as it was. Exits ``0`` on a fully verified migration (every table's row count
+    matches, and the destination's audit hash chain re-verifies intact), ``2`` if the
+    copy completed but verification found a problem, and ``1`` on any refused or
+    misconfigured attempt — never partway through a silent success.
+    """
+    resolved_dest = _resolve_dest_url(dest)
+    resolved_source = source or _resolve_database_url_or_exit()
+
+    try:
+        report: MigrationReport = run_postgres_migration(
+            source_url=resolved_source,
+            dest_url=resolved_dest,
+            dry_run=dry_run,
+            chunk_size=chunk_size,
+            checkpoint_path=checkpoint,
+            resume=resume,
+        )
+    except MigrationRefusedError as exc:
+        typer.secho(f"Migration refused: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "dry_run": report.dry_run,
+                    "resumed": report.resumed,
+                    "ok": report.ok,
+                    "tables": [
+                        {
+                            "table": t.table_name,
+                            "source_count": t.source_count,
+                            "dest_count_before": t.dest_count_before,
+                            "rows_copied": t.rows_copied,
+                            "dest_count_after": t.dest_count_after,
+                        }
+                        for t in report.tables
+                    ],
+                    "audit_chain_ok": report.audit_chain.ok,
+                    "audit_chain_first_break_seq": report.audit_chain.first_break_seq,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        label = "DRY RUN — " if report.dry_run else ""
+        typer.echo(f"{label}source:      {redact_database_url(resolved_source)}")
+        typer.echo(f"{label}destination: {redact_database_url(resolved_dest)}")
+        for t in report.tables:
+            typer.echo(
+                f"  {t.table_name:<32} source={t.source_count:<8} "
+                f"copied={t.rows_copied:<8} dest={t.dest_count_after}"
+            )
+        if not report.dry_run:
+            chain_state = "OK" if report.audit_chain.ok else "BROKEN"
+            typer.echo(f"audit chain: {chain_state}")
+
+    if report.dry_run:
+        return
+    if report.ok:
+        if not as_json:
+            typer.secho(
+                "Migration verified: row counts match and the audit chain is intact.",
+                fg=typer.colors.GREEN,
+            )
+        return
+    if not as_json:
+        typer.secho(
+            "Migration completed but verification found a problem — do not treat the "
+            "destination as authoritative yet.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+    raise typer.Exit(code=2)
 
 
 __all__ = ["app"]
