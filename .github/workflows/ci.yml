@@ -57,6 +57,47 @@ jobs:
           name: coverage-report
           path: coverage.xml
 
+  postgres:
+    name: postgres integration harness
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: operator
+          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_DB: postgres
+        ports:
+          # Loopback only, matching docker/postgres-test/docker-compose.yml's local
+          # equivalent — this is an ephemeral, single-job runner, not a shared host.
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U operator"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Postgres integration tests
+        env:
+          N8N_OPERATOR_TEST_POSTGRES_URL: postgresql+psycopg://operator:ci_test_password@127.0.0.1:5432/postgres
+        run: >-
+          uv run pytest -m postgres
+          --cov=src/n8n_operator
+          --cov-report=term-missing
+
   package:
     name: build · clean-install smoke
     runs-on: ubuntu-latest

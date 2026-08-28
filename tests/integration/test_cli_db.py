@@ -92,8 +92,9 @@ def test_db_status_after_init_is_up_to_date(cli_env: None) -> None:
     result = runner.invoke(app, ["db", "status"])
     assert result.exit_code == 0
     assert "up to date" in result.stdout
-    assert "current revision: 0002" in result.stdout
-    assert "head revision:    0002" in result.stdout
+    assert "current revision: 0003" in result.stdout
+    assert "head revision:    0003" in result.stdout
+    assert "connectivity:     reachable" in result.stdout
 
 
 @pytest.mark.integration
@@ -264,12 +265,13 @@ def test_no_secret_setting_names_appear_in_any_db_command_output(cli_env: None) 
 
 
 @pytest.mark.integration
-def test_db_help_lists_all_three_subcommands() -> None:
+def test_db_help_lists_all_four_subcommands() -> None:
     result = runner.invoke(app, ["db", "--help"])
     assert result.exit_code == 0
     assert "init" in result.stdout
     assert "migrate" in result.stdout
     assert "status" in result.stdout
+    assert "migrate-to-postgres" in result.stdout
 
 
 @pytest.mark.integration

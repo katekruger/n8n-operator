@@ -1,0 +1,32 @@
+name: n8n-operator-postgres-test
+
+# A disposable PostgreSQL instance for the pinned, loopback-only Postgres integration
+# harness (tests/integration/postgres/, marked `postgres`; BUILD_PLAN section 10.1).
+# Never targets production: a fresh named volume scoped to this project name only,
+# loopback-only port binding, no shared network with anything else on the host, and
+# nothing here reads or writes the operator's own SQLite database or registry.
+#
+# Pinned to the same major version (16) CI's service container uses
+# (.github/workflows/ci.yml) so a local run and CI exercise the same server behavior.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: n8n-operator-postgres-test
+    ports:
+      # Loopback only — never expose this test instance beyond the local machine.
+      - "127.0.0.1:55432:5432"
+    environment:
+      - POSTGRES_USER=operator
+      - POSTGRES_PASSWORD=operator_test_password
+      - POSTGRES_DB=postgres
+    volumes:
+      - n8n-operator-postgres-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  n8n-operator-postgres-test-data:
