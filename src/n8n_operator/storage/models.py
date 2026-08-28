@@ -41,7 +41,7 @@ from typing import Any
 from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.types import JSON, DateTime, Integer, String, TypeDecorator
+from sqlalchemy.types import JSON, Boolean, DateTime, Integer, String, TypeDecorator
 from ulid import ULID
 
 # --------------------------------------------------------------------------------------
@@ -148,7 +148,15 @@ def _nullable_enum_check(column: str, values: tuple[str, ...], *, name: str) -> 
 
 
 class Principal(Base):
-    """Who acted (BUILD_PLAN 8.1). v1 holds exactly one row, ``kind='local'``."""
+    """Who acted (BUILD_PLAN 8.1). v1 holds exactly one row, ``kind='local'``.
+
+    ``external_issuer``/``disabled_at`` are v2-foundational (BUILD_PLAN section 8.3,
+    stage 01): schema only, unused by any v1 code path. Identity in v2 is the pair
+    ``(external_issuer, external_subject)``, never ``external_subject`` alone
+    (ADR-014) — v1 never populates either column. ``disabled_at`` is checked live on
+    every call once v2 authorization lands (stage 02); it has no effect while nothing
+    reads it.
+    """
 
     __tablename__ = "principals"
     __table_args__ = (_enum_check("kind", ("local", "user", "service"), name="ck_principals_kind"),)
@@ -157,6 +165,8 @@ class Principal(Base):
     kind: Mapped[str] = mapped_column(String, nullable=False)
     display_name: Mapped[str] = mapped_column(String, nullable=False)
     external_subject: Mapped[str | None] = mapped_column(String, nullable=True)
+    external_issuer: Mapped[str | None] = mapped_column(String, nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
 
 
@@ -230,6 +240,8 @@ class Operation(Base):
         Index("ix_operations_principal_id", "principal_id"),
         Index("ix_operations_snapshot_id", "snapshot_id"),
         Index("ix_operations_parent_operation_id", "parent_operation_id"),
+        Index("ix_operations_organization_id", "organization_id"),
+        Index("ix_operations_environment_id", "environment_id"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -251,6 +263,16 @@ class Operation(Base):
     parent_operation_id: Mapped[str | None] = mapped_column(
         ForeignKey("operations.id"), nullable=True
     )
+    # v2-foundational (BUILD_PLAN section 8.3, stage 01): schema only. BUILD_PLAN
+    # describes organization_id as "not null in v2" at the application level once
+    # stage 02 (organizations) exists to populate it; the column itself must stay
+    # nullable here, or every v1 write path (which knows nothing of organizations)
+    # would fail its NOT NULL constraint today.
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organizations.id"), nullable=True
+    )
+    environment_id: Mapped[str | None] = mapped_column(ForeignKey("environments.id"), nullable=True)
+    approval_policy_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
 
@@ -291,12 +313,21 @@ class Approval(Base):
     __table_args__ = (
         _nullable_enum_check("decision", ("approved", "rejected"), name="ck_approvals_decision"),
         Index("ix_approvals_operation_id", "operation_id"),
+        # v2-foundational (BUILD_PLAN section 8.3, stage 01): once team-approval quorum
+        # writes multiple decision rows per operation (stage 05), no two rows may carry
+        # the same (operation_id, decided_by) pair (ADR-017 section 3). Safe to add now:
+        # v1 writes exactly one row per operation via ApprovalRepository.create, and
+        # decided_by starts NULL (plain SQL NULL-uniqueness means it never collides,
+        # the same rule documented on the idempotency-namespace constraint above) and
+        # is set exactly once by record_decision — never a second insert.
+        UniqueConstraint("operation_id", "decided_by", name="uq_approvals_operation_decided_by"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
     operation_id: Mapped[str] = mapped_column(ForeignKey("operations.id"), nullable=False)
     token_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     binding_hash: Mapped[str] = mapped_column(String, nullable=False)
+    quorum_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
@@ -357,20 +388,191 @@ class AuditLogEntry(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 
+class Organization(Base):
+    """The v2 tenant / isolation boundary (BUILD_PLAN section 8.3, ADR-013).
+
+    v2-foundational: schema only, stage 01. No v1 code path creates, reads, or
+    references a row here — organizations exist starting stage 02.
+    """
+
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
+
+
+class OrganizationMembership(Base):
+    """The RBAC grant: which roles a principal holds in an organization, and over what
+    workflow/environment scope (BUILD_PLAN section 8.3, ADR-013, ADR-015).
+
+    v2-foundational: schema only, stage 01. ``active_organization_id`` is a portable
+    stand-in for "unique on (principal_id, organization_id) while removed_at IS NULL"
+    (ADR-004 forbids partial/filtered indexes, rule D4) — the same plain-SQL
+    NULL-uniqueness technique the ``operations`` idempotency-namespace constraint
+    already relies on (see the module docstring), applied here instead of there.
+    Whichever stage-03 code creates or removes a membership is responsible for keeping
+    ``active_organization_id`` in lock-step with ``removed_at``: equal to
+    ``organization_id`` while the membership is active, ``NULL`` once removed. The
+    ``uq_organization_memberships_active`` constraint enforces the *uniqueness* the
+    database can guarantee (no two active rows collide); keeping the two columns
+    consistent with each other is the same kind of repository-layer discipline
+    ``state_version`` already requires from every ``operations`` writer.
+    """
+
+    __tablename__ = "organization_memberships"
+    __table_args__ = (
+        UniqueConstraint(
+            "principal_id", "active_organization_id", name="uq_organization_memberships_active"
+        ),
+        Index("ix_organization_memberships_principal_id", "principal_id"),
+        Index("ix_organization_memberships_organization_id", "organization_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), nullable=False)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False)
+    active_organization_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    roles: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    workflow_scope: Mapped[str] = mapped_column(String, nullable=False)
+    environment_scope: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
+    removed_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+
+class Environment(Base):
+    """One named n8n instance within an organization (BUILD_PLAN section 8.3, ADR-016).
+
+    v2-foundational: schema only, stage 01. ``n8n_base_url_ref``/``n8n_api_key_ref``
+    carry the same ``env:``/``keyring:`` indirection ``config.py`` already requires for
+    ``n8n_api_key`` (ADR-006) and the registry's ``trigger.secret_ref`` (rule R6) —
+    never a literal URL or key in this column once stage 04 starts writing it.
+    """
+
+    __tablename__ = "environments"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_environments_organization_name"),
+        Index("ix_environments_organization_id", "organization_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    n8n_base_url_ref: Mapped[str] = mapped_column(String, nullable=False)
+    n8n_api_key_ref: Mapped[str] = mapped_column(String, nullable=False)
+    is_production: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
+
+
+class WorkflowEnvironmentOverlay(Base):
+    """A per-environment override of a registry entry's reachability/strictness — never
+    its contract (BUILD_PLAN section 8.3, ADR-016, rules R13-R14).
+
+    v2-foundational: schema only, stage 01. ``workflow_id`` has no foreign key, exactly
+    like ``operations.workflow_id`` above — the registry itself is not a queryable table
+    with its own primary key, only a plain string this column indexes against.
+    """
+
+    __tablename__ = "workflow_environment_overlays"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id", "environment_id", name="uq_workflow_environment_overlays_workflow_env"
+        ),
+        _nullable_enum_check(
+            "approval_override", ("required",), name="ck_workflow_environment_overlays_approval"
+        ),
+        Index("ix_workflow_environment_overlays_workflow_id", "workflow_id"),
+        Index("ix_workflow_environment_overlays_environment_id", "environment_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    workflow_id: Mapped[str] = mapped_column(String, nullable=False)
+    environment_id: Mapped[str] = mapped_column(ForeignKey("environments.id"), nullable=False)
+    n8n_workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    definition_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    trigger_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    trigger_secret_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    approval_override: Mapped[str | None] = mapped_column(String, nullable=True)
+    limits_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class NotificationDelivery(Base):
+    """One delivery attempt record for the ``NotificationSink`` interface — approval
+    routing and alert hooks alike (BUILD_PLAN section 8.3, ADR-018).
+
+    v2-foundational: schema only, stage 01.
+    """
+
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (
+        _enum_check(
+            "status",
+            ("delivered", "failed", "pending"),
+            name="ck_notification_deliveries_status",
+        ),
+        Index("ix_notification_deliveries_subject_id", "subject_id"),
+        Index("ix_notification_deliveries_principal_id", "principal_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    subject_type: Mapped[str] = mapped_column(String, nullable=False)
+    subject_id: Mapped[str] = mapped_column(String, nullable=False)
+    principal_id: Mapped[str | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+
+class AuditAnchor(Base):
+    """One receipt from ``AuditAnchor.publish`` — content-free, pins chain state only
+    (BUILD_PLAN section 8.3, ADR-012 section 2).
+
+    v2-foundational: schema only, stage 01. Implemented starting stage 09.
+    """
+
+    __tablename__ = "audit_anchors"
+    __table_args__ = (
+        _enum_check(
+            "implementation",
+            ("local_file", "https_webhook"),
+            name="ck_audit_anchors_implementation",
+        ),
+        Index("ix_audit_anchors_covers_through_seq", "covers_through_seq"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    covers_through_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_hash: Mapped[str] = mapped_column(String, nullable=False)
+    implementation: Mapped[str] = mapped_column(String, nullable=False)
+    receipt: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    published_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
+    publish_failed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
 __all__ = [
     "GENESIS_HASH",
     "STATES",
     "TRANSITIONS",
     "Approval",
+    "AuditAnchor",
     "AuditLogEntry",
     "Base",
+    "Environment",
     "ExecutionResult",
+    "NotificationDelivery",
     "Operation",
     "OperationEvent",
+    "Organization",
+    "OrganizationMembership",
     "Principal",
     "RegistrySnapshot",
     "UTCDateTime",
     "WorkflowBinding",
+    "WorkflowEnvironmentOverlay",
     "new_ulid",
     "utc_now",
 ]
