@@ -19,23 +19,23 @@ approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.*
 > **Status: v1 release candidate, public repository, pre-release GitHub tag.** All
 > nine product phases are implemented and the local release gate is green: registry,
 > MCP server (stdio + Streamable HTTP), n8n integration, execution, and the full
-> operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). A GitHub
-> Release exists as a marked pre-release; **PyPI publishing is deliberately deferred**
-> (`.github/workflows/release.yml`'s `pypi` job is disabled until a PyPI trusted
-> publisher is registered). Two things remain before a final, non-candidate v1.0.0:
-> actually running the reproducible, Docker-based live-n8n harness
-> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) against a real instance, and a
-> real hosted OpenAI connector call. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md)
-> section 12 for the phase checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md)
-> for what v1 deliberately does not do, and [CHANGELOG.md](CHANGELOG.md) for the full
-> history.
+> operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). The
+> reproducible, Docker-based live-n8n harness
+> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) has been run for real
+> (2026-08-28, 8/8 passed). A GitHub Release exists as a marked pre-release; **PyPI
+> publishing is deliberately deferred** (`.github/workflows/release.yml`'s `pypi` job
+> is disabled until a PyPI trusted publisher is registered). One thing remains before
+> a final, non-candidate v1.0.0: a real hosted OpenAI connector call. See
+> [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
+> [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
+> do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 | Client / target | Transport | Evidence |
 |---|---|---|
 | MCP stdio clients (Claude Desktop and similar) | stdio | ✅ Automated on every CI push — `scripts/release_smoke.sh` runs a full MCP session against the built wheel (reference `mcp` Python client v2.1.1, last verified 2026-08-28) |
 | Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified (phase 9, one-time manual run) |
 | OpenAI Responses API `mcp` tool shape | Streamable HTTP | 🟢 Automated on every CI test run — a real MCP session against the documented `Authorization`+`Origin` `headers` shape, with bearer/Origin enforcement exercised (`tests/integration/test_mcp_http_openai_compat.py`); 🟡 an actual hosted OpenAI request is still pending a public TLS endpoint and credentials |
-| n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; repeatable live gate available |
+| n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; the repeatable Docker harness has been run for real (2026-08-28, 8/8 passed) — see [docs/COMPATIBILITY_MATRIX.md](docs/COMPATIBILITY_MATRIX.md) |
 
 <sub>"MCP session verified" always means the reference `mcp` protocol client, not a
 vendor's own GUI application — Claude Desktop's own process has not been separately
