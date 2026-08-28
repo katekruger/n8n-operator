@@ -31,7 +31,14 @@ bound to a specific principal, workflow, argument fingerprint, and approval.**
    `op_<ULID>`, which is the handle.
 2. The handle is bound at mint time to `(principal_id, workflow_id, definition_hash,
    argument_fingerprint)`. `argument_fingerprint` is `sha256` over canonical JSON of the
-   arguments as submitted.
+   arguments as submitted. This is a deterministic integrity/equality fingerprint, not
+   password hashing or a confidentiality control. Determinism is required so the value
+   can be recomputed at execution and compared with the value approved at preparation.
+   In v1, the same payload is necessarily retained for dispatch and execute-time
+   verification, so an unkeyed fingerprint does not expose a preimage that the operation
+   store does not already contain. A future storage model that encrypts or removes raw
+   arguments must revisit this choice—preferably with a versioned keyed HMAC—rather than
+   treating the fingerprint as redaction.
 3. Possessing a handle is not authority. Authority is the operation reaching `APPROVED`,
    which for anything above `read_only` requires a human acting out-of-band.
 4. `execute_operation(operation_id, handle)` verifies the binding, the state, the
