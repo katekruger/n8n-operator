@@ -38,6 +38,13 @@ ADRS = [
     "ADR-010-approval-delivery-and-expiry.md",
     "ADR-011-argument-limits-and-idempotency.md",
     "ADR-012-governed-retry-and-audit-anchoring.md",
+    "ADR-013-organization-tenant-and-principal-model.md",
+    "ADR-014-oidc-trust-and-session-model.md",
+    "ADR-015-rbac-authorization-evaluation.md",
+    "ADR-016-environment-registry-overlays.md",
+    "ADR-017-team-approval-quorum-semantics.md",
+    "ADR-018-notification-and-alert-hook-delivery.md",
+    "ADR-019-metrics-cardinality-and-privacy.md",
 ]
 
 # Decisions closed in phase 0.1, and the identifier each one is obliged to introduce into
