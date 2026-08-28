@@ -16,6 +16,12 @@ All notable changes to this project are documented here. The format follows
   require revisiting it with a versioned keyed HMAC. The corresponding CodeQL false
   positive was reviewed and dismissed with that rationale.
 
+### Added
+
+- An ordered set of twelve gated Claude Code prompts under `docs/build-prompts/v2/` that
+  turns Phase 10 into reviewable platform, security, usability, GTM-adoption, and release
+  stages while preserving the v1 safety model and v3 scope boundary.
+
 ## [1.0.0-rc3] - 2026-08-28
 
 ### Added
