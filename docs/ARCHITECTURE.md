@@ -395,7 +395,113 @@ Designed in now, unimplemented until their version:
 
 ---
 
-## 11. What this architecture deliberately does not do
+## 11. v2 user journeys
+
+Three journeys the v2 outcome (BUILD_PLAN section 2.2) exists to serve, each walked
+end to end against the contracts in [MCP_TOOLS.md](MCP_TOOLS.md) section 5 and the
+ADRs cited inline. Each is also a row group in
+[V2_TRACEABILITY.md](V2_TRACEABILITY.md).
+
+### 11.1 A startup GTM engineer operating staging and production
+
+A five-person startup has one n8n instance's workflows split across a `staging` and a
+`production` environment in one organization. The GTM engineer holds `operator` scoped
+to `crm.*` in both environments and `approver` scoped to `mkt.*` in `staging` only.
+
+1. `whoami` — one organization, two environments, the two scoped roles above
+   ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md),
+   [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)).
+2. `list_environments` — `staging` and `production`, neither archived.
+3. `prepare_operation` for `crm.sync_contact` with no `environment` argument —
+   `ENVIRONMENT_REQUIRED`: two environments exist, and production is never implicit
+   ([ADR-016](adr/ADR-016-environment-registry-overlays.md) section 3). The engineer
+   names `staging`; the workflow's `staging` overlay applies, its `approval: none`
+   (unchanged from base) executes without waiting.
+4. The same call against `production` — the base registry entry, no overlay for this
+   workflow in `production`, requires human approval; `request_approval` routes to the
+   org's `approver`s for `crm.*` in `production` — a role the GTM engineer does not
+   hold there, so someone else on the team decides.
+5. A `mkt.campaign_sync` operation prepared in `production` by anyone: the engineer,
+   asked to approve it, is not in the operation's `approval_policy_snapshot` — their
+   `approver` role is scoped to `staging` only — and `request_approval` correctly never
+   notifies them for this one.
+
+What this exercises: implicit-environment refusal (AC-37), workflow×environment
+role-scope intersection (AC-39), and overlay-scoped approval policy differing by
+environment for the identical workflow ID.
+
+### 11.2 A RevOps team requiring two-person approval for a bulk CRM update
+
+A RevOps team of four runs `crm.bulk_update_stage` — `side_effects: external_write`,
+`risk: high` — against `production`, with an org policy requiring 2 of the team's 3
+`approver`-scoped principals to sign off before any bulk update executes.
+
+1. `prepare_operation` reaches `PENDING_APPROVAL`; the requester is one of the four
+   and holds `approver` themselves, but the write-time
+   `approval_policy_snapshot` structurally excludes them from their own request's
+   eligible-approver list — no self-approval, by construction, not by a check that
+   could be skipped ([ADR-017](adr/ADR-017-team-approval-quorum-semantics.md)
+   section 1).
+2. `request_approval` notifies the remaining three eligible approvers over the
+   `NotificationSink` webhook — event type, operation ID, and a fetch reference only,
+   never the bulk update's actual argument list
+   ([ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md) section 4).
+3. Two approvers decide `approve` via the CLI (the actual decision, out-of-band, never
+   an MCP tool call — boundary B4 unchanged from v1); `get_approval_status` shows
+   `quorum_count: 2`, two decisions in, `ready: true`. The operation moves `APPROVED`
+   (T06).
+4. The third approver, unaware quorum was already reached, later tries to decide
+   anyway — irrelevant to quorum, but if they attempt a *second* decision on an
+   operation they'd already decided earlier in a different scenario, that call returns
+   `APPROVAL_ALREADY_DECIDED`, changing nothing (ADR-017 section 3).
+5. Mid-approval, an admin removes one of the three approvers from the org for an
+   unrelated reason. The snapshot is unaffected — quorum was already satisfied by the
+   other two — and even if it had not been, the removed approver's un-cast slot would
+   simply become unfillable, never re-expanding to admit a replacement
+   (invariant I13, ADR-017 section 1).
+6. `execute_operation` dispatches exactly once, identically to v1's single-approver
+   path — quorum changes who must agree, never what happens after agreement.
+
+What this exercises: self-dealing exclusion, snapshot immutability under mid-flight
+membership churn, duplicate-decision rejection, and content-free notification delivery
+(AC-40, AC-41, AC-49).
+
+### 11.3 Marketing operations investigating campaign-sync drift or a failed enrichment run
+
+A marketing-ops analyst holds `viewer` scoped to `mkt.*` across both environments — no
+`operator` or `approver` — and is asked why last night's `mkt.enrich_leads` run failed
+and whether `mkt.campaign_sync`'s live n8n definition still matches what is registered.
+
+1. `list_audit_events` filtered to `mkt.enrich_leads`, cursor-paginated — every event
+   the analyst is authorized to see for workflows in their scope, and nothing for any
+   workflow outside it: an unauthorized workflow's events are absent from the result
+   entirely, not present-and-redacted (ADR-012 section 3,
+   [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)). The failed operation's ID
+   surfaces here.
+2. `get_execution_log` on that operation ID — the failing node and its error message,
+   unchanged from v1 (AC-15) — enough to tell the analyst *what* broke without needing
+   `operator` access to have caused it.
+3. `get_metrics` for `mkt.*` over the `24h` window — success/failure counts and
+   latency percentiles, pre-filtered to the analyst's authorized workflow set before
+   any aggregation runs, so a struggling *other* team's workflow never appears in a
+   total the analyst sees ([ADR-019](adr/ADR-019-metrics-cardinality-and-privacy.md)
+   section 1). `mkt.enrich_leads`'s p95 shows `null` with
+   `"reason": "insufficient_sample"` — it runs rarely enough that ten executions
+   haven't accumulated in the window (ADR-019 section 4); the analyst reads the raw
+   failure event from step 1–2 instead, which is exactly the tool for that.
+4. `diff_workflow_definition` on `mkt.campaign_sync` against `production` — a
+   structural diff against the registered `definition_hash`
+   ([ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)), confirming
+   whether the sync workflow itself has drifted or whether last night's failure was
+   transient. `viewer` is sufficient for this call — no write capability is needed to
+   ask "did this change."
+
+What this exercises: `viewer`-role read scope across the full v2 monitoring surface
+without any `operator`/`approver` grant, metrics privacy filtering ahead of
+aggregation, and the percentile sample-size floor surfacing an honest "not enough
+data" rather than a misleading number (AC-42, AC-43, AC-44).
+
+## 12. What this architecture deliberately does not do
 
 - **No plugin system.** Extensibility would mean loading operator-supplied code into
   the trusted zone. The registry is the extension mechanism.
