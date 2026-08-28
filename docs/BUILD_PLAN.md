@@ -217,6 +217,21 @@ n8n-operator/
 │   ├── V1_LIMITATIONS.md           # plain-language index of v1 boundaries (phase 9)
 │   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
 │   ├── RELEASE_ROLLBACK.md         # rollback/yank procedure for a bad release (phase 9)
+│   ├── build-prompts/
+│   │   └── v2/                       # ordered, gated Claude Code implementation prompts
+│   │       ├── README.md
+│   │       ├── 00-baseline-and-v2-contracts.md
+│   │       ├── 01-postgresql-production-foundation.md
+│   │       ├── 02-organizations-and-oidc-identity.md
+│   │       ├── 03-rbac-and-authorization-boundaries.md
+│   │       ├── 04-multi-environment-registry.md
+│   │       ├── 05-team-approvals-and-routing.md
+│   │       ├── 06-governed-retry-and-reconciliation.md
+│   │       ├── 07-structural-workflow-diffs.md
+│   │       ├── 08-metrics-audit-query-and-alert-hooks.md
+│   │       ├── 09-external-audit-anchoring.md
+│   │       ├── 10-gtm-starter-kits-and-onboarding.md
+│   │       └── 11-v2-integration-release-and-proof.md
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
