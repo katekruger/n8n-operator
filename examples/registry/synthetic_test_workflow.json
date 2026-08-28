@@ -1,4 +1,5 @@
 {
+  "id": "opTestWorkflow0",
   "name": "n8n Operator — synthetic test workflow",
   "nodes": [
     {
