@@ -2,11 +2,19 @@
 # Start the isolated live-n8n compatibility harness (docs/LIVE_N8N_TESTING.md).
 #
 # Automates everything n8n exposes a supported, non-UI interface for: bringing up a
-# pinned, isolated instance and importing + activating the synthetic test workflow via
-# the n8n CLI (which operates directly against the instance's own database and needs no
-# API key or logged-in session). n8n has no documented REST/CLI endpoint for first-run
+# pinned, isolated instance and importing the synthetic test workflow via the n8n CLI
+# (which operates directly against the instance's own database and needs no API key or
+# logged-in session). n8n has no documented REST/CLI endpoint for first-run
 # owner-account setup or API-key creation — both are UI-only — so this script stops
-# short of those and prints the one manual step required to finish.
+# short of those and prints the manual steps required to finish.
+#
+# Activation is also attempted via the CLI here, but — confirmed empirically against a
+# real 2.35.7 instance — neither `update:workflow --active=true` nor its replacement
+# `publish:workflow` actually registers the webhook trigger in the *running* n8n
+# process; both only write the database row a separate, short-lived CLI process reads
+# and writes. Only the UI's own Active toggle (which goes through the live process's
+# own activation code path) reliably registers it, so that toggle is listed as a
+# required manual step below rather than silently left broken.
 #
 # Rerunnable: `docker compose up -d` is idempotent, and re-importing the same workflow
 # JSON updates the existing entry (matched by id) rather than duplicating it.
@@ -67,19 +75,24 @@ if [[ -z "${WORKFLOW_ID:-}" ]]; then
 else
   echo "Imported workflow ID: $WORKFLOW_ID"
   docker exec "$CONTAINER_NAME" n8n update:workflow --id="$WORKFLOW_ID" --active=true
-  echo "Activated workflow $WORKFLOW_ID."
+  echo "Set the database's active flag for workflow $WORKFLOW_ID (see the note above —"
+  echo "this alone does not register the webhook; the UI toggle step below still does)."
 fi
 
 cat <<EOF
 
-=== One manual step remains ===
-n8n has no documented REST or CLI path to create the first owner account or an API
-key — both are UI-only. Finish setup, then export the four variables the live suite
-needs:
+=== Manual steps remain ===
+n8n has no documented REST or CLI path to create the first owner account, an API key,
+or (empirically, despite CLI commands that claim to) reliably activate a workflow's
+webhook trigger against the already-running process — all three are UI-only in
+practice. Finish setup, then export the four variables the live suite needs:
 
   1. Open http://127.0.0.1:5678 and complete the one-time owner account setup.
   2. Go to Settings > n8n API > Create an API Key.
-  3. Then run:
+  3. Open the imported workflow and toggle it Active (top-right switch) — if it
+     already shows Active, toggle it off then on anyway, to force the running
+     process to actually register the webhook.
+  4. Then run:
 
        export N8N_LIVE_BASE_URL=http://127.0.0.1:5678
        export N8N_LIVE_API_KEY=<the key you just created>

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "ExecutionSummary",
@@ -63,6 +63,16 @@ class WorkflowDefinition(BaseModel):
     connections: dict[str, Any]
     settings: dict[str, Any] = Field(default_factory=dict)
     pinData: dict[str, Any] = Field(default_factory=dict)  # noqa: N815 - matches n8n's own JSON field name verbatim
+
+    @field_validator("settings", "pinData", mode="before")
+    @classmethod
+    def _null_becomes_empty(cls, value: Any) -> Any:
+        """n8n returns these as an explicit JSON ``null``, not an omitted key, when a
+        workflow has never had one set — confirmed empirically against a real 2.35.7
+        instance (a ``Field(default_factory=...)`` only applies when the key is
+        *absent*, not when it is present with a ``null`` value, so without this the
+        field would fail validation outright)."""
+        return {} if value is None else value
 
 
 class ExecutionSummary(BaseModel):

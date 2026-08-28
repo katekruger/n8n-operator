@@ -138,6 +138,30 @@ def test_get_workflow_returns_the_raw_dict(mock_n8n: MockN8n, client: N8nClient)
 
 
 @pytest.mark.integration
+def test_get_workflow_accepts_null_pindata_and_settings(
+    mock_n8n: MockN8n, client: N8nClient
+) -> None:
+    """n8n returns ``pinData``/``settings`` as an explicit JSON ``null`` — not an
+    omitted key — for a workflow that's never had either set, confirmed empirically
+    against a real 2.35.7 instance. A response carrying ``null`` must validate exactly
+    like one omitting the key entirely, not raise ``ProviderError``."""
+    definition = {
+        "id": "n8n-null-fields",
+        "name": "Test",
+        "active": True,
+        "nodes": [
+            {"id": "a", "name": "Webhook", "type": "n8n-nodes-base.webhook", "parameters": {}}
+        ],
+        "connections": {},
+        "settings": None,
+        "pinData": None,
+    }
+    mock_n8n.add_workflow("n8n-null-fields", definition)
+    result = client.get_workflow("n8n-null-fields")
+    assert result == definition
+
+
+@pytest.mark.integration
 def test_get_workflow_raises_missing_on_404(client: N8nClient) -> None:
     with pytest.raises(WorkflowMissingOnInstanceError):
         client.get_workflow("does-not-exist")

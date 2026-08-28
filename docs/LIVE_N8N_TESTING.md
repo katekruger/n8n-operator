@@ -17,14 +17,22 @@ scripts/live_n8n_up.sh
 ```
 
 This automates everything n8n exposes a supported, non-UI interface for: it starts the
-container, waits for `/healthz`, and imports and activates the synthetic workflow via
-the n8n CLI (which writes directly to the instance's own database and needs no
-credential). **One manual step remains** — n8n has no documented REST or CLI path to
-create the first owner account or an API key; both require the web UI:
+container, waits for `/healthz`, and imports the synthetic workflow via the n8n CLI
+(which writes directly to the instance's own database and needs no credential). It also
+attempts activation via the CLI — but confirmed empirically against a real 2.35.7
+instance, neither `update:workflow --active=true` nor its replacement `publish:workflow`
+actually registers the webhook trigger in the *running* n8n process; both only write a
+database row a separate, short-lived CLI process reads and writes. **Manual steps
+remain** — n8n has no documented REST or CLI path to create the first owner account or
+an API key (both require the web UI), and only the UI's own Active toggle reliably
+registers the webhook:
 
 1. Open `http://127.0.0.1:5678` and complete the one-time owner account setup.
 2. **Settings → n8n API → Create an API Key.**
-3. Export the four variables the suite reads (`scripts/live_n8n_up.sh` prints this
+3. Open the imported workflow and toggle it **Active** (top-right switch) — if it
+   already shows Active, toggle it off then on anyway, to force the running process to
+   actually register the webhook.
+4. Export the four variables the suite reads (`scripts/live_n8n_up.sh` prints this
    block with the workflow ID it already resolved):
 
    ```bash
