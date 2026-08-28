@@ -303,6 +303,42 @@ the canonical serialization of its own fields together with the previous entry's
 `audit/chain.py` verifies a range and reports the first break by sequence number.
 Tamper-evidence, not tamper-proofing — see BUILD_PLAN section 9.4.
 
+### 6.3 PostgreSQL (v2, stage 01)
+
+`storage/session.py`'s `create_engine_for_url` builds a dialect-appropriate engine: the
+SQLite pragmas above on SQLite, a bounded `QueuePool` with `pool_pre_ping` and
+`pool_recycle` plus a per-connection `statement_timeout` and an explicit `SET TIME ZONE
+'UTC'` on PostgreSQL — all connection/engine-setup concerns, none of it schema
+(the same "configured at connection setup only" discipline the SQLite pragmas already
+follow, ADR-004 rule D9, extended to the second dialect). Every value is a `Settings`
+field (`database_pool_size`, `database_statement_timeout_seconds`, etc.) — see
+[POSTGRES_OPERATIONS.md](POSTGRES_OPERATIONS.md) for tuning guidance and connection
+budgeting across concurrent processes.
+
+`storage/health.py`'s `check_database_health` opens one connection, times a trivial
+query, and reports reachability/latency/pool occupancy — never `database_url` itself
+(that's `config.redact_database_url`'s job, used everywhere the URL is displayed:
+`db status`, `migrate-to-postgres`'s own output). `db status` calls both.
+
+`storage/session.py`'s `run_in_session_with_retry` retries a DB-only transaction on a
+transient PostgreSQL deadlock or serialization failure (or SQLite lock contention) with
+a fresh session, bounded attempts, and no retry of anything that is not itself a
+transient error (a constraint violation propagates on the first attempt). It is not
+wired into `core/service.py`'s existing `prepare_operation`/`execute_operation` paths —
+a deliberate scope boundary for this stage, not an oversight — but is used by the
+SQLite-to-PostgreSQL migration tool's row-copy loop, where retrying a failed chunk is
+unambiguously safe (no external side effect has occurred; see ADR-005's no-automatic-
+retry discipline, which this primitive is careful never to cross into the n8n-dispatch
+boundary).
+
+`core/postgres_migration.py` orchestrates the one-time data copy: `storage/
+postgres_migration.py` (a `storage`-capability module, so it may not import `audit/` or
+`core/` — ARCHITECTURE.md section 2.1) copies rows and reports counts; `core/
+postgres_migration.py` composes that with an independent re-verification of the
+destination's audit hash chain (`core/service.py`'s existing `verify_audit_chain`), the
+same layering split every other cross-capability use case in this codebase follows. See
+[POSTGRES_OPERATIONS.md](POSTGRES_OPERATIONS.md) for the operator-facing walkthrough.
+
 ---
 
 ## 7. Configuration
