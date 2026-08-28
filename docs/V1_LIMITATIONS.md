@@ -128,10 +128,14 @@ is tested through the FastAPI test client, not a real browser) — BUILD_PLAN se
 BUILD_PLAN section 10.1's fourth layer exists in `tests/live/` and is runnable locally
 or through the manual `Live n8n compatibility` GitHub Actions workflow. `docker/live-n8n/`
 + `scripts/live_n8n_up.sh` fully automate standing up a pinned, isolated instance and
-importing and activating the synthetic workflow — but n8n has no documented REST or CLI
-path to create the first owner account or an API key; both are UI-only. One person has
-to click through that once per instance before the suite can authenticate at all. See
-[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md) for the exact procedure.
+importing, publishing, and activating the synthetic workflow (including a container
+restart, required because n8n only builds its webhook routing table at process boot —
+see [`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md) for the full mechanism) — but n8n has
+no documented REST or CLI path to create the first owner account or an API key; both
+are UI-only. One person has to click through that once per instance before the suite
+can authenticate at all. **Run for real against a fresh instance on 2026-08-28: 8/8
+passed** — see [`COMPATIBILITY_MATRIX.md`](COMPATIBILITY_MATRIX.md) for the evidence
+and the two real bugs that run found and fixed.
 
 The suite verifies instance health, authenticated workflow retrieval (with an exact
 workflow-ID match), active status, deterministic definition hashing, webhook dispatch,

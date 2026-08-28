@@ -9,6 +9,17 @@ summarizes it and states what is and isn't covered at a glance.
 | n8n version | Method | Result |
 |---|---|---|
 | **2.35.7** | Live spike against a real, local-only instance (phase 4) — every finding in [N8N_COMPATIBILITY.md](N8N_COMPATIBILITY.md) is a captured request/response pair, not a guess. | Fully compatible — every feature below verified working. |
+| **2.35.7** | Repeatable Docker harness ([`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md)), 2026-08-28 — a real, freshly stood-up instance, `scripts/live_n8n_up.sh`, `uv run pytest -m live_n8n -v` | **8/8 passed.** Found and fixed two real compatibility bugs in the process — see below. |
+
+**What the repeatable-harness run found that the original phase-4 spike didn't:**
+n8n 2.35.7 returns `pinData`/`settings` as an explicit JSON `null` (not an omitted
+key) for a workflow that's never had either set — `WorkflowDefinition`
+(`src/n8n_operator/n8n/types.py`) now coerces `None` to `{}` for both. And a webhook
+node's trigger is registered by the running n8n process using its `webhookId` field as
+the real lookup key, not the declared `path` alone — a webhook node imported without
+one (as `examples/registry/synthetic_test_workflow.json` originally was) never gets
+its route registered, regardless of activation method. Full story:
+[`LIVE_N8N_TESTING.md`](LIVE_N8N_TESTING.md).
 
 **This is one version, tested once.** Everything below this line describes what was
 empirically confirmed against 2.35.7. Operator uses only the stable, documented n8n

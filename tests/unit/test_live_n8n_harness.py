@@ -7,6 +7,7 @@ it (BUILD_PLAN section 12, phase 9 continuation: live-n8n reproducibility).
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker" / "live-n8n" / "docker-compose.yml"
 UP_SCRIPT = REPO_ROOT / "scripts" / "live_n8n_up.sh"
 DOWN_SCRIPT = REPO_ROOT / "scripts" / "live_n8n_down.sh"
+SYNTHETIC_WORKFLOW_FILE = REPO_ROOT / "examples" / "registry" / "synthetic_test_workflow.json"
 
 
 @pytest.mark.unit
@@ -131,3 +133,20 @@ def test_synthetic_workflow_entry_shape_matches_the_registry_schema() -> None:
     )
     assert entry.trigger.path == "/webhook/operator-smoke-test"
     assert entry.trigger.correlation == "response_envelope"
+
+
+@pytest.mark.unit
+def test_synthetic_workflow_webhook_node_carries_a_webhook_id() -> None:
+    """Confirmed empirically against a real n8n 2.35.7 instance: a webhook node
+    imported via the CLI without a ``webhookId`` never gets its trigger registered by
+    the running process, regardless of which activation mechanism is used
+    afterward (``update:workflow``, ``publish:workflow``, the REST ``/activate``
+    endpoint, or the UI's own Active toggle) — n8n's internal webhook route table
+    uses ``webhookId`` as its real lookup key, not just the declared ``path``. A
+    future edit to this file that drops the field would silently break every live
+    test without this guard catching it first."""
+    document = json.loads(SYNTHETIC_WORKFLOW_FILE.read_text())
+    webhook_nodes = [n for n in document["nodes"] if n["type"] == "n8n-nodes-base.webhook"]
+    assert webhook_nodes, "expected at least one webhook node in the synthetic workflow"
+    for node in webhook_nodes:
+        assert node.get("webhookId"), f"webhook node {node['name']!r} has no webhookId"

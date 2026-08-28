@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The live-n8n harness now actually works, run for real and confirmed 8/8 passing
+  against a fresh instance (2026-08-28)** — found and fixed three real bugs in the
+  process:
+  - `examples/registry/synthetic_test_workflow.json` had no top-level `id`, which
+    n8n 2.35.7's `import:workflow` CLI requires (`SQLITE_CONSTRAINT: NOT NULL`).
+  - `WorkflowDefinition` (`src/n8n_operator/n8n/types.py`) rejected a well-formed
+    response: n8n returns `pinData`/`settings` as an explicit JSON `null`, not an
+    omitted key, for a workflow that's never had either set.
+  - The workflow's webhook node had no `webhookId`. n8n's internal webhook route
+    table uses this UUID as its real lookup key, not the declared `path` alone — a
+    webhook node imported without one never gets its trigger registered by the
+    running process, no matter which activation mechanism runs afterward
+    (`update:workflow`, `publish:workflow`, the REST `/activate` endpoint, or the UI's
+    own Active toggle). `scripts/live_n8n_up.sh` now runs the confirmed working
+    sequence — import → `publish:workflow` → container restart — and
+    `tests/unit/test_live_n8n_harness.py` asserts the `webhookId` stays on the node.
 - Closed the v1 release-readiness documentation drift: the public checklist and build
   plan now reflect the successful `v1.0.0rc3` GitHub release, and the rollback runbook
   uses a fail-closed, operator-verified tag variable instead of a stale hardcoded tag.
