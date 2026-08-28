@@ -6,19 +6,63 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.0.0-rc3] - 2026-08-28
+
+### Added
+
+- A reproducible, Docker-based live-n8n compatibility harness
+  (`docker/live-n8n/docker-compose.yml`, `scripts/live_n8n_up.sh`/`live_n8n_down.sh`):
+  pinned, loopback-only, project-scoped. Automates everything n8n exposes a supported
+  non-UI interface for; the one remaining manual step (owner setup + API key, both
+  UI-only in n8n) is called out explicitly rather than worked around. The live test
+  suite grew from 2 to 8 cases covering health, authenticated retrieval, active status,
+  deterministic hashing, dispatch/correlation, drift detection in both directions, and
+  four clean-failure cases. Not yet run against a real instance in this repository's
+  own CI — it needs Docker, opt-in, and out of scope for normal pushes by design.
+- `scripts/mcp_session_smoke.py`: a real MCP client session over stdio against the
+  built wheel (initialize, the exact 12-tool/2-resource surface, a safe tool call, a
+  resource read, clean shutdown — plus an explicit check that neither result leaks a
+  registry `n8n_workflow_id` or the configured n8n credentials), now run automatically
+  by `scripts/release_smoke.sh` on every CI push rather than only as a one-time manual
+  check.
+- `tests/integration/test_mcp_http_openai_compat.py`: an automated, in-process
+  Streamable HTTP compatibility check matching the OpenAI Responses API's documented
+  `mcp` tool shape (`Authorization`+`Origin` via its `headers` field, confirmed against
+  OpenAI's own API reference before writing this). Drives the real
+  `build_server`/`serve_http` middleware stack non-loopback, so the actual
+  bearer-token/Origin-allowlist enforcement (boundary B9) runs for real. This is
+  protocol-level evidence only — no real hosted OpenAI Responses API call has been
+  made yet; that needs a public TLS endpoint and credentials, neither available when
+  this was written.
+- `.github/workflows/release.yml`: a complete, tag-triggered release pipeline (verify
+  → Sigstore-backed build provenance → GitHub Release → PyPI trusted publishing).
+  `scripts/check_release_consistency.py`, `scripts/inspect_release_artifacts.sh`, and
+  `scripts/extract_changelog_section.py` back it. The `pypi` job is deliberately
+  disabled (`if: false`) until a PyPI "trusted publisher" is registered for this
+  repository — a human, PyPI-account-holder action. `docs/RELEASE_ROLLBACK.md`
+  documents rollback (GitHub) and yank (PyPI, once publishing starts) procedures.
+- `tests/unit/test_github_workflows.py`: every workflow file is valid YAML, every
+  third-party GitHub Action is pinned to a full commit SHA (not a mutable tag) —
+  applied to every workflow in this repository.
+
 ### Changed
 
-- Repository visibility changed to public. Immediately before, confirmed full-history
-  Gitleaks was green on the exact commit exposed. Immediately after: enabled native
-  secret scanning, push protection, and private vulnerability reporting; configured
-  branch protection on `main` (four required checks, strict, `enforce_admins` on, no
-  force pushes or branch deletion — all newly available the moment visibility changed,
-  no plan upgrade needed); created the `release` and `pypi` GitHub Environments
-  `.github/workflows/release.yml` targets.
-- Reworded README.md, `examples/mcp-clients/README.md`, and
-  `.github/PUBLIC_RELEASE_CHECKLIST.md` to describe the repository's actual current
-  state (public, not yet tagged or published) rather than the private-repository
-  framing that preceded this change.
+- All GitHub Actions across every workflow re-pinned from mutable version tags (e.g.
+  `@v4`) to their exact, verified commit SHAs.
+- Repository visibility changed to public (2026-08-28), immediately after confirming
+  full-history Gitleaks was green on the exact commit exposed. Immediately after:
+  enabled native secret scanning, push protection, and private vulnerability
+  reporting; configured branch protection on `main` (four required checks, strict,
+  `enforce_admins` on, no force pushes or branch deletion — all newly available the
+  moment visibility changed, no plan upgrade needed); created the `release` and `pypi`
+  GitHub Environments `release.yml` targets.
+- README.md, `examples/mcp-clients/README.md`, and
+  `.github/PUBLIC_RELEASE_CHECKLIST.md` reworded throughout to describe exactly what's
+  been verified and how (reference `mcp` protocol client vs. Claude Desktop's own GUI,
+  which has not been separately launched; automated vs. one-time-manual evidence) and
+  to drop stale private-repository framing.
 
 ## [1.0.0-rc2] - 2026-08-27
 

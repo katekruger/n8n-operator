@@ -16,21 +16,23 @@ what was verified and when.</sub>
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: v1 release candidate, public repository, not yet tagged or published.**
-> All nine product phases are implemented and the local release gate is green:
-> registry, MCP server (stdio + Streamable HTTP), n8n integration, execution, and the
-> full operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). A
-> reproducible, Docker-based live-n8n harness exists
-> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) — actually running it against a
-> real instance, and a real hosted OpenAI connector call, remain before the first
-> GitHub Release and PyPI publish. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md)
+> **Status: v1 release candidate, public repository, pre-release GitHub tag.** All
+> nine product phases are implemented and the local release gate is green: registry,
+> MCP server (stdio + Streamable HTTP), n8n integration, execution, and the full
+> operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). A GitHub
+> Release exists as a marked pre-release; **PyPI publishing is deliberately deferred**
+> (`.github/workflows/release.yml`'s `pypi` job is disabled until a PyPI trusted
+> publisher is registered). Two things remain before a final, non-candidate v1.0.0:
+> actually running the reproducible, Docker-based live-n8n harness
+> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) against a real instance, and a
+> real hosted OpenAI connector call. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md)
 > section 12 for the phase checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md)
 > for what v1 deliberately does not do, and [CHANGELOG.md](CHANGELOG.md) for the full
 > history.
 
 | Client / target | Transport | Evidence |
 |---|---|---|
-| MCP stdio clients (Claude Desktop and similar) | stdio | ✅ Automated on every CI push — `scripts/release_smoke.sh` runs a full MCP session against the built wheel (reference `mcp` Python client v2.1.1, last verified 2026-08-27) |
+| MCP stdio clients (Claude Desktop and similar) | stdio | ✅ Automated on every CI push — `scripts/release_smoke.sh` runs a full MCP session against the built wheel (reference `mcp` Python client v2.1.1, last verified 2026-08-28) |
 | Generic MCP client | Streamable HTTP | ✅ Built-wheel MCP session verified (phase 9, one-time manual run) |
 | OpenAI Responses API `mcp` tool shape | Streamable HTTP | 🟢 Automated on every CI test run — a real MCP session against the documented `Authorization`+`Origin` `headers` shape, with bearer/Origin enforcement exercised (`tests/integration/test_mcp_http_openai_compat.py`); 🟡 an actual hosted OpenAI request is still pending a public TLS endpoint and credentials |
 | n8n 2.35.7 self-hosted | REST + webhook | ✅ Empirically verified; repeatable live gate available |
@@ -104,12 +106,11 @@ thing happened."
 
 ## Quickstart
 
-Requires Python 3.12. No tagged release exists yet — install from a clone of `main`.
-PyPI publishing is intentionally deferred until the live-n8n and hosted OpenAI-connector
-checks above pass for real.
+Requires Python 3.12. Not on PyPI yet (deliberately — see the status note above);
+install from the tagged release:
 
 ```bash
-git clone https://github.com/katekruger/n8n-operator.git
+git clone --branch v1.0.0rc3 https://github.com/katekruger/n8n-operator.git
 cd n8n-operator
 uv tool install .
 ```

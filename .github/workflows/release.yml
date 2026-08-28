@@ -163,6 +163,12 @@ jobs:
     needs: github-release
     runs-on: ubuntu-latest
     environment: pypi
+    # Deferred: no PyPI "trusted publisher" is registered for this repository yet (a
+    # human, PyPI-account-holder action — see .github/PUBLIC_RELEASE_CHECKLIST.md's
+    # "Release identity" section). Flip this to `true` (and delete this comment) once
+    # that's done; until then this job is skipped, not failed, so the GitHub Release
+    # above still completes cleanly on its own.
+    if: false
     permissions:
       id-token: write # trusted publishing (OIDC) — no PyPI token secret needed
     steps:

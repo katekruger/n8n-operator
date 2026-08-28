@@ -18,7 +18,7 @@ uv pip install --python "$SMOKE_DIR/venv/bin/python" "$WHEEL"
 
 export N8N_OPERATOR_DATABASE_URL="sqlite+pysqlite:///$SMOKE_DIR/operator.db"
 "$SMOKE_DIR/venv/bin/python" -c \
-  'import n8n_operator; assert n8n_operator.__version__ == "1.0.0rc2"'
+  'import n8n_operator; assert n8n_operator.__version__ == "1.0.0rc3"'
 "$SMOKE_DIR/venv/bin/n8n-operator" --help >/dev/null
 "$SMOKE_DIR/venv/bin/n8n-operator" db init
 "$SMOKE_DIR/venv/bin/n8n-operator" registry validate \
