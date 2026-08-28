@@ -638,6 +638,11 @@ exit codes, or HTTP status without inventing new codes.
 | `RESULT_NOT_AVAILABLE` | Operation never executed. | Check state first. |
 | `REGISTRY_UNAVAILABLE` | Registry failed to load. | Operator action required; the server should not be serving. |
 | `INTERNAL_ERROR` | Unexpected server fault. | Report; do not retry blindly. |
+| `ENVIRONMENT_NOT_FOUND` | *(v2)* No such environment ID visible to this caller — identical for a nonexistent ID and one the caller is not authorized to see (no enumeration oracle, [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)). | Call `list_environments`. |
+| `ENVIRONMENT_REQUIRED` | *(v2)* The resolved organization has more than one environment and none was named — never defaulted, even when only one is production ([ADR-016](adr/ADR-016-environment-registry-overlays.md)). | Call `list_environments`; name one explicitly. |
+| `ENVIRONMENT_ARCHIVED` | *(v2)* A state-changing call named an archived environment. Read tools still resolve it. | Ask the operator; use a live environment for new work. |
+| `APPROVER_NOT_IN_POLICY` | *(v2)* `request_approval`'s `approvers` named a principal outside the operation's approval-policy snapshot. | Omit `approvers`, or check `get_approval_status` for the real snapshot. |
+| `RETRY_NOT_APPLICABLE` | *(v2)* `retry_operation`'s parent is not in a state representing "did not run as intended" (`SUCCEEDED`, `CANCELED`, `INVALID`, `EXECUTING`, `PENDING_APPROVAL`, or `APPROVED`). | Do not retry; if a genuinely new run is wanted, call `prepare_operation`. |
 
 ### 4.1 Error shape
 
@@ -656,25 +661,396 @@ differently. It is `false` for every side-effect-adjacent failure — most impor
 
 ---
 
-## 5. v2 tools (contracts to be specified in the v2 phase)
+## 5. v2 tools
 
-Inventory is normative in BUILD_PLAN section 7.2: `whoami`, `list_environments`,
-`request_approval`, `get_approval_status`, `retry_operation`,
-`diff_workflow_definition`, `get_metrics`, `list_audit_events`.
+> Complete contracts, specified at v2 stage 00 (contract closure) alongside
+> [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) through
+> [ADR-019](adr/ADR-019-metrics-cardinality-and-privacy.md). Inventory is normative in
+> BUILD_PLAN section 7.2. Conventions in section 1 apply unchanged; the additions below
+> are cumulative, not replacements.
 
-Contract changes to v1 tools in v2:
+**Organization resolution.** v2 has no MCP tool that selects "the active organization."
+Every tool below except `whoami` and `list_environments` resolves its organization
+*through* the `environment` argument (each environment belongs to exactly one
+organization, [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) section
+2) — naming an environment names an organization. `whoami` and `list_environments`
+operate across every organization the caller belongs to, precisely so a caller can
+discover what to name before naming anything.
 
-- Every tool gains optional `environment`, defaulting to the caller's default environment.
-- Every result gains `environment`.
-- Results are filtered by the caller's RBAC scope. An unauthorized workflow returns
-  `WORKFLOW_NOT_FOUND`, never `FORBIDDEN` — authorization must not be an enumeration
-  oracle.
-- `retry_operation` returns a **new** `operation_id` with `parent_operation_id` set. It
-  never revives the original, and it never reuses the original's approval: validation,
-  preflight, and approval are all recalculated against the snapshot in force at retry time
-  ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md),
-  [ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md), invariant I11). A
-  `read_only` retry reaching `APPROVED` via T05 is recalculation, not reuse.
+**Environment default resolution** ([ADR-016](adr/ADR-016-environment-registry-overlays.md)
+section 3): omitting `environment` is valid only when the resolved organization has
+exactly one environment — that environment is used, whether or not it is
+`is_production`. The instant a second environment exists for that organization,
+omitting `environment` is `ENVIRONMENT_REQUIRED`, even if only one of the environments
+is production. Naming an environment ID outside the caller's authorized organizations,
+or one that does not exist, is `ENVIRONMENT_NOT_FOUND` — identical wording either way
+(no enumeration oracle, [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)
+section 3). Naming an archived environment for a state-changing call
+(`prepare_operation`) is `ENVIRONMENT_ARCHIVED`; read tools resolve an archived
+environment normally, because historical operations must stay readable
+([ADR-016](adr/ADR-016-environment-registry-overlays.md) section 4).
+
+**Authorization filtering.** Every result in v2 is filtered to what
+[ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)'s role-capability ∧
+workflow-scope ∧ environment-scope evaluation authorizes for the caller, applied
+*before* any list is built or any aggregate computed — never as a post-hoc redaction.
+An unauthorized workflow or environment produces `WORKFLOW_NOT_FOUND` /
+`ENVIRONMENT_NOT_FOUND`, the same as a nonexistent one. **There is no `FORBIDDEN` error
+code anywhere in v2.**
+
+---
+
+### 5.1 `whoami`
+
+Resolved identity: who the caller is, and every organization, role set, and
+environment they can see. The one tool a caller needs before naming anything else.
+
+**Arguments:** none.
+
+**Result**
+
+```json
+{
+  "principal_id": "prin_01JQ…",
+  "kind": "user",
+  "display_name": "Carolyn Stumph",
+  "organizations": [
+    {
+      "organization_id": "org_01JQ…",
+      "name": "Acme GTM",
+      "roles": ["operator", "approver"],
+      "environments": [
+        { "environment_id": "env_01JQ…", "name": "staging", "is_production": false },
+        { "environment_id": "env_01JR…", "name": "prod", "is_production": true }
+      ]
+    }
+  ]
+}
+```
+
+A caller who is a member of no organization gets `"organizations": []` — a normal,
+expected result for a freshly authenticated principal before an admin grants any
+membership ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md)
+section 3), never an error.
+
+**Errors:** none.
+
+---
+
+### 5.2 `list_environments`
+
+Every environment the caller can see, across every organization they belong to.
+
+**Arguments:** none.
+
+**Result**
+
+```json
+{
+  "environments": [
+    {
+      "environment_id": "env_01JQ…",
+      "organization_id": "org_01JQ…",
+      "name": "staging",
+      "is_production": false,
+      "archived": false,
+      "approval_policy_summary": "auto-approve read_only; 1 approver otherwise"
+    },
+    {
+      "environment_id": "env_01JR…",
+      "organization_id": "org_01JQ…",
+      "name": "prod",
+      "is_production": true,
+      "archived": false,
+      "approval_policy_summary": "2-of-3 approvers required, always"
+    }
+  ]
+}
+```
+
+Archived environments ([ADR-016](adr/ADR-016-environment-registry-overlays.md)
+section 4) appear only for callers holding `admin` in that environment's organization,
+with `"archived": true`.
+
+**Errors:** none.
+
+---
+
+### 5.3 `request_approval`
+
+Route a `PENDING_APPROVAL` operation's approval to its eligible approvers and (re)send
+notifications. **Still cannot grant approval** — the out-of-band decision itself
+crosses only the CLI or the approval app, exactly as in v1 (boundary B4).
+
+**Arguments**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `operation_id` | string | yes | Must be `PENDING_APPROVAL`. |
+| `approvers` | array of string | no | Principal IDs to notify. Must be a subset of the operation's approval-policy snapshot ([ADR-017](adr/ADR-017-team-approval-quorum-semantics.md) section 1) — never a way to add someone outside it. Omitted: notifies the full snapshot. |
+| `message` | string | no | Advisory, shown alongside the notification. Never affects policy ([ADR-007](adr/ADR-007-deterministic-before-llm.md)). |
+
+**Result**
+
+```json
+{
+  "operation_id": "op_01JQ…",
+  "quorum_count": 2,
+  "approval_policy_snapshot": ["prin_01JA…", "prin_01JB…", "prin_01JC…"],
+  "notified": ["prin_01JA…", "prin_01JB…"],
+  "state": "PENDING_APPROVAL"
+}
+```
+
+Calling this more than once re-sends notifications; delivery is deduplicated by
+`(operation_id, principal_id, event_type)` so a caller invoking it twice does not
+double-notify anyone ([ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md)
+section 2).
+
+**Errors:** `OPERATION_NOT_FOUND`, `INVALID_STATE_TRANSITION` (operation is not
+`PENDING_APPROVAL`), `APPROVER_NOT_IN_POLICY` (a named `approvers` entry is not in the
+operation's snapshot).
+
+---
+
+### 5.4 `get_approval_status`
+
+Which approvals have been collected, which are outstanding, against the required
+quorum.
+
+**Arguments**
+
+| Field | Type | Required |
+|---|---|---|
+| `operation_id` | string | yes |
+
+**Result**
+
+```json
+{
+  "operation_id": "op_01JQ…",
+  "quorum_count": 2,
+  "approval_policy_snapshot": ["prin_01JA…", "prin_01JB…", "prin_01JC…"],
+  "decisions": [
+    { "principal_id": "prin_01JA…", "decision": "approved", "decided_at": "2026-08-28T14:05:02Z" }
+  ],
+  "outstanding": ["prin_01JB…", "prin_01JC…"],
+  "ready": false
+}
+```
+
+`ready: true` means quorum is reached with zero rejections and the operation has moved
+or will move to `APPROVED` (T06); a single rejection anywhere in `decisions` means the
+operation is already `REJECTED` and `outstanding` is emptied, not because those
+approvers decided but because a decision is no longer possible
+([ADR-017](adr/ADR-017-team-approval-quorum-semantics.md) section 2).
+
+**Errors:** `OPERATION_NOT_FOUND`.
+
+---
+
+### 5.5 `retry_operation`
+
+Governed retry: mint a **new** operation linked to a terminal parent that did not
+reach its intended outcome, with validation, preflight, and approval all recalculated
+from scratch against the snapshot in force *now* ([ADR-005](adr/ADR-005-no-automatic-retry-v1.md),
+[ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md), invariant I11).
+
+**Arguments**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `operation_id` | string | yes | The parent. Must be `FAILED`, `UNKNOWN`, `BLOCKED`, `EXPIRED`, or `REJECTED` — the states representing "did not run as intended." |
+| `idempotency_key` | string | no | Same semantics as `prepare_operation` (invariant I8), scoped additionally to the parent. |
+| `reason` | string | no | Advisory, shown to the human approver if one is needed. Never affects policy. |
+
+**Result:** identical shape to `prepare_operation`'s four result variants
+(`PENDING_APPROVAL` / `APPROVED` / `INVALID` / `BLOCKED`), plus `parent_operation_id`
+in every variant.
+
+```json
+{
+  "operation_id": "op_01JZ…",
+  "parent_operation_id": "op_01JQ…",
+  "state": "PENDING_APPROVAL",
+  "workflow_id": "crm.sync_contact",
+  "approval_required": true,
+  "approval_instructions": "…",
+  "approval_expires_at": "2026-08-28T15:00:00Z",
+  "created_at": "2026-08-28T14:45:00Z",
+  "idempotent_replay": false
+}
+```
+
+**Never returned:** `SUCCEEDED` directly from this tool — a retry that would succeed
+still has to actually execute via `execute_operation` after reaching `APPROVED`, exactly
+like any other operation. `retry_operation` never dispatches to n8n itself.
+
+The parent is never moved, never re-read as anything but what it already was, and its
+handle stays burned. A `read_only`/`approval: none` parent retried under an unchanged
+registry snapshot reaches `APPROVED` via T05 exactly as a first attempt would — this is
+recalculation reaching the same conclusion, not approval reuse
+([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md) section 1).
+
+**Errors:** `OPERATION_NOT_FOUND`, `RETRY_NOT_APPLICABLE` (parent is SUCCEEDED,
+CANCELED, INVALID, EXECUTING, PENDING_APPROVAL, or APPROVED — never a state
+representing "did not run as intended"), `IDEMPOTENCY_CONFLICT`,
+`ARGUMENTS_TOO_LARGE`, `WORKFLOW_DISABLED`, `REGISTRY_UNAVAILABLE`.
+
+---
+
+### 5.6 `diff_workflow_definition`
+
+Structural diff between the registered `definition_hash` and the live n8n definition —
+turning drift from an opaque hash mismatch into a reviewable change list.
+
+**Arguments**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `workflow_id` | string | yes | |
+| `environment` | string | no | Standard resolution above. |
+
+**Result**
+
+```json
+{
+  "workflow_id": "crm.sync_contact",
+  "environment": "prod",
+  "registered_hash": "sha256:1a2b…",
+  "live_hash": "sha256:9f8e…",
+  "changed": true,
+  "diff": [
+    { "path": "/nodes/2/parameters/url", "change_type": "modified",
+      "registered_value": "[REDACTED]", "live_value": "[REDACTED]" },
+    { "path": "/nodes/5", "change_type": "added" }
+  ]
+}
+```
+
+The diff is computed over the same canonical form `definition_hash` is taken over
+([ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)) — a field on the
+canonicalization exclusion allowlist never appears as a diff entry, because it never
+contributed to either hash. Values matched by the workflow's own `output.redact` paths
+are redacted in the diff exactly as in any other tool result (boundary B6); an entry
+whose path is not otherwise redact-configured still shows real values, since a
+definition diff (unlike an execution result) contains no downstream PII by
+construction — only node configuration the operator already authored.
+
+**Errors:** `WORKFLOW_NOT_FOUND`, `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED`,
+`INSTANCE_UNREACHABLE`.
+
+---
+
+### 5.7 `get_metrics`
+
+Operation counts, outcome distribution, and latency percentiles, bounded and
+authorization-filtered before aggregation
+([ADR-019](adr/ADR-019-metrics-cardinality-and-privacy.md)).
+
+**Arguments**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `environment` | string | no | Standard resolution above. |
+| `window` | enum | no | `1h` / `24h` / `7d` / `30d`. Default `24h`. No arbitrary custom range. |
+| `group_by` | enum | no | `workflow` / `risk` / `side_effects` / `outcome`. Omitted: totals only. |
+
+**Result**
+
+```json
+{
+  "environment": "prod",
+  "window": "24h",
+  "generated_at": "2026-08-28T18:00:00Z",
+  "totals": {
+    "count": 214,
+    "by_outcome": { "succeeded": 190, "failed": 12, "unknown": 2, "blocked": 10 }
+  },
+  "latency_ms": { "p50": 812, "p95": 2104, "p99": null, "p99_reason": "insufficient_sample" },
+  "breakdown": [
+    { "key": "crm.sync_contact", "count": 140, "by_outcome": { "succeeded": 138, "failed": 2 } },
+    { "key": "other", "count": 74, "note": "51 additional workflows below the top-50 cutoff" }
+  ]
+}
+```
+
+A percentile is `null` with a `"_reason": "insufficient_sample"` field whenever its
+bucket has fewer than 10 samples in the window — never a number computed from too few
+executions to mean anything statistically, and never one precise enough to identify a
+single operation's exact duration ([ADR-019](adr/ADR-019-metrics-cardinality-and-privacy.md)
+section 4). A `breakdown` carries at most 50 distinct entries; beyond that, a single
+`"other"` entry with an aggregate count only — no further identifiers.
+
+**Errors:** `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED`.
+
+---
+
+### 5.8 `list_audit_events`
+
+Query the audit chain within the caller's authorization scope.
+
+**Arguments**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `environment` | string | no | Standard resolution above. |
+| `workflow_id` | string | no | Filter to one workflow. |
+| `since` | string | no | RFC 3339. |
+| `limit` | integer | no | 1–100, default 20. |
+| `cursor` | string | no | Opaque pagination cursor, anchored to `audit_log.seq` — no offset paging over an append-only log ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md) section 3). |
+
+**Result**
+
+```json
+{
+  "events": [
+    { "seq": 40231, "occurred_at": "2026-08-28T14:05:02Z", "actor": "prin_01JA…",
+      "action": "approval.granted", "subject_type": "operation", "subject_id": "op_01JQ…",
+      "outcome": "allowed", "detail": {} }
+  ],
+  "next_cursor": "eyJzZXEiOjQwMjMxfQ"
+}
+```
+
+Authorization filters the query before pagination runs: an event whose `subject_id`
+resolves to a workflow or environment outside the caller's scope is excluded entirely,
+never returned with a redacted `detail` ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md)
+section 3, [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)). `detail` carries
+the same write-time redaction v1 already applies (BUILD_PLAN section 8.1); there is no
+broader-role view of any entry's raw content.
+
+**Errors:** `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED`, `INVALID_ARGUMENTS`.
+
+---
+
+### 5.9 Contract changes to every v1 tool in v2
+
+Every v1 tool keeps its v1 argument, result, and error shape exactly, plus the
+additions below — nothing in section 2 is removed or narrowed.
+
+| Tool | `environment` | New/changed result field | Pagination | Authorization filtering | New errors |
+|---|---|---|---|---|---|
+| `list_workflows` | optional, standard resolution | `environment` added to the result envelope | **New in v2**: `cursor`/`limit` (1–100, default 20), same shape as v1 `list_operations` | Excludes workflows outside workflow-scope | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `describe_workflow` | optional, standard resolution | `environment` added | N/A (single resource) | Unauthorized workflow → `WORKFLOW_NOT_FOUND` | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `get_instance_health` | optional, standard resolution | `environment` added | N/A | Unauthorized environment → `ENVIRONMENT_NOT_FOUND` | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `validate_input` | optional, standard resolution | `environment` added | N/A | Unauthorized workflow → `WORKFLOW_NOT_FOUND` | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `preflight_workflow` | optional, standard resolution | `environment` added | N/A | Unauthorized workflow → `WORKFLOW_NOT_FOUND` | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `prepare_operation` | optional, standard resolution | `environment` added; approval-required results additionally include `approval_policy_snapshot` size (count only) when quorum > 1 | N/A | Unauthorized workflow/environment → `WORKFLOW_NOT_FOUND`/`ENVIRONMENT_NOT_FOUND`; not `operator` for this workflow+environment → same | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED`, `ENVIRONMENT_ARCHIVED` |
+| `get_operation` | *(implicit — carried on the operation itself)* | `environment` added | N/A | Operation's own environment outside caller's scope → `OPERATION_NOT_FOUND` | none new |
+| `execute_operation` | *(implicit)* | `environment` added | N/A | Same as `get_operation` | none new |
+| `cancel_operation` | *(implicit)* | `environment` added | N/A | Same as `get_operation` | none new |
+| `list_operations` | optional, standard resolution | `environment` added per row; `environment` filter argument added | Unchanged shape, now environment-scoped | Excludes operations outside workflow/environment scope | `ENVIRONMENT_NOT_FOUND`, `ENVIRONMENT_REQUIRED` |
+| `get_execution_result` | *(implicit)* | `environment` added | N/A | Same as `get_operation` | none new |
+| `get_execution_log` | *(implicit)* | `environment` added | N/A | Same as `get_operation` | none new |
+
+"Implicit" means the tool's only argument is an `operation_id` that already resolved
+to one environment at `prepare_operation` time — there is nothing to disambiguate, and
+adding a redundant `environment` argument here would only create a way for it to
+disagree with the operation's real one. Authorization for these six tools is instead:
+does the caller's scope cover the operation's *actual* environment and workflow, with
+an unauthorized operation returning `OPERATION_NOT_FOUND` — the same anti-enumeration
+answer as everywhere else, applied to operations instead of workflows or environments.
 
 ---
 

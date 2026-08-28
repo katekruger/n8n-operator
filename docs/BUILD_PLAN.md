@@ -217,6 +217,7 @@ n8n-operator/
 │   ├── V1_LIMITATIONS.md           # plain-language index of v1 boundaries (phase 9)
 │   ├── RECONCILING_UNKNOWN.md      # manual reconciliation guide for UNKNOWN (phase 9)
 │   ├── RELEASE_ROLLBACK.md         # rollback/yank procedure for a bad release (phase 9)
+│   ├── V2_TRACEABILITY.md          # v2 outcome/tool -> AC/test/doc/stage matrix (stage 00)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -229,7 +230,14 @@ n8n-operator/
 │       ├── ADR-009-dispatch-correlation.md
 │       ├── ADR-010-approval-delivery-and-expiry.md
 │       ├── ADR-011-argument-limits-and-idempotency.md
-│       └── ADR-012-governed-retry-and-audit-anchoring.md
+│       ├── ADR-012-governed-retry-and-audit-anchoring.md
+│       ├── ADR-013-organization-tenant-and-principal-model.md
+│       ├── ADR-014-oidc-trust-and-session-model.md
+│       ├── ADR-015-rbac-authorization-evaluation.md
+│       ├── ADR-016-environment-registry-overlays.md
+│       ├── ADR-017-team-approval-quorum-semantics.md
+│       ├── ADR-018-notification-and-alert-hook-delivery.md
+│       └── ADR-019-metrics-cardinality-and-privacy.md
 ├── examples/
 │   ├── registry/
 │   │   ├── workflows.example.yaml         # annotated sample registry
@@ -451,6 +459,25 @@ Enforced in code and verified by property tests (section 10.2):
 - **I12** — An approval URL is never returned to a caller that cannot reach it
   ([ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)).
 
+### 5.5 v2 invariants (contracts fixed at stage 00; enforced starting stage 05)
+
+The v1 state machine above is **unchanged in v2** — no new state, no new transition, no
+edge added out of a terminal state. These two invariants govern the v2 authorization and
+approval-routing layers that sit alongside it, at the same formal status as I1–I12:
+
+- **I13** — An operation's approval-policy snapshot is fixed the moment the operation
+  enters `PENDING_APPROVAL` (T04) and never gains members afterward. A principal removed
+  from the organization after the snapshot is taken can no longer decide; a principal
+  granted the approver role after the snapshot is taken was never eligible for this
+  operation. A decision already cast survives removal
+  ([ADR-017](adr/ADR-017-team-approval-quorum-semantics.md)).
+- **I14** — Authorization denial is never distinguishable from absence. Every response an
+  unauthorized caller can reach — for a workflow, an environment, or an operation outside
+  their scope — is identical to the response a nonexistent one would produce. There is no
+  `FORBIDDEN` error code in any version
+  ([ADR-015](adr/ADR-015-rbac-authorization-evaluation.md), extending boundary B1's
+  anti-enumeration guarantee across the v2 organization boundary).
+
 ---
 
 ## 6. Workflow registry schema
@@ -546,6 +573,8 @@ a bad registry never degrades into a partially-live allowlist.
 | R10 | `risk: high` requires `approval: required`, which `defaults` may not weaken. |
 | R11 | `limits.max_argument_bytes`, when present, is a positive integer not greater than the server ceiling `N8N_OPERATOR_MAX_ARGUMENT_BYTES`. |
 | R12 | `trigger.correlation` is one of `none` / `response_envelope`, and `response_envelope` is only valid for `trigger.type: webhook`. |
+| R13 | *(v2)* An environment overlay ([ADR-016](adr/ADR-016-environment-registry-overlays.md)) may only set `n8n_workflow_id`, `definition_hash`, `trigger.path`, `trigger.secret_ref`, `approval`, or `limits`. An overlay setting any other field — `input_schema`, `side_effects`, `risk`, `title`, `description`, or `tags` — fails to load. |
+| R14 | *(v2)* An overlay's `approval`/`limits` may only strengthen relative to the base entry (raise `approval` toward `required`, tighten a limit), never weaken it. A `(workflow_id, environment_id)` pair has at most one overlay, enforced by a database unique constraint, not an application check. |
 
 ### 6.7 Snapshots
 
@@ -773,6 +802,120 @@ v1 retains everything indefinitely, locally. `execution_results.redacted_payload
 the only large column and is capped by `output.max_bytes`. Retention policy and
 archival are v3 enterprise controls; there is no delete path in v1 or v2.
 
+### 8.3 v2 data-model additions
+
+Contracts fixed at stage 00; implemented starting stage 01
+([ADR-004](adr/ADR-004-sqlite-to-postgres.md)'s portability rules D1–D10 apply to
+every table below exactly as they do to the v1 tables above). No v1 table is dropped
+or renamed; three gain columns, described first.
+
+**`principals`** gains: `external_issuer` (text, null for `service`) alongside the
+existing `external_subject` — identity is the pair, never `sub` alone
+([ADR-014](adr/ADR-014-oidc-trust-and-session-model.md)). `disabled_at` (timestamptz,
+null while active) — checked on every call, never cached
+([ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) section 4). `kind`'s v1 value
+`local` is retired at the v2 `apiVersion`; `user` and `service` are the only values.
+
+**`operations`** gains: `organization_id` (text FK, not null in v2) and an
+`environment_id` (text FK) alongside the existing `environment` text column, which
+becomes a display label rather than the join key. `approval_policy_snapshot` (json,
+null until `request_approval` — actually written at T04, see below) — the list of
+eligible approver `principal_id`s and the required `quorum_count`, fixed at
+`PENDING_APPROVAL` and never rewritten (invariant I13).
+
+**`approvals`** gains a **new column** `quorum_count` (integer, default 1 — v1's
+existing single-decision behavior is `quorum_count: 1` under the same table, not a
+different code path) and becomes one-row-per-decision rather than one-row-per-operation:
+its existing unique-per-operation shape is replaced by a unique constraint on
+`(operation_id, decided_by)` — the same table, wider key, so `decided_by` (already a
+v1 column, always `local` in v1) now legitimately repeats across rows for the same
+`operation_id` in v2.
+
+**`organizations`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `name` | text | |
+| `created_at` | timestamptz | |
+
+**`organization_memberships`** — the RBAC grant
+([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md),
+[ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `principal_id` | text FK | |
+| `organization_id` | text FK | |
+| `roles` | json | Non-empty array drawn from `viewer`/`operator`/`approver`/`admin`. |
+| `workflow_scope` | text | Workflow-ID glob pattern, `*` for all. |
+| `environment_scope` | json | Array of environment IDs, or `["*"]` for all. |
+| `created_at` | timestamptz | |
+| `removed_at` | timestamptz null | Non-null means the membership no longer grants anything, checked live on every call — never cached. |
+
+Unique on `(principal_id, organization_id)` while `removed_at IS NULL` — one active
+membership per principal per organization; role/scope changes update the row rather
+than adding a second one, keeping "what can this principal do here right now" a single
+row lookup.
+
+**`environments`** ([ADR-016](adr/ADR-016-environment-registry-overlays.md)).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `organization_id` | text FK | |
+| `name` | text | Unique per organization. |
+| `n8n_base_url_ref` | text | Config/secret reference, never a literal URL in a shared table row beyond what config already resolves (ADR-006 discipline extended). |
+| `n8n_api_key_ref` | text | `env:`/`keyring:` indirection, same rule as `trigger.secret_ref` (R6). |
+| `is_production` | boolean | Never influences implicit default resolution beyond the single-environment case ([ADR-016](adr/ADR-016-environment-registry-overlays.md) section 3). |
+| `archived_at` | timestamptz null | Soft-delete only; historical operations remain resolvable forever. |
+| `created_at` | timestamptz | |
+
+**`workflow_environment_overlays`** ([ADR-016](adr/ADR-016-environment-registry-overlays.md), rules R13–R14).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `workflow_id` | text | References the base registry entry's `id`. |
+| `environment_id` | text FK | |
+| `n8n_workflow_id` | text null | Override; null means inherit the base (only valid if the base is meaningful across environments, otherwise required). |
+| `definition_hash` | text null | Override. |
+| `trigger_path` | text null | Override. |
+| `trigger_secret_ref` | text null | Override. |
+| `approval_override` | text null | `required` only — an overlay may never set `none` where the base is `required` (R14). |
+| `limits_override` | json null | Only keys that tighten a base `limits` value. |
+
+Unique on `(workflow_id, environment_id)` — R14's "at most one overlay per pair" is a
+database constraint, not an application check.
+
+**`notification_deliveries`** ([ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md)).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `idempotency_key` | text unique | `(subject_id, principal_id, event_type)`, canonicalized. |
+| `subject_type`, `subject_id` | text | What the notification concerns. |
+| `principal_id` | text null | Null for an alert hook (targets a configured endpoint, not a person). |
+| `event_type` | text | e.g. `approval.requested`, `drift.detected`, `operation.stuck`. |
+| `attempts` | integer | |
+| `status` | text | `delivered`, `failed`, `pending`. |
+| `last_attempted_at` | timestamptz null | |
+| `delivered_at` | timestamptz null | |
+
+**`audit_anchors`** ([ADR-012](adr/ADR-012-governed-retry-and-audit-anchoring.md) section 2)
+— receipts from `AuditAnchor.publish`, one row per anchor.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | text PK | ULID. |
+| `covers_through_seq` | integer | The `audit_log.seq` this anchor pins up to. |
+| `entry_hash` | text | `audit_log.entry_hash` at `covers_through_seq`. |
+| `implementation` | text | `local_file` or `https_webhook` in v2. |
+| `receipt` | json | Implementation-specific, content-free (no actors, arguments, or subjects — the anchor pins chain state, never audit content). |
+| `published_at` | timestamptz | |
+| `publish_failed` | boolean | Fail-visible per ADR-012's requirement — a failed publish is a row, not a silent gap. |
+
 ---
 
 ## 9. Security boundaries
@@ -818,6 +961,10 @@ operator and a potentially-manipulated agent.
 | B11 | B: audit | Append-only. No update or delete statement against `audit_log` exists in the codebase; a contract test greps for one. |
 | B12 | A to B: argument volume | A core-enforced cap on the canonical argument size, applied identically for every adapter and **before** persistence. Transport limits remain as defense in depth ([ADR-011](adr/ADR-011-argument-limits-and-idempotency.md)). |
 | B13 | B to A: approval reachability | An approval URL is returned only to callers the transport proves are local. Remote callers receive `approval_required`, the operation ID, and instructions instead of an address they cannot reach (invariant I12, [ADR-010](adr/ADR-010-approval-delivery-and-expiry.md)). |
+| B14 | *(v2)* A to B: identity | Identity flows only through a validated OIDC bearer token, never through a tool argument. No tool accepts a field that asserts "act as principal X" ([ADR-014](adr/ADR-014-oidc-trust-and-session-model.md)). |
+| B15 | *(v2)* B: organization isolation | Every organization-scoped query filters by `organization_id`, resolved from the caller's authenticated membership, never from a client-supplied value. No query spans organizations ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md)). |
+| B16 | *(v2)* B to external: notification content | A notification or alert-hook payload carries an event type, a subject ID, and a fetch reference — never operation arguments, workflow title/description, or execution results ([ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md)), extending B5/B6 to a delivery surface Operator does not fully control. |
+| B17 | *(v2)* B: approval quorum integrity | The requesting principal is structurally excluded from their own operation's approval-policy snapshot; the snapshot never gains members after it is taken (invariant I13, [ADR-017](adr/ADR-017-team-approval-quorum-semantics.md)). |
 
 ### 9.3 The confused-deputy problem
 
@@ -1066,6 +1213,121 @@ scripted manual walkthrough. Each maps to at least one test in section 10.
   and the CLI. The same idempotency key under two different workflows produces two
   independent operations; the same namespace and key with different arguments returns
   `IDEMPOTENCY_CONFLICT` (I10, I8, B12).
+
+### 11.9 v2 — organizations, environments, RBAC, quorum, retry, and delivery (stage 00 contracts)
+
+Fixed as contracts at stage 00; each becomes demonstrable starting the stage that
+implements it (noted per criterion). Numbering continues from 11.8; none of AC-01
+through AC-33 changes meaning or is renumbered.
+
+- **AC-34** — A principal's organization memberships are exactly its non-`removed_at`
+  `organization_memberships` rows; `whoami` lists only those, and no tool call ever
+  exposes the existence of an organization the caller does not belong to — including
+  through a guessed ID in any v2 tool's `environment` or `organization` argument, which
+  returns the same `ENVIRONMENT_NOT_FOUND`/`WORKFLOW_NOT_FOUND` a nonexistent ID would
+  ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md), invariant I14).
+  Stage 02.
+- **AC-35** — A `principals` row of `kind: service` has no `external_issuer`/`sub` pair
+  usable for interactive OIDC login, cannot appear as a `request_approval` notification
+  target derived from an interactive session, and JIT-provisions on first authenticated
+  call without ever JIT-provisioning a membership — a service principal with zero
+  memberships authenticates successfully and is authorized for nothing
+  ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) section 2,
+  [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md)). Stage 02.
+- **AC-36** — A single OIDC `(iss, sub)` pair holding memberships in two organizations
+  resolves an implicit organization only when every environment named or defaulted
+  resolves to memberships in exactly one organization; an ambiguous case (no
+  `environment` given, memberships span organizations with no single implicit
+  environment) returns `ENVIRONMENT_REQUIRED` rather than guessing
+  ([ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) section 3). Stage 02.
+- **AC-37** — With two or more non-archived environments in an organization, every v2
+  tool and every v1 tool's v2 form that accepts `environment` returns
+  `ENVIRONMENT_REQUIRED` when it is omitted — never silently defaulting to production,
+  and never defaulting to any environment flagged `is_production: true` — while a
+  single-environment organization resolves that one environment implicitly
+  ([ADR-016](adr/ADR-016-environment-registry-overlays.md) section 3, rule R13).
+  Stage 04.
+- **AC-38** — The role-capability matrix in
+  [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md) is exhaustive and enforced:
+  a property test drives every (role, tool) pair from the matrix table against the
+  authorization evaluator and asserts the allow/deny outcome matches the table exactly,
+  for all four roles across all 20 v1+v2 tools. Stage 03.
+- **AC-39** — A caller holding a role scoped to workflow set W1 and environment set E1
+  is authorized for a tool call only when the call's workflow is in W1 **and** its
+  environment is in E1 — never on either condition alone. A membership granting
+  `operator` on `crm.*` in the `staging` environment does not authorize `crm.sync` in
+  `production`, and does not authorize `mkt.campaign_sync` in `staging`
+  ([ADR-015](adr/ADR-015-rbac-authorization-evaluation.md), rule: intersection, never
+  union). Stage 03.
+- **AC-40** — An operation's `approval_policy_snapshot`, once written at
+  `PENDING_APPROVAL`, is unchanged by a subsequent membership grant, revocation, or role
+  change — a newly-granted approver cannot decide on an operation requested before the
+  grant, and a decision cast by a since-removed approver before their removal remains
+  valid and counted toward quorum (invariant I13,
+  [ADR-017](adr/ADR-017-team-approval-quorum-semantics.md) section 1). Stage 05.
+- **AC-41** — Every `request_approval` notification and every alert-hook delivery
+  carries an idempotency key of `(subject_id, principal_id, event_type)`; two deliveries
+  with the same key produce one received notification, verified by a fake
+  `NotificationSink` counting distinct receipts, and a delivery exhausting its bounded
+  retry count is recorded `DELIVERY_FAILED` rather than retried indefinitely
+  ([ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md) section 2). Stage 05
+  (approval routing), stage 08 (alert hooks).
+- **AC-42** — `get_metrics` accepts only `window` values `1h`/`24h`/`7d`/`30d`; any
+  latency percentile bucket with fewer than 10 samples in the requested window is `null`
+  with `"reason": "insufficient_sample"`, never a computed value; and a single-dimension
+  breakdown beyond 50 distinct values folds the remainder into one `"other"` bucket
+  carrying only a count ([ADR-019](adr/ADR-019-metrics-cardinality-and-privacy.md)
+  sections 2–4). Stage 08.
+- **AC-43** — `list_audit_events` paginates by opaque cursor anchored to `audit_log.seq`
+  (never an offset), bounded `limit` 1–100 default 20; an entry whose `subject_id` names
+  a workflow or environment outside the caller's authorized scope is excluded from the
+  query entirely, never returned redacted (ADR-012 section 3,
+  [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md)). Stage 08.
+- **AC-44** — Two callers, one authorized for workflow `crm.sync_contact` and one not,
+  issue `describe_workflow`, `get_operation`, `diff_workflow_definition`, and
+  `list_audit_events` calls against the same real operation ID and workflow ID; the
+  unauthorized caller's response is bitwise identical in shape and error code to the
+  same call against a nonexistent ID, for every one of the four tools (invariant I14,
+  no `FORBIDDEN` code exists anywhere in v2). Stage 03.
+- **AC-45** — `whoami` and every authorization check treat a `principals` row with
+  non-null `disabled_at` — service principal — or a membership with non-null
+  `removed_at` — as unauthenticated/unauthorized on the **next** call after the change,
+  with no session, cache, or token permitting continued access; verified by disabling a
+  principal mid-test between two calls using the same bearer token
+  ([ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) section 4). Stage 02.
+- **AC-46** — A JWKS `kid` miss triggers exactly one rate-limited re-fetch per
+  configured cooldown window (never an unbounded re-fetch loop under a forged-`kid`
+  probe), and a token whose `iat`/`exp` falls within ±60 seconds of server clock skew is
+  accepted while one outside that window is rejected
+  ([ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) section 2). Stage 02.
+- **AC-47** — An archived environment remains resolvable by every read tool
+  (`get_operation`, `list_operations`, `get_execution_result`,
+  `get_execution_log`, `list_audit_events`, `diff_workflow_definition` against a
+  historical operation) for operations that ran before archival, and is rejected with
+  `ENVIRONMENT_ARCHIVED` by every tool that would create new state
+  (`prepare_operation`, `execute_operation`, `retry_operation`, `request_approval`)
+  ([ADR-016](adr/ADR-016-environment-registry-overlays.md) section 4). Stage 04.
+- **AC-48** — Two `workflow_environment_overlays` rows for the same
+  `(workflow_id, environment_id)` are rejected by a database unique-constraint violation
+  surfaced as a load-time registry error, never as a silent last-write-wins; an overlay
+  attempting to set `approval_override: none` against a base `approval: required` fails
+  the same load-time validation (rules R13, R14,
+  [ADR-016](adr/ADR-016-environment-registry-overlays.md) section 1). Stage 04.
+- **AC-49** — A principal in an operation's `approval_policy_snapshot` who decides twice
+  on the same operation receives `APPROVAL_ALREADY_DECIDED` on the second attempt and
+  the operation's decision set is unchanged by it; the operation's own preparing
+  principal never appears in its own `approval_policy_snapshot`, verified by preparing
+  an operation as a principal who also holds `approver` scoped to that workflow and
+  environment and confirming their exclusion
+  ([ADR-017](adr/ADR-017-team-approval-quorum-semantics.md) sections 1, 3). Stage 05.
+- **AC-50** — `retry_operation` on a parent in `SUCCEEDED`, `CANCELED`, `INVALID`,
+  `EXECUTING`, `PENDING_APPROVAL`, or `APPROVED` returns `RETRY_NOT_APPLICABLE` and
+  creates no new operation; `retry_operation` on an `UNKNOWN` parent succeeds (creating
+  a new operation, never acting on the `UNKNOWN` one itself, invariant I7) and two
+  concurrent `retry_operation` calls against the same parent with the same
+  `idempotency_key` return the same new operation exactly once each, with no duplicate
+  row and no duplicate n8n dispatch, verified by a race test asserting a single winner
+  under concurrent database writes (ADR-012 section 1, invariant I11). Stage 06.
 
 ---
 
@@ -1844,19 +2106,141 @@ it touches are updated in the same change.
 
 ### Phase 10 — v2
 
-- [ ] PostgreSQL support and a migration path from SQLite (ADR-004)
-- [ ] OAuth/OIDC identity; `whoami`
-- [ ] RBAC over tools, workflows, environments
-- [ ] Multi-environment registry overlays; `list_environments`
-- [ ] Team approvals with quorum; `request_approval`, `get_approval_status`
-- [ ] Governed retries; `retry_operation` — new operation, full recalculation, no approval
-      reuse (ADR-005, ADR-012, invariant I11)
-- [ ] `diff_workflow_definition`
-- [ ] Monitoring: `get_metrics`, `list_audit_events`, alerting hooks
-- [ ] `AuditAnchor` interface plus the signed local anchor file and authenticated HTTPS
-      webhook implementations (ADR-012)
-- [ ] Exact-ID reconciliation annotations for `UNKNOWN` operations that carry an execution
-      ID — annotations only, never a transition (ADR-009, invariant I7)
+v2 is broken into eleven implementation stages, each with its own execution prompt
+(`docs/build-prompts/v2/NN-*.md`, tracked outside the product repo per PR #13). This
+checklist mirrors those stages exactly so progress here and progress against the
+prompts never drift apart. Every stage's acceptance criteria are the AC-34..50 set in
+section 11.9 plus any v1 AC it touches; every stage's entry criteria are the prior
+stage's exit criteria plus a green non-live gate.
+
+#### Stage 00 — Baseline and v2 contract closure *(this stage)*
+
+- [x] Complete v2 tool contracts for all 8 new tools (MCP_TOOLS.md section 5.1–5.8)
+- [x] Every v1 tool's v2 `environment`/default-resolution/pagination/authorization/error
+      contract specified (MCP_TOOLS.md section 5.9)
+- [x] v2 data-model additions (section 8.3), invariants I13/I14 (section 5.5), registry
+      rules R13/R14 (section 6.6), security boundaries B14–B17 (section 9.2)
+- [x] Acceptance criteria AC-34 through AC-50 (section 11.9)
+- [x] ADR-013 through ADR-019 added; ADR-012 updated with `list_audit_events` semantics
+      rather than duplicated
+- [ ] Three v2 user journeys added to ARCHITECTURE.md
+- [ ] `docs/V2_TRACEABILITY.md` created, mapping every v2 outcome and tool to its
+      acceptance criteria, tests, documentation, and implementing stage
+- [ ] `scripts/check_docs_consistency.py` extended (new ADRs, updated AC/invariant/
+      boundary/rule ranges, a new v2-tool-inventory drift check) and green
+- [ ] Full non-live gate green on this branch; PR opened and left for review, not
+      merged, tagged, or released (working rule 5)
+
+#### Stage 01 — PostgreSQL production foundation
+
+- [ ] PostgreSQL support alongside SQLite; a migration path that carries existing v1
+      SQLite data forward (ADR-004)
+- [ ] Alembic migrations for every v2 table in section 8.3, verified against both
+      backends (autogenerate produces an empty diff on each, mirroring AC-24's rule)
+- [ ] The core-portability contract test (import-graph walk, ADR-001) extended to cover
+      every new storage module without new violations
+
+#### Stage 02 — Organizations and OIDC identity
+
+- [ ] `organizations`, `organization_memberships` tables; `principals` gains
+      `external_issuer` and `disabled_at` (section 8.3, ADR-013)
+- [ ] OIDC resource-server bearer validation: `(iss, sub)` identity pairing, JWKS
+      caching with rate-limited re-fetch on `kid` miss, ±60s clock-skew tolerance
+      (ADR-014)
+- [ ] `whoami` tool (MCP_TOOLS.md section 5.1)
+- [ ] Disabled-principal and removed-membership re-check on every call, no caching
+      (ADR-014 section 4)
+- [ ] AC-34, AC-35, AC-36, AC-45, AC-46 demonstrable
+
+#### Stage 03 — RBAC and authorization boundaries
+
+- [ ] Role-capability matrix evaluator implementing the full (role, tool) table in
+      ADR-015, driven by the AC-38 property test rather than hand-enumerated cases
+- [ ] Workflow-scope AND environment-scope AND role-capability intersection (never
+      union) enforced on every tool call (ADR-015)
+- [ ] No `FORBIDDEN` error code anywhere; denial for authorization and denial for
+      nonexistence are the same response shape (invariant I14)
+- [ ] AC-38, AC-39, AC-44 demonstrable
+
+#### Stage 04 — Multi-environment registry
+
+- [ ] `environments`, `workflow_environment_overlays` tables; overlay field allowlist
+      and strengthen-only enforcement at load time (rules R13, R14; ADR-016)
+- [ ] `list_environments` tool (MCP_TOOLS.md section 5.2)
+- [ ] Default-environment resolution: implicit only for a single non-archived
+      environment, `ENVIRONMENT_REQUIRED` otherwise, production never implicit
+      (ADR-016 section 3)
+- [ ] Environment archival (not deletion); historical operations remain resolvable
+      (ADR-016 section 4)
+- [ ] AC-37, AC-47, AC-48 demonstrable
+
+#### Stage 05 — Team approvals and routing
+
+- [ ] `approvals` table widened to `quorum_count` and one-row-per-decision, unique on
+      `(operation_id, decided_by)` (section 8.3)
+- [ ] `approval_policy_snapshot` written at `PENDING_APPROVAL` entry, requester
+      structurally excluded, never re-expanded (invariant I13, ADR-017 section 1)
+- [ ] `request_approval`, `get_approval_status` tools (MCP_TOOLS.md sections 5.3–5.4)
+- [ ] `NotificationSink` interface plus the authenticated HTTPS webhook implementation,
+      at-least-once with dedup by `(subject_id, principal_id, event_type)` (ADR-018)
+- [ ] AC-40, AC-41 (approval-routing half), AC-49 demonstrable
+
+#### Stage 06 — Governed retry and reconciliation
+
+- [ ] `retry_operation` tool (MCP_TOOLS.md section 5.5): new operation, full
+      re-validation, re-preflight, and re-approval against the current snapshot, no
+      approval reuse (ADR-012 section 1, invariant I11)
+- [ ] `parent_operation_id` lineage; parent never moved, handle stays burned
+- [ ] `UNKNOWN`-parent retry succeeds without acting on the parent; exact-ID
+      reconciliation annotations recorded as audit annotations only, never a transition
+      (ADR-009, invariant I7)
+- [ ] AC-50 demonstrable, including the concurrent-retry race test
+
+#### Stage 07 — Structural workflow diffs
+
+- [ ] `diff_workflow_definition` tool (MCP_TOOLS.md section 5.6), built on the same
+      canonicalization rules as `definition_hash` (ADR-008) so a diff and a drift
+      detection can never disagree about what changed
+
+#### Stage 08 — Metrics, audit query, and alert hooks
+
+- [ ] `get_metrics` tool (MCP_TOOLS.md section 5.7): pre-aggregation authorization
+      filtering, enumerated windows, 50-entry cardinality cap with `"other"` bucket,
+      10-sample percentile floor (ADR-019)
+- [ ] `list_audit_events` tool (MCP_TOOLS.md section 5.8): cursor pagination anchored
+      to `audit_log.seq`, authorization-filters-before-pagination, v1 write-time
+      redaction unchanged (ADR-012 section 3)
+- [ ] Alert-hook triggers (drift detected, `EXECUTING` stuck past threshold, an
+      operation reaching `UNKNOWN`) delivered over the same `NotificationSink` (ADR-018)
+- [ ] `notification_deliveries` table (section 8.3)
+- [ ] AC-41 (alert-hook half), AC-42, AC-43 demonstrable
+
+#### Stage 09 — External audit anchoring
+
+- [ ] `AuditAnchor` interface plus the signed local anchor file and authenticated
+      HTTPS webhook implementations (ADR-012 section 2)
+- [ ] `audit_anchors` table (section 8.3); fail-visible publication failures recorded,
+      never silently skipped
+
+#### Stage 10 — GTM starter kits and onboarding
+
+- [ ] Example registries and onboarding walkthroughs for the three v2 user journeys in
+      ARCHITECTURE.md: a startup GTM engineer on staging+production, a RevOps
+      two-person-approval bulk CRM update, and a marketing-ops drift/failed-enrichment
+      investigation
+
+#### Stage 11 — v2 integration, release, and proof
+
+- [ ] Full AC-01 through AC-50 pass, including the v1 criteria re-verified against the
+      v2 surface (AC-23's tool-count check becomes a 20-tool check, not a 12-tool one,
+      once v2 ships)
+- [ ] The `live_n8n` pytest layer phase 9 recorded as never built (`docs/V1_LIMITATIONS.md`)
+      exists and passes against v2's multi-environment surface, closing that gap rather
+      than carrying it forward again
+- [ ] `docs/V2_TRACEABILITY.md` fully checked off — every row has a passing test and
+      shipped documentation
+- [ ] Phase 9's release process (verify → provenance → github-release → pypi) repeated
+      for the v2 tag
 
 ### Phase 11 — v3
 

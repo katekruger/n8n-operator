@@ -2,9 +2,10 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-26
+- **Updated:** 2026-08-28 (added section 3, `list_audit_events` query semantics, at v2 stage 00)
 - **Deciders:** Lead architect
 - **Phase:** 0.1 (architecture-decision closure), implemented in phase 10 (v2)
-- **Related:** [ADR-005](ADR-005-no-automatic-retry-v1.md), [ADR-003](ADR-003-operation-handles.md), [BUILD_PLAN.md](../BUILD_PLAN.md) sections 5.4, 9.4, [THREAT_MODEL.md](../THREAT_MODEL.md) T-35, RR-4, RR-5
+- **Related:** [ADR-005](ADR-005-no-automatic-retry-v1.md), [ADR-003](ADR-003-operation-handles.md), [ADR-015](ADR-015-rbac-authorization-evaluation.md), [ADR-019](ADR-019-metrics-cardinality-and-privacy.md), [BUILD_PLAN.md](../BUILD_PLAN.md) sections 5.4, 9.4, [THREAT_MODEL.md](../THREAT_MODEL.md) T-35, RR-4, RR-5
 
 ## Context
 
@@ -99,6 +100,32 @@ submission (RFC 9162-style, giving third-party-verifiable inclusion proofs), and
 storage integration (object-lock buckets, compliance-mode retention). Each is a new
 implementation behind the same interface; none changes the chain or the audit schema.
 
+### 3. `list_audit_events` — query scope, pagination, and redaction
+
+Added at v2 stage 00 (contract closure), alongside the tool's contract in
+[MCP_TOOLS.md](../MCP_TOOLS.md) section 5.8: querying the chain needed the same rigor
+as writing to it, decided here rather than left implicit in a tool schema.
+
+1. **Cursor-based pagination**, identical in shape to v1's `list_operations`: an opaque
+   `cursor`, a `limit` bounded 1–100 with a default of 20. No offset-based paging —
+   an offset over a monotonically-growing append-only log is exactly the kind of
+   pagination that silently skips or duplicates rows under concurrent writes; a cursor
+   anchored to `audit_log.seq` does not.
+2. **Authorization filters the query, not the result.** Exactly the discipline
+   [ADR-019](ADR-019-metrics-cardinality-and-privacy.md) states for `get_metrics`:
+   an audit entry whose `subject_id` names a workflow or environment outside the
+   caller's authorized scope ([ADR-015](ADR-015-rbac-authorization-evaluation.md)) is
+   excluded from the query entirely — never returned with a redacted body, because even
+   the existence of an event for an unauthorized workflow is enumeration-adjacent
+   information the caller has no standing to receive.
+3. **Content redaction is unchanged from v1.** `audit_log.detail` is already redacted
+   at write time (BUILD_PLAN section 8.1's own column note: "Redacted"); v2 adds no
+   second redaction pass and no un-redaction path for a caller with a broader role —
+   there is no role in [ADR-015](ADR-015-rbac-authorization-evaluation.md)'s matrix
+   that can see an audit entry's raw, pre-redaction detail. `admin` gets broader
+   *query* scope (more workflows and environments visible), never a different view of
+   any single entry's content.
+
 ## Consequences
 
 ### Positive
@@ -115,6 +142,10 @@ implementation behind the same interface; none changes the chain or the audit sc
   which is what makes it plausible to point one at a third-party service.
 - The two initial implementations need no infrastructure a v1 operator lacks, so RR-4
   improves for solo operators, not only for enterprises.
+- `list_audit_events` reusing v1's cursor shape and inheriting v1's write-time
+  redaction means the audit query surface needed no new privacy mechanism of its own —
+  it composes two decisions already made elsewhere ([ADR-015](ADR-015-rbac-authorization-evaluation.md),
+  BUILD_PLAN section 8.1) rather than adding a third.
 
 ### Negative
 

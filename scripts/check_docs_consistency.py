@@ -27,7 +27,10 @@ D11 The error taxonomy is closed: every code a tool declares is defined in MCP_T
     code, and the superseded spelling IDEMPOTENCY_KEY_CONFLICT survives only where the
     supersession itself is documented (ADR-011).
 D12 Every ADR exists, carries a Status and a Decision, and is referenced by at least one
-    normative document -- no ADR is orphaned (ADR-008..ADR-012).
+    normative document -- no ADR is orphaned (ADR-008..ADR-019).
+D13 The v2 tool inventory is consistent across documents: BUILD_PLAN section 7.2's table
+    matches the set of `### 5.x` tool contracts in MCP_TOOLS.md section 5, and matches
+    EXPECTED_V2_TOOLS exactly (added at v2 stage 00, contract closure).
 
 Exit code 0 means consistent; 1 means at least one contradiction, printed to stdout.
 """
@@ -60,6 +63,13 @@ ADRS = [
     "ADR-010-approval-delivery-and-expiry.md",
     "ADR-011-argument-limits-and-idempotency.md",
     "ADR-012-governed-retry-and-audit-anchoring.md",
+    "ADR-013-organization-tenant-and-principal-model.md",
+    "ADR-014-oidc-trust-and-session-model.md",
+    "ADR-015-rbac-authorization-evaluation.md",
+    "ADR-016-environment-registry-overlays.md",
+    "ADR-017-team-approval-quorum-semantics.md",
+    "ADR-018-notification-and-alert-hook-delivery.md",
+    "ADR-019-metrics-cardinality-and-privacy.md",
 ]
 
 NORMATIVE_DOCS = [
@@ -278,9 +288,9 @@ for path, text in all_docs.items():
 # --------------------------------------------------------------------------- D6
 ac_block = section(plan, "## 11. Acceptance criteria", "## 12. Progress checklist")
 defined_ac = set(re.findall(r"\*\*(AC-\d\d)\*\*", ac_block))
-expected_ac = {f"AC-{n:02d}" for n in range(1, 34)}
+expected_ac = {f"AC-{n:02d}" for n in range(1, 51)}
 if defined_ac != expected_ac:
-    fail("D6", f"acceptance criteria {sorted(defined_ac)} != expected AC-01..AC-33")
+    fail("D6", f"acceptance criteria {sorted(defined_ac)} != expected AC-01..AC-50")
 
 for path, text in all_docs.items():
     for used in set(re.findall(r"\b(AC-\d\d)\b", text)):
@@ -290,21 +300,21 @@ for path, text in all_docs.items():
 # --------------------------------------------------------------------------- D7
 inv_block = section(plan, "### 5.4 Invariants", "## 6. Workflow registry schema")
 defined_inv = set(re.findall(r"\*\*(I\d+)\*\*", inv_block))
-expected_inv = {f"I{n}" for n in range(1, 13)}
+expected_inv = {f"I{n}" for n in range(1, 15)}
 if defined_inv != expected_inv:
-    fail("D7", f"invariants {sorted(defined_inv)} != expected I1-I12")
+    fail("D7", f"invariants {sorted(defined_inv)} != expected I1-I14")
 
 b_block = section(plan, "### 9.2 Boundary controls", "### 9.3")
 defined_b = set(re.findall(r"^\| (B\d+) \|", b_block, re.MULTILINE))
-expected_b = {f"B{n}" for n in range(1, 14)}
+expected_b = {f"B{n}" for n in range(1, 18)}
 if defined_b != expected_b:
-    fail("D7", f"boundary controls {sorted(defined_b)} != expected B1-B13")
+    fail("D7", f"boundary controls {sorted(defined_b)} != expected B1-B17")
 
 r_block = section(plan, "### 6.6 Load-time validation rules", "### 6.7 Snapshots")
 defined_r = set(re.findall(r"^\| (R\d+) \|", r_block, re.MULTILINE))
-expected_r = {f"R{n}" for n in range(1, 13)}
+expected_r = {f"R{n}" for n in range(1, 15)}
 if defined_r != expected_r:
-    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R12")
+    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R14")
 
 for path, text in all_docs.items():
     for used in set(re.findall(r"\b(?:invariant |invariants )(I\d+)\b", text)):
@@ -479,6 +489,21 @@ for adr_name in ADRS:
     if adr_id not in normative_text:
         fail("D12", f"{adr_id} is orphaned: no normative document references it")
 
+# --------------------------------------------------------------------------- D13
+mcp_v2_tools = set(re.findall(r"^### 5\.\d `([a-z_]+)`", mcp_text, re.MULTILINE))
+if mcp_v2_tools != EXPECTED_V2_TOOLS:
+    fail(
+        "D13",
+        f"MCP_TOOLS section 5 documents {sorted(mcp_v2_tools)}; expected "
+        f"{sorted(EXPECTED_V2_TOOLS)}",
+    )
+if v2_tools != mcp_v2_tools:
+    fail(
+        "D13",
+        f"BUILD_PLAN 7.2 tools {sorted(v2_tools)} != MCP_TOOLS section 5 tools "
+        f"{sorted(mcp_v2_tools)}",
+    )
+
 # --------------------------------------------------------------------------- report
 if failures:
     print(f"Documentation consistency: {len(failures)} problem(s)\n")
@@ -491,7 +516,7 @@ print(f"  transitions  {len(defined_transitions)}  (T01-T15)")
 print(f"  v1 tools     {len(v1_tools)}")
 print(f"  v2 tools     {len(v2_tools)} (20 total)")
 print(f"  v3 tools     {len(v3_tools)} (28 total)")
-print(f"  criteria     {len(defined_ac)}  (AC-01-AC-33)")
+print(f"  criteria     {len(defined_ac)}  (AC-01-AC-50)")
 print(f"  invariants   {len(defined_inv)}  boundaries {len(defined_b)}  rules {len(defined_r)}")
 print(f"  canon rules  {len(defined_can)}  (CAN-01-CAN-07)")
 print(f"  error codes  {len(taxonomy_codes)} in the taxonomy, {len(CHECK_ONLY_CODES)} check-only")
