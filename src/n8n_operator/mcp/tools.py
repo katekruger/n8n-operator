@@ -516,7 +516,13 @@ def _shape_prepare_result(
     execution_deadline: str | None,
     environment: str | None,
     deps: ToolDeps,
+    parent_operation_id: str | None = None,
 ) -> dict[str, Any]:
+    """Shared by ``prepare_operation`` and ``retry_operation`` (stage 06,
+    MCP_TOOLS.md section 5.5's own note: "identical shape to prepare_operation's four
+    result variants... plus parent_operation_id in every variant"). ``prepare_
+    operation``'s own calls never pass ``parent_operation_id`` — its result stays
+    byte-identical to every pre-stage-06 shape, no new key at all."""
     if state == "INVALID":
         result: dict[str, Any] = {
             "operation_id": operation_id,
@@ -570,6 +576,8 @@ def _shape_prepare_result(
         }
     if deps.enable_v2:
         result["environment"] = environment
+    if parent_operation_id is not None:
+        result["parent_operation_id"] = parent_operation_id
     return result
 
 
@@ -686,6 +694,7 @@ def _make_get_operation(deps: ToolDeps) -> Tool:
             "approval": approval_block,
             "handle_used": operation.handle_burned_at is not None,
             "arguments": operation.arguments,
+            "parent_operation_id": operation.parent_operation_id,
         }
         if deps.enable_v2:
             result["environment"] = operation.environment
@@ -949,6 +958,7 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
                 "state": op.state,
                 "created_at": _iso(op.created_at),
                 "state_changed_at": _iso(op.updated_at),
+                "parent_operation_id": op.parent_operation_id,
                 **({"environment": op.environment} if deps.enable_v2 else {}),
             }
             for op in operations
@@ -1297,15 +1307,102 @@ def _make_get_approval_status(deps: ToolDeps) -> Tool:
     )
 
 
+# ======================================================================================
+# retry_operation (v2 — stage 06, MCP_TOOLS.md section 5.5)
+# ======================================================================================
+
+
+class RetryOperationArgs(_ToolArgs):
+    operation_id: str
+    idempotency_key: str | None = None
+    reason: str | None = None
+
+
+def _make_retry_operation(deps: ToolDeps) -> Tool:
+    async def handler(
+        operation_id: str, idempotency_key: str | None = None, reason: str | None = None
+    ) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        # As `execute_operation`'s own handler: the parent's own environment must be
+        # known before the right preflight adapter can be chosen, and `retry_operation`
+        # takes no `environment` argument of its own (the parent's is reused) — so a
+        # first, read-only peek resolves it. Nothing this peek learns is ever returned
+        # to the caller; if `retry_operation` itself then denies (e.g. this caller can
+        # read the operation but lacks `retry_operation`'s own admin-only capability),
+        # the result is the identical `OPERATION_NOT_FOUND` a nonexistent ID would
+        # give, so this peek creates no enumeration oracle (invariant I14).
+        with session_scope(deps.session_factory) as session:
+            try:
+                pinned_operation = service.get_operation(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        pinned_environment_id = pinned_operation.environment if deps.enable_v2 else None
+        preflight_port, _, _ = _adapters_for(deps, pinned_environment_id)
+
+        with session_scope(deps.session_factory) as session:
+            try:
+                operation, idempotent_replay, approval_token = service.retry_operation(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    preflight=preflight_port,
+                    server_max_argument_bytes=deps.server_max_argument_bytes,
+                    idempotency_key=idempotency_key,
+                    reason=reason,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+            detail = _latest_event_detail(session, operation.id)
+        return _shape_prepare_result(
+            operation_id=operation.id,
+            state=operation.state,
+            workflow_id=operation.workflow_id,
+            idempotent_replay=idempotent_replay,
+            approval_token=approval_token,
+            detail=detail,
+            created_at=_iso(operation.created_at),
+            approval_expires_at=_iso(operation.approval_expires_at),
+            execution_deadline=_iso(operation.execution_deadline),
+            environment=operation.environment if deps.enable_v2 else None,
+            deps=deps,
+            parent_operation_id=operation.parent_operation_id,
+        )
+
+    return _build_tool(
+        name="retry_operation",
+        description=(
+            "Governed retry: mint a new operation linked to a terminal parent that "
+            "did not reach its intended outcome, with validation, preflight, and "
+            "approval all recalculated from scratch against the current registry "
+            "snapshot. Never revives or transitions the parent; never reuses its "
+            "approval."
+        ),
+        args_model=RetryOperationArgs,
+        handler=handler,
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+
+
 def build_tools(deps: ToolDeps) -> list[Tool]:
     """Every v1 tool, bound to ``deps`` — the list ``mcp/server.py`` hands to
     ``MCPServer(tools=...)``. Exactly BUILD_PLAN section 7.1's twelve; a contract test
     (``tests/contract/test_mcp_tool_inventory.py``) asserts this list's names against
     that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2),
-    ``list_environments`` (stage 04), ``request_approval``, and ``get_approval_status``
-    (stage 05) are appended, a thirteenth through sixteenth tool, only when
-    ``deps.enable_v2`` is set — v1's exact twelve-tool surface (AC-23) is otherwise
-    untouched."""
+    ``list_environments`` (stage 04), ``request_approval`` and ``get_approval_status``
+    (stage 05), and ``retry_operation`` (stage 06) are appended, a thirteenth through
+    seventeenth tool, only when ``deps.enable_v2`` is set — v1's exact twelve-tool
+    surface (AC-23) is otherwise untouched."""
     tools = [
         _make_list_workflows(deps),
         _make_describe_workflow(deps),
@@ -1325,4 +1422,5 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
         tools.append(_make_list_environments(deps))
         tools.append(_make_request_approval(deps))
         tools.append(_make_get_approval_status(deps))
+        tools.append(_make_retry_operation(deps))
     return tools

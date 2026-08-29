@@ -217,12 +217,40 @@ async def test_same_tool_schemas_across_local_and_remote_deps() -> None:
         assert local_by_name[name].annotations == remote_by_name[name].annotations
 
 
+async def test_v2_tools_including_retry_operation_are_identical_across_transports() -> None:
+    """As :func:`test_same_tool_schemas_across_local_and_remote_deps`, extended to
+    the full v2 (``enable_v2=True``) 17-tool surface — stage 06's ``retry_operation``
+    included."""
+    local_server: MCPServer[Any] = MCPServer(
+        "local",
+        tools=build_tools(
+            ToolDeps(**{**_make_deps(caller_is_local=True).__dict__, "enable_v2": True})
+        ),
+    )
+    remote_server: MCPServer[Any] = MCPServer(
+        "remote",
+        tools=build_tools(
+            ToolDeps(**{**_make_deps(caller_is_local=False).__dict__, "enable_v2": True})
+        ),
+    )
+    local_tools = await local_server.list_tools()
+    remote_tools = await remote_server.list_tools()
+
+    local_by_name = {t.name: t for t in local_tools}
+    remote_by_name = {t.name: t for t in remote_tools}
+    assert local_by_name.keys() == remote_by_name.keys()
+    assert "retry_operation" in local_by_name
+    for name in local_by_name:
+        assert local_by_name[name].input_schema == remote_by_name[name].input_schema
+        assert local_by_name[name].annotations == remote_by_name[name].annotations
+
+
 def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
     """Stage 02's completion gate: v1 mode (``enable_v2`` unset, the default) stays
     exactly the twelve tools AC-23 requires; ``whoami``, ``list_environments``
-    (stage 04), ``request_approval``, and ``get_approval_status`` (stage 05) are a
-    thirteenth through sixteenth tool that exist only when an operator opts in
-    (BUILD_PLAN section 7.2)."""
+    (stage 04), ``request_approval``, ``get_approval_status`` (stage 05), and
+    ``retry_operation`` (stage 06) are a thirteenth through seventeenth tool that
+    exist only when an operator opts in (BUILD_PLAN section 7.2)."""
     v1_tools = build_tools(_make_deps())
     v2_tools = build_tools(ToolDeps(**{**_make_deps().__dict__, "enable_v2": True}))
 
@@ -235,5 +263,6 @@ def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
         "list_environments",
         "request_approval",
         "get_approval_status",
+        "retry_operation",
     }
-    assert len(v2_tools) == 16
+    assert len(v2_tools) == 17

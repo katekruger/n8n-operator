@@ -227,6 +227,22 @@ class OperationNotFoundError(DomainError):
     default_message = "No such operation."
 
 
+class RetryNotApplicableError(DomainError):
+    """Stage 06 (ADR-012 section 1): ``retry_operation``'s parent is not in a state
+    representing "did not run as intended" — or, distinctly (``details={"reason":
+    "chain_depth_exceeded"}``), the retry chain already reaches ``MAX_RETRY_CHAIN_
+    DEPTH``. Both are still "you may not retry this operation"; MCP_TOOLS.md's frozen
+    error contract for this tool names no separate code for the chain-depth case."""
+
+    code = "RETRY_NOT_APPLICABLE"
+    retryable = False
+    remediation = "Do not retry; if a genuinely new run is wanted, call prepare_operation."
+    default_message = (
+        'This operation is not in a state representing "did not run as intended" '
+        "(SUCCEEDED, CANCELED, INVALID, EXECUTING, PENDING_APPROVAL, or APPROVED)."
+    )
+
+
 class OperationExpiredError(DomainError):
     code = "OPERATION_EXPIRED"
     retryable = False
@@ -371,6 +387,20 @@ class ApprovalAlreadyDecidedError(AuthorizationError):
     default_message = "You have already decided this operation."
 
 
+class ReconciliationNotApplicableError(DomainError):
+    """Stage 06 (ADR-009/ADR-012): ``operations reconcile record`` refused — the
+    operation is not ``UNKNOWN``, the named execution ID does not exist or is
+    unreachable, or its own ``workflowId`` does not match this operation's
+    registered ``n8n_workflow_id``. CLI-only, like ``ApprovalAlreadyDecidedError`` —
+    no MCP tool ever reaches reconciliation (boundary B4's spirit), so this carries no
+    taxonomy row."""
+
+    code = "RECONCILIATION_NOT_APPLICABLE"
+    retryable = False
+    remediation = "Check the operation's state and the execution ID; nothing was recorded."
+    default_message = "This reconciliation attempt could not be verified and was not recorded."
+
+
 # --------------------------------------------------------------------------------------
 # Provider — the n8n instance's own state (ADR-009).
 # --------------------------------------------------------------------------------------
@@ -512,6 +542,7 @@ TAXONOMY: dict[str, type[OperatorError]] = {
         IdempotencyConflictError,
         ArgumentsTooLargeError,
         OperationNotFoundError,
+        RetryNotApplicableError,
         ApprovalRequiredError,
         OperationExpiredError,
         OperationCanceledError,
@@ -532,11 +563,11 @@ TAXONOMY: dict[str, type[OperatorError]] = {
         InternalError,
     )
 }
-"""24 original v1 codes, the 3 environment codes stage 04 adds, and the 1 approval
-code (``APPROVER_NOT_IN_POLICY``) stage 05 adds — verified by a contract test that
-parses that table and asserts this dict's keys are a subset of it, and that each
-implemented class's ``remediation`` matches the table's "Model's correct next move"
-column verbatim."""
+"""24 original v1 codes, the 3 environment codes stage 04 adds, the 1 approval code
+(``APPROVER_NOT_IN_POLICY``) stage 05 adds, and the 1 retry code (``RETRY_NOT_
+APPLICABLE``) stage 06 adds — verified by a contract test that parses that table and
+asserts this dict's keys are a subset of it, and that each implemented class's
+``remediation`` matches the table's "Model's correct next move" column verbatim."""
 
 __all__ = [
     "TAXONOMY",
@@ -573,8 +604,10 @@ __all__ = [
     "OptimisticLockError",
     "ProviderError",
     "RateLimitedError",
+    "ReconciliationNotApplicableError",
     "RegistryUnavailableError",
     "ResultNotAvailableError",
+    "RetryNotApplicableError",
     "StorageError",
     "WorkflowDisabledError",
     "WorkflowInactiveError",

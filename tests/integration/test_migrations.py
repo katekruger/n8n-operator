@@ -47,7 +47,7 @@ def test_empty_database_upgrades_to_head(migration_db_url: str) -> None:
             current = MigrationContext.configure(connection).get_current_revision()
     finally:
         engine.dispose()
-    assert current == "0005"
+    assert current == "0006"
 
 
 @pytest.mark.integration
@@ -131,13 +131,13 @@ def test_migration_is_idempotent_at_head(migration_db_url: str) -> None:
             current = MigrationContext.configure(connection).get_current_revision()
     finally:
         engine.dispose()
-    assert current == "0005"
+    assert current == "0006"
 
 
 @pytest.mark.integration
-def test_head_revision_is_0005() -> None:
+def test_head_revision_is_0006() -> None:
     from alembic.script import ScriptDirectory
 
     cfg = _alembic_config("sqlite+pysqlite:///:memory:")
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0005"
+    assert script.get_current_head() == "0006"

@@ -319,7 +319,8 @@ n8n-operator/
 │       │           ├── 0002_approval_binding_hash.py  # phase 6, ADR-010
 │       │           ├── 0003_v2_foundation_schema.py   # v2 data model (stage 01)
 │       │           ├── 0004_service_principal_credential_ref.py  # stage 02
-│       │           └── 0005_approval_assigned_to.py  # stage 05
+│       │           ├── 0005_approval_assigned_to.py  # stage 05
+│       │           └── 0006_audit_log_subject_index.py  # stage 06
 │       ├── notifications/          # NotificationSink implementations (ADR-018; stage 05)
 │       │   ├── __init__.py
 │       │   ├── base.py             # local NotificationEventLike/DeliveryOutcome shapes

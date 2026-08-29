@@ -72,7 +72,7 @@ def register_resources(server: MCPServer[Any], deps: ToolDeps) -> None:
     async def audit_operation(operation_id: str) -> dict[str, Any]:
         with session_scope(deps.session_factory) as session:
             try:
-                service.get_operation(
+                operation = service.get_operation(
                     session, operation_id=operation_id, principal_id=deps.principal_id
                 )
             except OperatorError as exc:
@@ -80,6 +80,7 @@ def register_resources(server: MCPServer[Any], deps: ToolDeps) -> None:
             events = OperationEventRepository(session).list_for_operation(operation_id)
         return {
             "operation_id": operation_id,
+            "parent_operation_id": operation.parent_operation_id,
             "events": [
                 {
                     "from_state": event.from_state,

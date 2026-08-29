@@ -213,7 +213,14 @@ def test_list_json_output_shape(prepared: str, cli_env: None) -> None:
     assert payload[0]["operation_id"] == prepared
     assert payload[0]["workflow_id"] == "wf.approval"
     assert payload[0]["state"] == "PENDING_APPROVAL"
-    assert set(payload[0]) == {"operation_id", "workflow_id", "state", "created_at", "updated_at"}
+    assert set(payload[0]) == {
+        "operation_id",
+        "workflow_id",
+        "state",
+        "created_at",
+        "updated_at",
+        "parent_operation_id",
+    }
 
 
 @pytest.mark.integration
