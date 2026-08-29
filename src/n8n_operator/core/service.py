@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.audit import writer as audit_writer
 from n8n_operator.audit.chain import ChainVerificationResult, verify_chain
-from n8n_operator.core import authorization, state_machine
+from n8n_operator.core import authorization, identity, state_machine
 from n8n_operator.core.handles import (
     compute_approval_binding,
     hash_approval_token,
@@ -48,6 +48,7 @@ from n8n_operator.core.idempotency import (
 from n8n_operator.core.models import (
     ApprovalDecisionContext,
     DispatchOutcome,
+    EnvironmentSummary,
     ExecutionResult,
     HealthCheckResult,
     Operation,
@@ -64,6 +65,7 @@ from n8n_operator.errors import (
     ArgumentsTooLargeError,
     ConcurrencyLimitReachedError,
     DefinitionDriftError,
+    EnvironmentArchivedError,
     HandleAlreadyUsedError,
     HandleInvalidError,
     InstanceUnreachableError,
@@ -82,12 +84,14 @@ from n8n_operator.errors import (
     WorkflowMissingOnInstanceError,
     WorkflowNotFoundError,
 )
-from n8n_operator.registry.loader import LoadedRegistry, load_registry
+from n8n_operator.registry.loader import LoadedOverlay, LoadedRegistry, load_overlay, load_registry
 from n8n_operator.registry.schema import (
     RegistryDocument,
     WorkflowDetail,
     WorkflowEntry,
+    WorkflowOverlayEntry,
     WorkflowSummary,
+    resolve_overlay,
 )
 from n8n_operator.registry.validation import ArgumentError, validate_arguments
 from n8n_operator.storage.models import STATES, RegistrySnapshot
@@ -97,12 +101,14 @@ from n8n_operator.storage.models import Operation as OperationRow
 from n8n_operator.storage.repository import (
     ApprovalRepository,
     AuditLogRepository,
+    EnvironmentRepository,
     ExecutionResultRepository,
     OperationEventRepository,
     OperationRepository,
     OrganizationMembershipRepository,
     RegistrySnapshotRepository,
     WorkflowBindingRepository,
+    WorkflowEnvironmentOverlayRepository,
 )
 from n8n_operator.storage.session import session_scope
 
@@ -374,6 +380,7 @@ def _authorize(
     workflow_id: str | None,
     enable_v2: bool,
     environment_id: str | None = None,
+    environment_organization_id: str | None = None,
     requester_principal_id: str | None = None,
     decider_principal_id: str | None = None,
 ) -> authorization.AuthorizationDecision:
@@ -400,6 +407,7 @@ def _authorize(
         tool_name=tool_name,
         workflow_id=workflow_id,
         environment_id=environment_id,
+        environment_organization_id=environment_organization_id,
         requester_principal_id=requester_principal_id,
         decider_principal_id=decider_principal_id,
     )
@@ -415,6 +423,79 @@ def _authorize(
         },
     )
     return decision
+
+
+def _overlay_entry_from_row(row: Any, *, workflow_id: str) -> WorkflowOverlayEntry:
+    return WorkflowOverlayEntry(
+        workflow_id=workflow_id,
+        n8n_workflow_id=row.n8n_workflow_id,
+        definition_hash=row.definition_hash,
+        trigger_path=row.trigger_path,
+        trigger_secret_ref=row.trigger_secret_ref,
+        approval_override=row.approval_override,
+        limits_override=row.limits_override,
+    )
+
+
+def _apply_environment(
+    session: Session,
+    *,
+    principal_id: str,
+    environment: str | None,
+    workflow_id: str,
+    base_entry: WorkflowEntry,
+    tool_name: str,
+    enable_v2: bool,
+    forbid_archived: bool = False,
+) -> tuple[str | None, WorkflowEntry]:
+    """Resolve the environment (Stage 04, ADR-016) and apply its overlay (if any) on
+    top of ``base_entry`` (already resolved from the active registry snapshot by the
+    caller) — the one place environment resolution, authorization, and overlay merge
+    happen together, so the three can never drift out of step for a given call. Also
+    performs the workflow-scope/role-capability authorization check
+    (:func:`_authorize`, Stage 03), now finally reachable with a real
+    ``environment_id`` instead of ``None`` (closes THREAT_MODEL.md RR-13).
+
+    ``enable_v2=False`` (v1, unchanged): returns ``(None, base_entry)`` — no
+    environment concept reaches v1 callers at all, literally the same result every
+    pre-stage-04 call already got.
+
+    Raises :class:`WorkflowNotFoundError` on an authorization denial (the identical
+    shape a nonexistent workflow already produces — invariant I14), and
+    :class:`EnvironmentArchivedError` when ``forbid_archived`` and the resolved
+    environment is archived (state-changing calls only — AC-47; read tools pass
+    ``forbid_archived=False``, the default, since an archived environment must stay
+    resolvable for historical operations).
+    """
+    if not enable_v2:
+        return None, base_entry
+
+    resolved_env = identity.resolve_environment(
+        session, principal_id=principal_id, environment=environment
+    )
+    if forbid_archived and resolved_env.archived_at is not None:
+        raise EnvironmentArchivedError()
+
+    decision = _authorize(
+        session,
+        principal_id=principal_id,
+        tool_name=tool_name,
+        workflow_id=workflow_id,
+        environment_id=resolved_env.id,
+        environment_organization_id=resolved_env.organization_id,
+        enable_v2=enable_v2,
+    )
+    if not decision.allowed:
+        raise WorkflowNotFoundError()
+
+    overlay_row = WorkflowEnvironmentOverlayRepository(session).get(workflow_id, resolved_env.id)
+    overlay_entry = (
+        _overlay_entry_from_row(overlay_row, workflow_id=workflow_id)
+        if overlay_row is not None
+        else None
+    )
+    merged_entry = resolve_overlay(base_entry, overlay_entry)
+    return resolved_env.id, merged_entry
 
 
 def _get_owned_operation_row(
@@ -443,11 +524,20 @@ def _get_owned_operation_row(
         # `enable_v2=False` (v1 stays byte-identical to before this stage for every
         # *gated* check), which would silently defeat the ownership check itself.
         raise OperationNotFoundError()
+    environment_organization_id: str | None = None
+    if row.environment_id is not None:
+        environment_row = EnvironmentRepository(session).get(row.environment_id)
+        # A real, prior operation's own `environment_id` always still names a real row
+        # — environments are archived, never deleted (ADR-016 section 4).
+        assert environment_row is not None
+        environment_organization_id = environment_row.organization_id
     decision = _authorize(
         session,
         principal_id=principal_id,
         tool_name=tool_name,
         workflow_id=row.workflow_id,
+        environment_id=row.environment_id,
+        environment_organization_id=environment_organization_id,
         enable_v2=enable_v2,
     )
     if not decision.allowed:
@@ -651,6 +741,57 @@ def reload_registry(
     return snapshot, False
 
 
+def reload_overlay(
+    session: Session, path: Path, *, environment_id: str, actor: str = "local"
+) -> LoadedOverlay:
+    """Load, validate (rules R13-R14, ADR-016), and persist one environment's overlay
+    file — validated against the **current active base registry snapshot**, not
+    whatever the base meant when the overlay was originally authored.
+
+    Unlike :func:`reload_registry`, this writes no immutable snapshot of its own:
+    ``workflow_environment_overlays`` rows are deliberately mutable (see
+    ``WorkflowEnvironmentOverlayRepository``'s own docstring) — a *reload* replaces the
+    full set of overlays this environment has, the same way re-applying a config file
+    would. Every overlay entry the file names is upserted; any existing overlay row for
+    this environment whose ``workflow_id`` the file no longer names is deleted, so a
+    workflow removed from the file is no longer overridden, not silently left with a
+    stale prior override. What must never change retroactively is what an
+    already-*prepared* operation was governed by — that guarantee comes from
+    ``core.service`` resolving and freezing the merged contract once, at
+    ``prepare_operation`` time, never from re-reading this table later.
+    """
+    document = _require_active_document(session)
+    loaded = load_overlay(path, base_document=document, base_resolved_entries=document.workflows)
+
+    overlay_repo = WorkflowEnvironmentOverlayRepository(session)
+    named_workflow_ids = {overlay.workflow_id for overlay in loaded.overlays}
+    for existing in overlay_repo.list_for_environment(environment_id):
+        if existing.workflow_id not in named_workflow_ids:
+            overlay_repo.delete(existing.workflow_id, environment_id)
+    for overlay in loaded.overlays:
+        overlay_repo.upsert(
+            workflow_id=overlay.workflow_id,
+            environment_id=environment_id,
+            n8n_workflow_id=overlay.n8n_workflow_id,
+            definition_hash=overlay.definition_hash,
+            trigger_path=overlay.trigger_path,
+            trigger_secret_ref=overlay.trigger_secret_ref,
+            approval_override=overlay.approval_override,
+            limits_override=overlay.limits_override,
+        )
+
+    audit_writer.write(
+        AuditLogRepository(session),
+        actor=actor,
+        action="overlay.reloaded",
+        subject_type="environment",
+        subject_id=environment_id,
+        outcome="allowed",
+        detail={"source_path": loaded.source_path, "overlay_count": len(loaded.overlays)},
+    )
+    return loaded
+
+
 def list_workflows(
     session: Session,
     *,
@@ -659,6 +800,9 @@ def list_workflows(
     side_effects: str | None = None,
     principal_id: str | None = None,
     enable_v2: bool = False,
+    environment: str | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
 ) -> list[WorkflowSummary]:
     """Every enabled workflow in the active snapshot (MCP_TOOLS.md section 2.1).
 
@@ -668,13 +812,58 @@ def list_workflows(
     way it would for a caller who scrolled through the unfiltered list by hand — it is
     not a second gate alongside ``enabled`` (ADR-002 default-deny already is that gate).
 
-    v2 (``enable_v2=True``): workflows outside the caller's role/workflow-scope are
-    excluded the same way (MCP_TOOLS.md section 5.9) — a caller's active memberships
-    are fetched once and each entry checked against them, rather than one database
-    round trip per workflow.
+    v2 (``enable_v2=True``): resolves one environment for the whole call (Stage 04,
+    ``core.identity.resolve_environment`` — a caller wanting the resolved ID for its
+    own result envelope calls that directly, the same function this uses), excludes
+    workflows outside the caller's role/workflow-scope for that environment
+    (MCP_TOOLS.md section 5.9), and reflects that environment's overlay — a workflow
+    overlaid to ``approval: required`` in this environment shows that, not the base
+    entry's own value.
+
+    ``limit``/``cursor`` (v2 only — MCP_TOOLS.md section 5.9, "same shape as v1
+    ``list_operations``"): applied *after* every filter above, including the
+    authorization filter, so a cursor can never walk past an entry a filter would
+    have hidden (the same pagination-side-channel discipline
+    ``list_operations``/``OperationRepository.list`` already establish). Workflow IDs
+    have no ULID-style sortable timestamp, so the cursor is simply "every entry whose
+    ``id`` sorts strictly after this one", over the same deterministic, alphabetical
+    ``id`` ordering every page uses — stable regardless of how the registry document
+    itself orders its own ``workflows`` list. v1 (``enable_v2=False``) ignores both:
+    the full, unpaginated list every v1 caller has always received.
     """
     document = _require_active_document(session)
-    summaries = [WorkflowSummary.from_entry(entry) for entry in document.workflows if entry.enabled]
+    entries = [entry for entry in document.workflows if entry.enabled]
+
+    if enable_v2:
+        assert principal_id is not None  # every v2 caller is authenticated
+        resolved_env = identity.resolve_environment(
+            session, principal_id=principal_id, environment=environment
+        )
+        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
+            principal_id
+        )
+        merged_entries = []
+        for entry in entries:
+            if not authorization.evaluate(
+                memberships=memberships,
+                tool_name="list_workflows",
+                workflow_id=entry.id,
+                environment_id=resolved_env.id,
+                environment_organization_id=resolved_env.organization_id,
+            ).allowed:
+                continue
+            overlay_row = WorkflowEnvironmentOverlayRepository(session).get(
+                entry.id, resolved_env.id
+            )
+            overlay_entry = (
+                _overlay_entry_from_row(overlay_row, workflow_id=entry.id)
+                if overlay_row is not None
+                else None
+            )
+            merged_entries.append(resolve_overlay(entry, overlay_entry))
+        entries = merged_entries
+
+    summaries = [WorkflowSummary.from_entry(entry) for entry in entries]
     if tags:
         wanted = set(tags)
         summaries = [s for s in summaries if wanted <= set(s.tags)]
@@ -682,23 +871,25 @@ def list_workflows(
         summaries = [s for s in summaries if s.risk == risk]
     if side_effects is not None:
         summaries = [s for s in summaries if s.side_effects == side_effects]
+
     if enable_v2:
-        assert principal_id is not None  # every v2 caller is authenticated
-        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
-            principal_id
-        )
-        summaries = [
-            s
-            for s in summaries
-            if authorization.evaluate(
-                memberships=memberships, tool_name="list_workflows", workflow_id=s.workflow_id
-            ).allowed
-        ]
+        if not (1 <= limit <= 100):
+            raise InvalidArgumentsError(details={"limit": limit})
+        summaries = sorted(summaries, key=lambda s: s.workflow_id)
+        if cursor is not None:
+            summaries = [s for s in summaries if s.workflow_id > cursor]
+        summaries = summaries[:limit]
+
     return summaries
 
 
 def describe_workflow(
-    session: Session, *, workflow_id: str, principal_id: str | None = None, enable_v2: bool = False
+    session: Session,
+    *,
+    workflow_id: str,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
+    environment: str | None = None,
 ) -> WorkflowDetail:
     """One workflow's full contract (MCP_TOOLS.md section 2.2). Disabled and absent are
     the same ``WORKFLOW_NOT_FOUND`` here — unlike ``prepare_operation``, discovery does
@@ -709,15 +900,15 @@ def describe_workflow(
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
     if principal_id is not None:
-        decision = _authorize(
+        _, entry = _apply_environment(
             session,
             principal_id=principal_id,
-            tool_name="describe_workflow",
+            environment=environment,
             workflow_id=workflow_id,
+            base_entry=entry,
+            tool_name="describe_workflow",
             enable_v2=enable_v2,
         )
-        if not decision.allowed:
-            raise WorkflowNotFoundError()
     return WorkflowDetail.from_entry(entry)
 
 
@@ -728,6 +919,7 @@ def validate_input(
     arguments: dict[str, Any],
     principal_id: str | None = None,
     enable_v2: bool = False,
+    environment: str | None = None,
 ) -> list[ArgumentError]:
     """Check ``arguments`` against a workflow's schema without creating an operation
     (MCP_TOOLS.md section 2.4)."""
@@ -736,15 +928,15 @@ def validate_input(
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
     if principal_id is not None:
-        decision = _authorize(
+        _, entry = _apply_environment(
             session,
             principal_id=principal_id,
-            tool_name="validate_input",
+            environment=environment,
             workflow_id=workflow_id,
+            base_entry=entry,
+            tool_name="validate_input",
             enable_v2=enable_v2,
         )
-        if not decision.allowed:
-            raise WorkflowNotFoundError()
     return validate_arguments(entry.input_schema, arguments)
 
 
@@ -755,6 +947,7 @@ def preflight_workflow(
     preflight: PreflightPort,
     principal_id: str | None = None,
     enable_v2: bool = False,
+    environment: str | None = None,
 ) -> PreflightResult:
     """Run the same checks ``prepare_operation`` runs, without creating an operation
     (MCP_TOOLS.md section 2.5)."""
@@ -763,15 +956,15 @@ def preflight_workflow(
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
     if principal_id is not None:
-        decision = _authorize(
+        _, entry = _apply_environment(
             session,
             principal_id=principal_id,
-            tool_name="preflight_workflow",
+            environment=environment,
             workflow_id=workflow_id,
+            base_entry=entry,
+            tool_name="preflight_workflow",
             enable_v2=enable_v2,
         )
-        if not decision.allowed:
-            raise WorkflowNotFoundError()
     return preflight.check(entry)
 
 
@@ -805,7 +998,7 @@ def prepare_operation(
     session: Session,
     *,
     principal_id: str,
-    environment: str,
+    environment: str | None = None,
     workflow_id: str,
     arguments: dict[str, Any],
     preflight: PreflightPort,
@@ -839,15 +1032,25 @@ def prepare_operation(
     entry = _require_enabled_entry(document, workflow_id)
     assert entry.approval is not None  # resolved entries always carry a concrete value
 
-    decision = _authorize(
+    resolved_environment_id, entry = _apply_environment(
         session,
         principal_id=principal_id,
-        tool_name="prepare_operation",
+        environment=environment,
         workflow_id=workflow_id,
+        base_entry=entry,
+        tool_name="prepare_operation",
         enable_v2=enable_v2,
+        forbid_archived=True,
     )
-    if not decision.allowed:
-        raise WorkflowNotFoundError()
+    # The legacy free-text idempotency-namespace column (ADR-011's `environment` — v1
+    # unchanged: whatever the caller passed, or "default"). In v2 it becomes the
+    # resolved environment's own id, so the same idempotency key against two different
+    # environments never collides (Stage 04's own named test scenario).
+    environment_value = (
+        resolved_environment_id
+        if resolved_environment_id is not None
+        else (environment if environment is not None else "default")
+    )
 
     canonical_bytes = canonicalize_arguments(arguments)
     fingerprint = fingerprint_arguments(canonical_bytes)
@@ -891,7 +1094,7 @@ def prepare_operation(
     if idempotency_key is not None:
         existing = op_repo.find_by_idempotency(
             principal_id=principal_id,
-            environment=environment,
+            environment=environment_value,
             workflow_id=workflow_id,
             idempotency_key=idempotency_key,
         )
@@ -908,7 +1111,8 @@ def prepare_operation(
     operation = op_repo.create(
         id=handle,
         principal_id=principal_id,
-        environment=environment,
+        environment=environment_value,
+        environment_id=resolved_environment_id,
         snapshot_id=snapshot.id,
         workflow_id=workflow_id,
         definition_hash=entry.definition_hash,
@@ -1327,7 +1531,15 @@ def execute_operation(
     row = _get_owned_operation_row(
         session, operation_id, principal_id, tool_name="execute_operation", enable_v2=enable_v2
     )
-    if row.environment != environment:
+    # v1 only: the operation's own recorded `environment` must match what the caller
+    # (still) says it is — v1 has exactly one value ("default"), so this can never
+    # actually fail; it stands in for what a real multi-environment check would need
+    # to enforce, the same "make the structural invariant explicit" reasoning as the
+    # approval-token binding check elsewhere in this module. v2 has no re-supplied
+    # `environment` to validate against here — `operation.environment` was already
+    # resolved and fixed once, at `prepare_operation` time; nothing this function's
+    # caller could pass would add real coverage over that.
+    if not enable_v2 and row.environment != environment:
         raise OperationNotFoundError()
 
     if row.handle_burned_at is not None:
@@ -1574,10 +1786,16 @@ def list_operations(
     last operation in a full page and omits it once a page comes back short.
 
     v1 (``enable_v2=False``): unchanged — every row belongs to ``principal_id``
-    (ownership-scoped). v2: visibility is role/scope-based, not ownership-based
-    (ADR-015) — an operator/approver/admin whose grants cover a workflow sees every
-    principal's operations against it, not only their own. The scope filter is pushed
-    into the SQL query itself, *before* ``LIMIT`` (``OperationRepository.list``'s own
+    (ownership-scoped), and ``environment`` (still the legacy free-text value, always
+    ``"default"``) is an ordinary exact-match filter. v2: visibility is role/scope-
+    based, not ownership-based (ADR-015) — an operator/approver/admin whose grants
+    cover a workflow sees every principal's operations against it, not only their
+    own. ``environment`` is a real environment argument, standard-resolved the same
+    way every other v2 tool resolves one (Stage 04, MCP_TOOLS.md section 5.9) —
+    omitted with more than one environment visible raises
+    :class:`~n8n_operator.errors.EnvironmentRequiredError`, exactly like
+    ``describe_workflow``. The scope filter is pushed into the SQL query itself,
+    *before* ``LIMIT`` (``OperationRepository.list``'s own
     ``workflow_id_like_patterns``), so a cursor can never walk past a row the filter
     would have hidden (the pagination side channel the completion gate names). A
     caller-supplied ``workflow_id`` filter that the caller isn't authorized for
@@ -1593,7 +1811,17 @@ def list_operations(
 
     scoped_principal_id: str | None = principal_id
     like_patterns: list[str] | None = None
+    resolved_environment: str | None = environment
     if enable_v2:
+        # v2's `environment` argument names a real environment (MCP_TOOLS.md section
+        # 5.9), resolved by the same rule every other v2 tool uses — not the legacy
+        # v1 free-text filter this parameter doubles as. The resolved id is exactly
+        # what `Operation.environment` holds for a v2-prepared row (`prepare_
+        # operation`'s own doc), so filtering by it below is still the same simple
+        # exact-match column comparison.
+        resolved_environment = identity.resolve_environment(
+            session, principal_id=principal_id, environment=environment
+        ).id
         memberships = OrganizationMembershipRepository(session).list_active_for_principal(
             principal_id
         )
@@ -1624,7 +1852,7 @@ def list_operations(
 
     rows = OperationRepository(session).list(
         principal_id=scoped_principal_id,
-        environment=environment,
+        environment=resolved_environment,
         workflow_id=workflow_id,
         workflow_id_like_patterns=like_patterns,
         states=states,
@@ -1671,6 +1899,62 @@ def expire_overdue_operations(session: Session) -> int:
         if after.state != before:
             changed += 1
     return changed
+
+
+def list_environments(session: Session, *, principal_id: str) -> list[EnvironmentSummary]:
+    """Every environment visible to ``principal_id`` (MCP_TOOLS.md section 5.9,
+    ADR-016 section 4) — v2 only; callers gate registration on ``deps.enable_v2`` the
+    same way ``whoami`` does.
+
+    Archived environments are included only for a caller who is ``admin`` in that
+    environment's own organization (ADR-016 section 4: an archived environment stays
+    resolvable forever by ID, but does not appear in a *list* to anyone else) — never
+    an instance URL, a raw workflow ID, or a secret reference, and never an archived
+    environment's name to a non-admin (it is simply omitted, the same "absent, not
+    denied" shape ``list_workflows`` already uses for filtering).
+
+    ``approval_policy_summary`` is computed from this environment's own resolved
+    (base + overlay) workflow contracts — never a raw policy dump — so a caller sees
+    "3 of 5 workflows require approval" for an environment whose overlays tighten
+    approval, and the base registry's own count for one that has none.
+    """
+    memberships = OrganizationMembershipRepository(session).list_active_for_principal(principal_id)
+    admin_org_ids = {m.organization_id for m in memberships if "admin" in m.roles}
+    visible = identity.list_visible_environments(
+        session, principal_id=principal_id, include_archived=True
+    )
+    document = _require_active_document(session)
+    overlays = WorkflowEnvironmentOverlayRepository(session)
+    summaries: list[EnvironmentSummary] = []
+    for env in visible:
+        archived = env.archived_at is not None
+        if archived and env.organization_id not in admin_org_ids:
+            continue
+        enabled_entries = [entry for entry in document.workflows if entry.enabled]
+        requires_approval = 0
+        for entry in enabled_entries:
+            overlay_row = overlays.get(entry.id, env.id)
+            overlay_entry = (
+                _overlay_entry_from_row(overlay_row, workflow_id=entry.id)
+                if overlay_row is not None
+                else None
+            )
+            merged = resolve_overlay(entry, overlay_entry)
+            if merged.approval == "required":
+                requires_approval += 1
+        summaries.append(
+            EnvironmentSummary(
+                environment_id=env.id,
+                organization_id=env.organization_id,
+                name=env.name,
+                is_production=env.is_production,
+                archived=archived,
+                approval_policy_summary=(
+                    f"{requires_approval} of {len(enabled_entries)} workflows require approval"
+                ),
+            )
+        )
+    return summaries
 
 
 # ----------------------------------------------------------------------------------

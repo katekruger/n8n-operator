@@ -1,0 +1,31 @@
+# n8n Operator — example environment overlay: staging
+#
+# See development.yaml for the overlay shape and rules (R13/R14). Staging sits
+# between development (no overrides) and production (the strictest overrides): real
+# enough to validate a campaign or integration end to end, but not yet touching real
+# customer data at production volume, so its own limits are tightened a little —
+# never loosened past what the base registry already allows.
+#
+# Validate before loading:
+#     n8n-operator environment validate-overlay <environment-id> \
+#         --path examples/environments/staging.yaml
+
+apiVersion: n8n-operator/v1
+
+metadata:
+  name: staging
+  description: >
+    A caller preparing crm.sync_contact here is exercised against a real, but
+    non-production, n8n instance and a real, but lower, throughput ceiling than the
+    base registry's own default — a GTM engineer validating a workflow here before
+    preparing its production equivalent under stricter approval (ARCHITECTURE.md
+    section 11.1's own worked journey).
+
+overlays:
+  # The base registry places no rate ceiling on crm.sync_contact at all
+  # (`limits.rate_limit_per_minute` is unset). Staging adds one for the first time —
+  # allowed under R14 ("no base ceiling" can never be *weakened*, since there was
+  # nothing to weaken; any concrete value is stricter than none).
+  - workflow_id: crm.sync_contact
+    limits_override:
+      rate_limit_per_minute: 5

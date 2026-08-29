@@ -34,6 +34,7 @@ __all__ = [
     "AuditEvent",
     "DispatchOutcome",
     "Environment",
+    "EnvironmentSummary",
     "ExecutionResult",
     "HealthCheckResult",
     "Operation",
@@ -51,6 +52,21 @@ class Environment(StrEnum):
     environments extend this type rather than validate against nothing at all."""
 
     DEFAULT = "default"
+
+
+class EnvironmentSummary(BaseModel):
+    """One row of ``list_environments`` (MCP_TOOLS.md section 5.9, stage 04) — never
+    an instance URL, a raw workflow ID, a secret reference, or a hidden (archived, to
+    a non-admin) environment's name (ADR-016 section 4)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    environment_id: str
+    organization_id: str
+    name: str
+    is_production: bool
+    archived: bool
+    approval_policy_summary: str
 
 
 class Principal(BaseModel):

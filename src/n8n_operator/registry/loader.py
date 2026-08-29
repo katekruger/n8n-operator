@@ -40,8 +40,10 @@ from pydantic import ValidationError as PydanticValidationError
 
 from n8n_operator.errors import RegistryUnavailableError
 from n8n_operator.registry.schema import (
+    EnvironmentOverlayDocument,
     RegistryDocument,
     WorkflowEntry,
+    WorkflowOverlayEntry,
     resolve_workflow_entry,
 )
 
@@ -395,6 +397,140 @@ def _check_r12_correlation(entry: WorkflowEntry) -> RuleViolation | None:
     return None
 
 
+# --------------------------------------------------------------------------------------
+# Environment overlay rules R13-R14 (BUILD_PLAN section 6.6, stage 04, ADR-016).
+# Checked against the base document's *resolved* entries, at overlay-load time only —
+# see registry/schema.py's resolve_overlay() docstring for why this is not re-checked
+# on every later resolution.
+# --------------------------------------------------------------------------------------
+
+# Direction each limits_override key must move relative to the base's resolved value
+# to count as "strengthening" (ADR-016 section 1's own two explicit examples — raise
+# approval_ttl_seconds, lower max_concurrent — plus the same one-directional-only shape
+# ADR-011's rule R11 already uses for max_argument_bytes, applied to every other
+# per-workflow limit the same way execution/dispatch strictness already reasons about
+# them: shorter windows and lower ceilings are the conservative direction everywhere
+# except the human *approval* deliberation window, which is safer when longer).
+_LIMITS_STRENGTHEN_DIRECTION: dict[str, str] = {
+    "approval_ttl_seconds": "raise",
+    "execution_ttl_seconds": "lower",
+    "timeout_seconds": "lower",
+    "max_concurrent": "lower",
+    "rate_limit_per_minute": "lower",
+    "max_argument_bytes": "lower",
+}
+
+
+def _check_r13_overlay_field_allowlist(
+    overlay_entries: list[WorkflowOverlayEntry], base_ids: set[str]
+) -> list[RuleViolation]:
+    """R13: an overlay entry's field shape is already restricted by
+    ``WorkflowOverlayEntry``'s own ``extra="forbid"`` (no field exists on that model
+    for ``input_schema``/``side_effects``/``risk``/``title``/``description``/``tags``
+    to even name) — this check covers what a single entry's own shape can't: every
+    overlay's ``workflow_id`` must reference a real entry in the base registry (an
+    overlay for a workflow that doesn't exist is never silently ignored), and no two
+    overlay entries in the same document may name the same ``workflow_id``."""
+    violations: list[RuleViolation] = []
+    seen: set[str] = set()
+    for overlay in overlay_entries:
+        if overlay.workflow_id not in base_ids:
+            violations.append(
+                RuleViolation(
+                    "R13",
+                    f"overlay names workflow_id {overlay.workflow_id!r}, which does not "
+                    "exist in the active base registry",
+                    overlay.workflow_id,
+                )
+            )
+        if overlay.workflow_id in seen:
+            violations.append(
+                RuleViolation(
+                    "R13",
+                    f"duplicate overlay entry for workflow_id {overlay.workflow_id!r}",
+                    overlay.workflow_id,
+                )
+            )
+        seen.add(overlay.workflow_id)
+        if overlay.limits_override:
+            unknown = set(overlay.limits_override) - set(_LIMITS_STRENGTHEN_DIRECTION)
+            if unknown:
+                violations.append(
+                    RuleViolation(
+                        "R13",
+                        f"limits_override names unknown limit key(s): {sorted(unknown)}",
+                        overlay.workflow_id,
+                    )
+                )
+    return violations
+
+
+def _check_r14_overlay_strengthen_only(
+    base_entry: WorkflowEntry, overlay: WorkflowOverlayEntry
+) -> list[RuleViolation]:
+    """R14: an overlay may only *strengthen* the base entry's approval/limits policy,
+    never weaken it. ``approval_override`` is structurally limited to ``"required"``
+    by the model's own ``Literal`` type (a schema-validation failure catches
+    "none", not this function) — checked here only for the case that IS reachable:
+    an overlay setting ``approval_override: "required"`` against a base that is
+    *already* ``"required"`` is redundant but harmless, never a violation; there is no
+    way to reach this function with an actual weakening of `approval` at all, which is
+    exactly the point of the Literal-type restriction.
+    """
+    violations: list[RuleViolation] = []
+    assert base_entry.approval is not None  # base_entry is always already-resolved
+
+    if not overlay.limits_override:
+        return violations
+    for key, overlay_value in overlay.limits_override.items():
+        direction = _LIMITS_STRENGTHEN_DIRECTION.get(key)
+        if direction is None:
+            continue  # reported by R13 instead — an unknown key, not a direction violation
+        base_value = getattr(base_entry.limits, key)
+        if base_value is None:
+            continue  # no base ceiling/floor to violate — any concrete value is stricter
+        if direction == "lower" and overlay_value > base_value:
+            violations.append(
+                RuleViolation(
+                    "R14",
+                    f"limits_override.{key} ({overlay_value}) may only lower the base "
+                    f"value ({base_value}), never raise it",
+                    overlay.workflow_id,
+                )
+            )
+        elif direction == "raise" and overlay_value < base_value:
+            violations.append(
+                RuleViolation(
+                    "R14",
+                    f"limits_override.{key} ({overlay_value}) may only raise the base "
+                    f"value ({base_value}), never lower it",
+                    overlay.workflow_id,
+                )
+            )
+    return violations
+
+
+def check_overlay_rules(
+    base_document: RegistryDocument,
+    base_resolved_entries: list[WorkflowEntry],
+    overlay_document: EnvironmentOverlayDocument,
+) -> list[RuleViolation]:
+    """Run R13-R14 against ``overlay_document``, resolved against
+    ``base_resolved_entries`` (the *current* active base registry's own resolved
+    entries — the overlay is validated against what the base means *right now*, not
+    against whatever it meant when originally authored)."""
+    base_ids = {entry.id for entry in base_document.workflows}
+    violations = list(_check_r13_overlay_field_allowlist(overlay_document.overlays, base_ids))
+
+    by_id = {entry.id: entry for entry in base_resolved_entries}
+    for overlay in overlay_document.overlays:
+        base_entry = by_id.get(overlay.workflow_id)
+        if base_entry is None:
+            continue  # already reported by R13 above
+        violations.extend(_check_r14_overlay_strengthen_only(base_entry, overlay))
+    return violations
+
+
 def check_rules(
     document: RegistryDocument,
     resolved_entries: list[WorkflowEntry],
@@ -539,6 +675,54 @@ def load_registry(path: Path, *, server_max_argument_bytes: int) -> LoadedRegist
     )
 
 
+def parse_overlay_document(raw: Any) -> EnvironmentOverlayDocument:
+    """As :func:`parse_registry_document`, for an overlay file."""
+    try:
+        return EnvironmentOverlayDocument.model_validate(raw)
+    except PydanticValidationError as exc:
+        violations = [RuleViolation("SCHEMA", error["msg"]) for error in exc.errors()]
+        raise RegistryValidationError(violations) from None
+
+
+@dataclass(frozen=True)
+class LoadedOverlay:
+    """The pure, storage-agnostic result of a successful overlay load — parallel to
+    :class:`LoadedRegistry`, deliberately without a ``content_hash``/canonical-document
+    concept of its own: an overlay has no independent identity to snapshot the way the
+    base registry does (decision: resolution happens live, per ``registry/schema.py``'s
+    ``resolve_overlay`` docstring, not via a frozen overlay snapshot)."""
+
+    overlays: list[WorkflowOverlayEntry] = field(repr=False)
+    source_path: str
+    loaded_at: datetime
+
+
+def load_overlay(
+    path: Path, *, base_document: RegistryDocument, base_resolved_entries: list[WorkflowEntry]
+) -> LoadedOverlay:
+    """Parse, validate, and resolve the environment overlay file at ``path``, against
+    the currently active base registry (``base_document``/``base_resolved_entries`` —
+    typically ``core.service.get_active_snapshot``'s own resolved output).
+
+    Raises :class:`RegistryParseError` if the file cannot even be read or parsed, or
+    :class:`RegistryValidationError` carrying every R13/R14 violation found. Returns a
+    :class:`LoadedOverlay` only when the overlay is entirely clean.
+    """
+    source = read_registry_source(path)
+    raw = parse_registry_yaml(source)
+    document = parse_overlay_document(raw)
+
+    violations = check_overlay_rules(base_document, base_resolved_entries, document)
+    if violations:
+        raise RegistryValidationError(violations)
+
+    return LoadedOverlay(
+        overlays=list(document.overlays),
+        source_path=str(path),
+        loaded_at=datetime.now(UTC),
+    )
+
+
 def _canonical_document(
     document: RegistryDocument, resolved_entries: list[WorkflowEntry]
 ) -> dict[str, Any]:
@@ -558,13 +742,17 @@ def _canonical_document(
 
 __all__ = [
     "MAX_REGISTRY_FILE_BYTES",
+    "LoadedOverlay",
     "LoadedRegistry",
     "RegistryParseError",
     "RegistryValidationError",
     "RuleViolation",
     "canonical_json_bytes",
+    "check_overlay_rules",
     "check_rules",
+    "load_overlay",
     "load_registry",
+    "parse_overlay_document",
     "parse_registry_document",
     "parse_registry_yaml",
     "read_registry_source",

@@ -245,6 +245,10 @@ n8n-operator/
 │   ├── registry/
 │   │   ├── workflows.example.yaml         # annotated sample registry
 │   │   └── synthetic_test_workflow.json   # importable n8n workflow for testing (phase 9)
+│   ├── environments/                      # annotated sample overlays (stage 04)
+│   │   ├── development.yaml               # no overrides — inherits the base registry
+│   │   ├── staging.yaml                   # a new rate ceiling the base doesn't set
+│   │   └── production.yaml                # approval required + tighter limits
 │   └── mcp-clients/                       # ready-to-copy client configs (phase 9)
 │       ├── README.md
 │       ├── claude_desktop_config.json     # stdio
@@ -341,7 +345,8 @@ n8n-operator/
 │               ├── audit.py        # verify, export
 │               ├── health.py       # get_instance_health, from the command line
 │               ├── db.py           # init, migrate, status, migrate-to-postgres
-│               └── identity.py     # orgs, memberships, service principals (stage 02)
+│               ├── identity.py     # orgs, memberships, service principals (stage 02)
+│               └── environment.py  # environments, overlays (stage 04)
 └── tests/
     ├── conftest.py
     ├── fixtures/
@@ -2357,15 +2362,91 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 04 — Multi-environment registry
 
-- [ ] `environments`, `workflow_environment_overlays` tables; overlay field allowlist
-      and strengthen-only enforcement at load time (rules R13, R14; ADR-016)
-- [ ] `list_environments` tool (MCP_TOOLS.md section 5.2)
-- [ ] Default-environment resolution: implicit only for a single non-archived
-      environment, `ENVIRONMENT_REQUIRED` otherwise, production never implicit
-      (ADR-016 section 3)
-- [ ] Environment archival (not deletion); historical operations remain resolvable
-      (ADR-016 section 4)
-- [ ] AC-37, AC-47, AC-48 demonstrable
+- [x] `environments`, `workflow_environment_overlays` tables — already existed from
+      stage 01's schema-only migration; this stage gives `EnvironmentRepository` full
+      CRUD (`create`/`get`/`archive`, alongside stage 02's `list_for_organization`)
+      and adds `WorkflowEnvironmentOverlayRepository` (`upsert`/`get`/
+      `list_for_environment`/`delete`), the one deliberately mutable repository in
+      this schema. Overlay field allowlist (an unrecognized field, unknown/duplicate
+      `workflow_id`) and strengthen-only enforcement (rule R13/R14 —
+      `registry/loader.py`'s `check_overlay_rules`, an asymmetric per-field
+      "strengthen direction" table: `approval_ttl_seconds` raise-only, every other
+      limit lower-only) run at `reload-overlay` time, against the *current active*
+      base snapshot — `tests/property/test_overlay_properties.py` (Hypothesis over
+      base/overlay limit pairs, plus a real-database proof of the
+      `(workflow_id, environment_id)` unique constraint).
+- [x] `list_environments` tool (MCP_TOOLS.md section 5.2) — `core.service.
+      list_environments` + the 14th MCP tool (`whoami` is the 13th), gated the same
+      way `whoami` is on `deps.enable_v2`. Never an instance URL, raw workflow ID, or
+      secret reference; an archived environment is included only for a caller who is
+      `admin` in its organization (ADR-016 section 4). `tests/integration/
+      test_mcp_list_environments_tool.py`.
+- [x] Default-environment resolution: implicit only for a single non-archived
+      environment, `ENVIRONMENT_REQUIRED` otherwise, production never implicit even
+      across two different organizations (ADR-016 section 3) —
+      `core.identity.resolve_environment`, reused by every v1 use case through the
+      new `core.service._apply_environment` helper. Naming an environment ID resolves
+      identically whether it doesn't exist or the caller isn't a member of its
+      organization (no enumeration oracle). `tests/integration/
+      test_environment_service.py`.
+- [x] Environment archival (not deletion); a new `prepare_operation` against an
+      archived environment is refused (`ENVIRONMENT_ARCHIVED`), but every read tool
+      and an operation already `EXECUTING`-bound to it remain resolvable forever
+      (ADR-016 section 4). `tests/integration/
+      test_environment_service.py::test_archived_environment_rejects_new_prepare_but_stays_readable`,
+      `::test_operation_prepared_before_archival_may_still_execute`.
+- [x] Every v1 tool gained an `environment: str | None = None` argument and an
+      `environment` result field (v2 only — v1's own result shape is byte-identical to
+      before this stage); `prepare_operation`/`execute_operation` freeze the resolved
+      environment onto the operation row itself (`operations.environment`/
+      `environment_id`), so a later overlay edit never rewrites what an
+      already-prepared operation was governed by, and the idempotency namespace
+      (which already included `environment`) now genuinely separates two
+      environments reusing the same key. `tests/integration/
+      test_environment_service.py::test_idempotency_key_reused_across_environments_does_not_collide`.
+- [x] A real security gap found and closed within this same stage, before it ever
+      reached a live v1 tool call: `core.authorization.evaluate`'s environment-scope
+      conjunct had no notion of which organization an `environment_id` actually
+      belonged to, so a membership's `environment_scope: ["*"]` wrongly authorized
+      *any* environment, including one in an unrelated organization. Fixed via a new
+      `environment_organization_id` parameter, checked before a membership's own
+      scope pattern (THREAT_MODEL.md T-54; closes RR-13).
+      `tests/property/test_no_enumeration.py::test_a_wildcard_environment_scope_never_authorizes_another_organizations_environment`,
+      `tests/integration/test_environment_service.py::test_cross_environment_operation_access_is_denied`.
+- [x] `n8n-operator environment` CLI: `create`/`archive`/`list`/`show-safe`/`health`/
+      `registry-diff`/`validate-overlay`/`reload-overlay`. `show-safe` never prints a
+      resolved URL or credential, only the reference string itself (ADR-006);
+      `health` resolves *that one environment's own* n8n configuration, not the
+      process-wide one `n8n-operator health` (v1) checks. `tests/integration/
+      test_cli_environment.py`, including a no-secrets artifact-inspection test
+      (`test_no_command_ever_prints_the_resolved_secret_value`).
+- [x] Annotated `examples/environments/{development,staging,production}.yaml`,
+      validated against the real example base registry
+      (`examples/registry/workflows.example.yaml`); `docs/WORKFLOW_REGISTRY.md`
+      section 9.5.
+- [x] Per-environment n8n client resolution for the MCP transport: `ToolDeps.
+      n8n_client_factory` (`mcp/tools.py`'s new `N8nAdapterBundle` — preflight/health/
+      dispatch bound to one environment), backed by `mcp/server.py`'s
+      `_EnvironmentAdapterFactory`, which resolves `Environment.n8n_base_url_ref`/
+      `n8n_api_key_ref` the first time a given environment is asked for and caches
+      the client for the process lifetime (never re-resolved per call). `get_instance_
+      health`, `preflight_workflow`, and `prepare_operation`/`execute_operation`
+      (pinned to the operation's own already-resolved environment, not whatever the
+      current call happens to name) all resolve through it in v2 mode; every v1/dev
+      call is unaffected (`deps.n8n_client_factory=None`).
+- [x] Two-instance MCP integration harness: two distinct `httpx.MockTransport`-backed
+      n8n instances, proving `get_instance_health`/`preflight_workflow` genuinely
+      reach a *different* instance depending on which environment resolved.
+      `tests/integration/test_mcp_two_instance_environments.py`.
+- [x] Named GTM scenario tests, driven through the real MCP tool layer
+      (`tests/integration/test_gtm_scenarios.py`): ARCHITECTURE.md section 11.1's
+      startup GTM engineer journey verbatim (implicit-environment refusal,
+      `list_environments`, a strengthen-only production overlay making the identical
+      workflow ID require approval only in `production`); a RevOps-style scenario
+      restricting a capability to one environment while another stays open in both; a
+      marketing operator's `describe_workflow` against a sales-only workflow
+      returning `WORKFLOW_NOT_FOUND`, bitwise identical to a nonexistent ID.
+- [x] AC-37, AC-47, AC-48 demonstrable
 
 #### Stage 05 — Team approvals and routing
 

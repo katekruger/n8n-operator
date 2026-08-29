@@ -22,6 +22,7 @@ Phase 5 (BUILD_PLAN section 12).
 from __future__ import annotations
 
 import hmac
+import threading
 from typing import Any
 
 import anyio.to_thread
@@ -40,15 +41,16 @@ from n8n_operator.core.models import (
     PreflightResult,
     WorkflowContract,
 )
+from n8n_operator.errors import RegistryUnavailableError
 from n8n_operator.identity.oidc import OidcVerifier
 from n8n_operator.logging_setup import register_secret
 from n8n_operator.mcp.resources import register_resources
-from n8n_operator.mcp.tools import ToolDeps, build_tools
+from n8n_operator.mcp.tools import N8nAdapterBundle, ToolDeps, build_tools
 from n8n_operator.n8n.client import N8nClient
 from n8n_operator.n8n.dispatch import N8nDispatch
 from n8n_operator.n8n.health import N8nHealth
 from n8n_operator.n8n.preflight import N8nPreflight
-from n8n_operator.storage.repository import PrincipalRepository
+from n8n_operator.storage.repository import EnvironmentRepository, PrincipalRepository
 from n8n_operator.storage.session import session_scope
 
 __all__ = ["build_server"]
@@ -117,6 +119,64 @@ class _DispatchAdapter:
 
     def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None:
         return self._impl.fetch_node_trace(execution_id)
+
+
+class _EnvironmentAdapterFactory:
+    """Builds, and caches, one :class:`~n8n_operator.mcp.tools.N8nAdapterBundle` per
+    ``environment_id`` (stage 04) — the composition root's per-environment analogue of
+    the single fixed ``N8nClient`` :func:`build_server` already constructs for v1/dev
+    mode. Resolves ``Environment.n8n_base_url_ref``/``n8n_api_key_ref`` (the same
+    ``env:``/``keyring:`` indirection the base registry's own ``trigger.secret_ref``
+    uses, ADR-006) the first time a given environment is asked for, then reuses that
+    one client for this server process's lifetime — never re-resolved per call.
+
+    A resolution failure (a bad or unset reference) surfaces as
+    :class:`~n8n_operator.errors.RegistryUnavailableError` at the point a caller
+    actually asks for this environment's adapters, not at server startup — this
+    factory itself never touches the network, so constructing it can never fail.
+    """
+
+    def __init__(
+        self, *, session_factory: sessionmaker[Session], request_timeout_seconds: int
+    ) -> None:
+        self._session_factory = session_factory
+        self._request_timeout_seconds = request_timeout_seconds
+        self._cache: dict[str, N8nAdapterBundle] = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, environment_id: str) -> N8nAdapterBundle:
+        with self._lock:
+            cached = self._cache.get(environment_id)
+            if cached is not None:
+                return cached
+            bundle = self._build(environment_id)
+            self._cache[environment_id] = bundle
+            return bundle
+
+    def _build(self, environment_id: str) -> N8nAdapterBundle:
+        with session_scope(self._session_factory) as session:
+            environment = EnvironmentRepository(session).get(environment_id)
+            if environment is None:  # pragma: no cover - defensive; the caller only
+                # ever passes an id `identity.resolve_environment` already resolved
+                raise RegistryUnavailableError(details={"environment_id": environment_id})
+            base_url_ref = environment.n8n_base_url_ref
+            api_key_ref = environment.n8n_api_key_ref  # gitleaks:allow - a field name, not a value
+        try:
+            base_url = resolve_secret_reference(base_url_ref)
+            api_key = resolve_secret_reference(api_key_ref)
+        except ValueError as exc:
+            raise RegistryUnavailableError(details={"environment_id": environment_id}) from exc
+        register_secret(api_key)
+        client = N8nClient(
+            base_url=base_url,
+            api_key=api_key,
+            connect_timeout_seconds=float(self._request_timeout_seconds),
+        )
+        return N8nAdapterBundle(
+            preflight=_PreflightAdapter(N8nPreflight(client)),
+            health=_HealthAdapter(N8nHealth(client)),
+            dispatch=_DispatchAdapter(N8nDispatch(client)),
+        )
 
 
 class _OperatorTokenVerifier(TokenVerifier):
@@ -276,6 +336,14 @@ def build_server(
         approval_base_url=f"http://{settings.approval_bind}",
         known_secrets=client.known_secrets(),
         enable_v2=settings.enable_v2,
+        n8n_client_factory=(
+            _EnvironmentAdapterFactory(
+                session_factory=session_factory,
+                request_timeout_seconds=settings.request_timeout_seconds,
+            )
+            if settings.enable_v2
+            else None
+        ),
     )
     server: MCPServer[Any] = MCPServer(
         "n8n-operator",

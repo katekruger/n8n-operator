@@ -18,11 +18,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from n8n_operator.core import service
 from n8n_operator.core.models import PreflightResult
 from n8n_operator.errors import (
+    EnvironmentRequiredError,
     InsufficientRoleError,
     OperationNotFoundError,
     WorkflowNotFoundError,
 )
+from n8n_operator.storage.models import Organization
 from n8n_operator.storage.repository import (
+    EnvironmentRepository,
     OrganizationMembershipRepository,
     OrganizationRepository,
     PrincipalRepository,
@@ -101,6 +104,20 @@ def loaded(session_factory: sessionmaker[Session], registry_path: Path) -> sessi
     return session_factory
 
 
+def _make_org_with_environment(session: Session, *, name: str) -> Organization:
+    """A Stage 04 org needs at least one environment before any v2 use case that
+    calls ``identity.resolve_environment`` (every discovery/operation call) can
+    resolve one — with exactly one, omitting ``environment`` resolves it implicitly."""
+    org = OrganizationRepository(session).create(name=name)
+    EnvironmentRepository(session).create(
+        organization_id=org.id,
+        name="default",
+        n8n_base_url_ref="env:N8N_TEST_BASE_URL",
+        n8n_api_key_ref="env:N8N_TEST_API_KEY",
+    )
+    return org
+
+
 def _prepare(
     session_factory: sessionmaker[Session],
     *,
@@ -111,7 +128,7 @@ def _prepare(
         operation, _replay, _token = service.prepare_operation(
             session,
             principal_id=principal_id,
-            environment="default",
+            environment=None,
             workflow_id=workflow_id,
             arguments={},
             preflight=FakePreflight(),
@@ -129,7 +146,7 @@ def _prepare(
 @pytest.mark.integration
 def test_removing_a_membership_denies_the_very_next_call(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         alice = PrincipalRepository(session).create(kind="user", display_name="Alice")
         OrganizationMembershipRepository(session).create(
             principal_id=alice.id, organization_id=org.id, roles=["viewer"], workflow_scope="*"
@@ -149,7 +166,11 @@ def test_removing_a_membership_denies_the_very_next_call(loaded: sessionmaker[Se
         assert membership is not None
         OrganizationMembershipRepository(session).remove(membership.id)
 
-    with session_scope(loaded) as session, pytest.raises(WorkflowNotFoundError):
+    # With her membership gone, Alice has no visible environment left either (Stage
+    # 04: environment resolution runs before workflow authorization) — the error is
+    # ENVIRONMENT_REQUIRED, not WORKFLOW_NOT_FOUND, but it's equally denied and reveals
+    # nothing about the workflow itself.
+    with session_scope(loaded) as session, pytest.raises(EnvironmentRequiredError):
         service.describe_workflow(
             session, workflow_id="crm.sync_contact", principal_id=alice_id, enable_v2=True
         )
@@ -164,7 +185,7 @@ def test_narrowing_workflow_scope_mid_session_denies_the_very_next_call(
     that still exists but was *updated* (removed and re-created with a narrower scope,
     since a membership row is immutable except for ``removed_at``)."""
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         bob = PrincipalRepository(session).create(kind="user", display_name="Bob")
         OrganizationMembershipRepository(session).create(
             principal_id=bob.id, organization_id=org.id, roles=["operator"], workflow_scope="*"
@@ -215,8 +236,8 @@ def test_a_principal_in_two_organizations_is_authorized_by_either_grant_independ
     `billing.charge_card` (org B only grants `viewer` there, and org A's grant does not
     cover that workflow at all) — never "operator on billing.* by combining the two"."""
     with session_scope(loaded) as session:
-        org_a = OrganizationRepository(session).create(name="Org A")
-        org_b = OrganizationRepository(session).create(name="Org B")
+        org_a = _make_org_with_environment(session, name="Org A")
+        org_b = _make_org_with_environment(session, name="Org B")
         carol = PrincipalRepository(session).create(kind="user", display_name="Carol")
         OrganizationMembershipRepository(session).create(
             principal_id=carol.id,
@@ -230,13 +251,20 @@ def test_a_principal_in_two_organizations_is_authorized_by_either_grant_independ
             roles=["viewer"],
             workflow_scope="billing.*",
         )
-        carol_id = carol.id
+        carol_id, org_a_id, org_b_id = carol.id, org_a.id, org_b.id
+
+    with session_scope(loaded) as session:
+        # Carol belongs to two organizations, each with its own environment — two
+        # environments are visible to her, so `environment` must be named explicitly
+        # (ADR-016 section 3, unlike the single-org tests elsewhere in this file).
+        env_a_id = EnvironmentRepository(session).list_for_organization(org_a_id)[0].id
+        env_b_id = EnvironmentRepository(session).list_for_organization(org_b_id)[0].id
 
     with session_scope(loaded) as session:
         operation, _replay, _token = service.prepare_operation(
             session,
             principal_id=carol_id,
-            environment="default",
+            environment=env_a_id,
             workflow_id="crm.sync_contact",
             arguments={},
             preflight=FakePreflight(),
@@ -251,7 +279,7 @@ def test_a_principal_in_two_organizations_is_authorized_by_either_grant_independ
         service.prepare_operation(
             session,
             principal_id=carol_id,
-            environment="default",
+            environment=env_b_id,
             workflow_id="billing.charge_card",
             arguments={},
             preflight=FakePreflight(),
@@ -268,7 +296,7 @@ def test_a_principal_in_two_organizations_is_authorized_by_either_grant_independ
 @pytest.mark.integration
 def test_an_approver_may_never_decide_their_own_operation(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         dana = PrincipalRepository(session).create(kind="user", display_name="Dana")
         OrganizationMembershipRepository(session).create(
             principal_id=dana.id,
@@ -289,7 +317,7 @@ def test_an_approver_may_never_decide_their_own_operation(loaded: sessionmaker[S
 @pytest.mark.integration
 def test_a_different_approver_may_decide_it(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         requester = PrincipalRepository(session).create(kind="user", display_name="Requester")
         approver = PrincipalRepository(session).create(kind="user", display_name="Approver")
         OrganizationMembershipRepository(session).create(
@@ -315,7 +343,7 @@ def test_a_different_approver_may_decide_it(loaded: sessionmaker[Session]) -> No
 @pytest.mark.integration
 def test_a_viewer_without_the_approver_role_cannot_decide(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         requester = PrincipalRepository(session).create(kind="user", display_name="Requester")
         viewer = PrincipalRepository(session).create(kind="user", display_name="Viewer")
         OrganizationMembershipRepository(session).create(
@@ -345,7 +373,7 @@ def test_a_viewer_without_the_approver_role_cannot_decide(loaded: sessionmaker[S
 @pytest.mark.integration
 def test_audit_verify_requires_admin(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         operator = PrincipalRepository(session).create(kind="user", display_name="Op")
         admin = PrincipalRepository(session).create(kind="user", display_name="Admin")
         OrganizationMembershipRepository(session).create(
@@ -367,7 +395,7 @@ def test_audit_verify_requires_admin(loaded: sessionmaker[Session]) -> None:
 @pytest.mark.integration
 def test_audit_export_requires_admin(loaded: sessionmaker[Session]) -> None:
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         viewer = PrincipalRepository(session).create(kind="user", display_name="Viewer")
         OrganizationMembershipRepository(session).create(
             principal_id=viewer.id, organization_id=org.id, roles=["viewer"], workflow_scope="*"
@@ -392,7 +420,7 @@ def test_list_operations_scope_filter_applies_before_the_page_limit(
     the scope filter were applied *after* `LIMIT`, a page could come back short of
     real, visible rows sitting just past the (pre-filter) cutoff."""
     with session_scope(loaded) as session:
-        org = OrganizationRepository(session).create(name="Acme")
+        org = _make_org_with_environment(session, name="Acme")
         eve = PrincipalRepository(session).create(kind="user", display_name="Eve")
         admin = PrincipalRepository(session).create(kind="user", display_name="Admin")
         OrganizationMembershipRepository(session).create(
@@ -412,7 +440,7 @@ def test_list_operations_scope_filter_applies_before_the_page_limit(
             service.prepare_operation(
                 session,
                 principal_id=admin_id,
-                environment="default",
+                environment=None,
                 workflow_id="billing.charge_card",
                 arguments={},
                 preflight=FakePreflight(),

@@ -380,7 +380,7 @@ def test_v2_cli_cannot_approve_its_own_operation(
             operation, _replay, _token = service.prepare_operation(
                 session,
                 principal_id="dev",
-                environment="default",
+                environment=None,
                 workflow_id="wf.approval",
                 arguments={"email": "a@b.com"},
                 preflight=FakePreflight(),

@@ -1,0 +1,37 @@
+# n8n Operator — example environment overlay: production
+#
+# See development.yaml for the overlay shape and rules (R13/R14). Production is
+# never an implicit default (ADR-016 section 3) — a caller must always name it
+# explicitly, precisely so a slip of habit can never send a call here by accident.
+# Its own overlay is the strictest of the three example environments: an
+# auto-approved, read-only workflow elsewhere in this registry requires a human's
+# approval here, and every rate/duration ceiling this file touches is tighter than
+# staging's own (staging.yaml).
+#
+# Validate before loading:
+#     n8n-operator environment validate-overlay <environment-id> \
+#         --path examples/environments/production.yaml
+
+apiVersion: n8n-operator/v1
+
+metadata:
+  name: production
+  description: >
+    A GTM engineer who validated crm.sync_contact in staging (staging.yaml) prepares
+    the same workflow here under a real human approval gate and a tighter rate
+    ceiling — the production equivalent of the same call, deliberately harder to run
+    by accident (ARCHITECTURE.md section 11.1).
+
+overlays:
+  # reports.pipeline_summary is read-only and auto-approved (`approval: none`) in the
+  # base registry — production requires a human's approval for it anyway, even
+  # though nothing about the workflow's own contract changed.
+  - workflow_id: reports.pipeline_summary
+    approval_override: required
+
+  # Half of staging's own rate ceiling (staging.yaml's rate_limit_per_minute: 5) —
+  # allowed under R14 since 2 < 5 (rate_limit_per_minute only ever lowers).
+  - workflow_id: crm.sync_contact
+    limits_override:
+      rate_limit_per_minute: 2
+      execution_ttl_seconds: 120

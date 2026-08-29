@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
-from n8n_operator.storage.models import Principal
+from n8n_operator.errors import EnvironmentNotFoundError, EnvironmentRequiredError
+from n8n_operator.storage.models import Environment, Principal
 from n8n_operator.storage.repository import (
     EnvironmentRepository,
     OrganizationMembershipRepository,
@@ -33,7 +34,9 @@ __all__ = [
     "WhoAmI",
     "build_whoami",
     "ensure_dev_principal",
+    "list_visible_environments",
     "resolve_cli_principal_id",
+    "resolve_environment",
     "resolve_user_principal",
 ]
 
@@ -44,6 +47,10 @@ DEV_PRINCIPAL_DISPLAY_NAME = "local development (identity_mode=dev — never for
 # and idempotent by construction the same way `ensure_dev_principal` itself already is.
 DEV_ORGANIZATION_ID = "org_local_development"
 DEV_ORGANIZATION_NAME = "Local development"
+
+# Same fixed-ID idempotency trick as the organization above, for the same reason.
+DEV_ENVIRONMENT_ID = "env_local_development"
+DEV_ENVIRONMENT_NAME = "Local development"
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,13 @@ def ensure_dev_principal(session: Session, *, principal_id: str) -> Principal:
     not a bypass — the dev principal is simply, deliberately, always an admin of its own
     always-existing development organization.
 
+    Stage 04 extends the same idempotent seeding one step further: that organization
+    also always has exactly one real ``Environment`` row (also a real, ordinary,
+    archivable/revocable row — not a bypass of ``resolve_environment``). With exactly
+    one environment visible, an omitted ``environment`` argument resolves to it
+    implicitly (ADR-016 section 3) — the same "local dev stays easy" property Stage 04
+    would otherwise take away the moment ``resolve_environment`` becomes reachable.
+
     Idempotent — safe to call on every server startup, not just once at ``db init``:
     an operator flipping ``enable_v2``/``identity_mode`` on an existing database should
     not have to remember a separate seeding step first.
@@ -141,6 +155,16 @@ def ensure_dev_principal(session: Session, *, principal_id: str) -> Principal:
             roles=["admin"],
             workflow_scope="*",
             environment_scope=["*"],
+        )
+
+    environments = EnvironmentRepository(session)
+    if not environments.list_for_organization(organization.id, include_archived=True):
+        environments.create(
+            id=DEV_ENVIRONMENT_ID,
+            organization_id=organization.id,
+            name=DEV_ENVIRONMENT_NAME,
+            n8n_base_url_ref="env:N8N_OPERATOR_N8N_BASE_URL",
+            n8n_api_key_ref="env:N8N_OPERATOR_N8N_API_KEY",
         )
 
     return principal
@@ -178,6 +202,64 @@ def build_whoami(session: Session, principal: Principal) -> WhoAmI:
         display_name=principal.display_name,
         organizations=organizations,
     )
+
+
+def list_visible_environments(
+    session: Session, *, principal_id: str, include_archived: bool = False
+) -> list[Environment]:
+    """Every environment visible to ``principal_id``, across every organization they
+    have an active membership in (ADR-013 section 2: naming an environment names an
+    organization, so "visible environments" is exactly "environments in any
+    organization I belong to" — there is no separate per-environment visibility grant).
+
+    ``include_archived=True`` includes archived rows regardless of role — callers that
+    need ADR-016 section 4's "archived environments visible only to an org admin" rule
+    (``list_environments`` the MCP tool) filter that in themselves, since this function
+    has no opinion on role, only membership.
+    """
+    memberships = OrganizationMembershipRepository(session).list_active_for_principal(principal_id)
+    environments: list[Environment] = []
+    for membership in memberships:
+        environments.extend(
+            EnvironmentRepository(session).list_for_organization(
+                membership.organization_id, include_archived=include_archived
+            )
+        )
+    return environments
+
+
+def resolve_environment(
+    session: Session, *, principal_id: str, environment: str | None
+) -> Environment:
+    """The one environment-resolution rule every v2 tool call uses
+    (MCP_TOOLS.md's "Environment default resolution", ADR-016 section 3): naming an
+    ``environment`` ID resolves it directly, identically whether it doesn't exist or
+    the caller simply isn't a member of its organization (no enumeration oracle,
+    ADR-015 section 3) — including an *archived* one, which stays resolvable by ID
+    forever (ADR-016 section 4); the archived check itself is each caller's own job
+    (``core.service._apply_environment``'s ``forbid_archived``), not this function's.
+    Omitting ``environment`` resolves only when exactly one **non-archived**
+    environment is visible across every organization the caller belongs to — an
+    archived environment never counts toward that count and is never an implicit
+    default, and neither is a live one merely because it happens to be
+    ``is_production`` (ADR-016 section 3's own explicit refusal).
+    """
+    visible = list_visible_environments(session, principal_id=principal_id, include_archived=True)
+    if environment is not None:
+        match = next((env for env in visible if env.id == environment), None)
+        if match is None:
+            raise EnvironmentNotFoundError()
+        return match
+    live = [env for env in visible if env.archived_at is None]
+    if len(live) == 1:
+        return live[0]
+    if not live:
+        raise EnvironmentRequiredError(
+            "No environment is visible to this caller; an admin must create one "
+            "(`n8n-operator environment create`) before `environment` can be omitted "
+            "or named."
+        )
+    raise EnvironmentRequiredError()
 
 
 def resolve_cli_principal_id(session: Session, *, enable_v2: bool, dev_principal_id: str) -> str:
