@@ -158,6 +158,39 @@ def resolve_v2_identity_flags() -> tuple[bool, str]:
     return enable_v2, dev_principal_id
 
 
+def resolve_notification_sink_config() -> tuple[str, str | None, str | None]:
+    """``(notification_sink, webhook_url, webhook_bearer_token)``, resolved and
+    validated *without* requiring the rest of :class:`Settings` (notably
+    ``n8n_base_url``/``n8n_api_key``) to be present — the same "orthogonal concern"
+    reasoning :func:`resolve_v2_identity_flags` documents, extended to stage 05's
+    ``operations request-approval``/``notifications retry-failed`` CLI commands, which
+    (like ``operations approve``/``reject``) never touch n8n.
+
+    Reads the same env vars :class:`Settings`' own fields do
+    (``N8N_OPERATOR_NOTIFICATION_SINK``, ``N8N_OPERATOR_NOTIFICATION_WEBHOOK_URL``,
+    ``N8N_OPERATOR_NOTIFICATION_WEBHOOK_BEARER_TOKEN``), with the webhook token
+    resolved through the same ``env:``/``keyring:`` indirection as ``n8n_api_key``
+    (ADR-006). Raises :class:`ValueError` when ``notification_sink`` is ``"webhook"``
+    and either the URL or the token reference is unset or fails to resolve.
+    """
+    sink = os.environ.get("N8N_OPERATOR_NOTIFICATION_SINK", "local").strip().lower()
+    if sink not in {"local", "webhook"}:
+        raise ValueError(
+            f"N8N_OPERATOR_NOTIFICATION_SINK must be 'local' or 'webhook'; got {sink!r}"
+        )
+    if sink == "local":
+        return sink, None, None
+    url = os.environ.get("N8N_OPERATOR_NOTIFICATION_WEBHOOK_URL")
+    token_ref = os.environ.get("N8N_OPERATOR_NOTIFICATION_WEBHOOK_BEARER_TOKEN")
+    if not url or not token_ref:
+        raise ValueError(
+            "notification_sink is 'webhook'; N8N_OPERATOR_NOTIFICATION_WEBHOOK_URL and "
+            "N8N_OPERATOR_NOTIFICATION_WEBHOOK_BEARER_TOKEN are both required"
+        )
+    token = resolve_secret_reference(token_ref)
+    return sink, url, token
+
+
 def redact_database_url(database_url: str) -> str:
     """``database_url`` with any embedded password replaced by SQLAlchemy's own
     ``***`` placeholder — never the literal value.
@@ -345,11 +378,26 @@ class Settings(BaseSettings):
     oidc_resource_server_url: HttpUrl | None = Field(default=None)
     dev_principal_id: str = Field(default="dev")
 
+    # --- notification delivery (ADR-018; stage 05) ------------------------------------------
+    # "local": LocalNotificationSink (structured log line — the default; needs no config).
+    # "webhook": WebhookNotificationSink — notification_webhook_url and
+    # notification_webhook_bearer_token are then both required (validated below).
+    notification_sink: Literal["local", "webhook"] = Field(default="local")
+    notification_webhook_url: HttpUrl | None = Field(default=None)
+    notification_webhook_bearer_token: SecretStr | None = Field(default=None)
+
     # ---- field-level validation -------------------------------------------------------
 
     @field_validator("n8n_api_key", mode="before")
     @classmethod
     def _resolve_n8n_api_key(cls, value: object) -> object:
+        if isinstance(value, str):
+            return resolve_secret_reference(value)
+        return value
+
+    @field_validator("notification_webhook_bearer_token", mode="before")
+    @classmethod
+    def _resolve_notification_webhook_bearer_token(cls, value: object) -> object:
         if isinstance(value, str):
             return resolve_secret_reference(value)
         return value
@@ -441,6 +489,17 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_notification_webhook_config(self) -> Settings:
+        if self.notification_sink == "webhook" and (
+            self.notification_webhook_url is None or self.notification_webhook_bearer_token is None
+        ):
+            raise ValueError(
+                "notification_sink is 'webhook'; notification_webhook_url and "
+                "notification_webhook_bearer_token are both required"
+            )
+        return self
+
     # ---- derived accessors ---------------------------------------------------------------
 
     def allowed_origins(self) -> tuple[str, ...]:
@@ -516,6 +575,7 @@ __all__ = [
     "resolve_database_password",
     "resolve_database_url",
     "resolve_max_argument_bytes",
+    "resolve_notification_sink_config",
     "resolve_registry_path",
     "resolve_secret_reference",
     "resolve_v2_identity_flags",

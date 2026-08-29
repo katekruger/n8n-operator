@@ -40,7 +40,7 @@ from n8n_operator.core.idempotency import (
 from n8n_operator.errors import ArgumentsTooLargeError, IdempotencyConflictError
 from n8n_operator.registry.loader import (
     LoadedRegistry,
-    _check_r5_r10_approval_policy,
+    _check_r5_r10_r15_approval_policy,
     _check_r6_secret_ref,
     _check_r8_trigger_path,
     load_registry,
@@ -250,7 +250,7 @@ def test_approval_none_can_only_coexist_with_read_only(
     entry = WorkflowEntry.model_construct(
         id="wf.x", approval=approval, side_effects=side_effects, risk=risk
     )
-    r5_violations = [v for v in _check_r5_r10_approval_policy(entry) if v.rule == "R5"]
+    r5_violations = [v for v in _check_r5_r10_r15_approval_policy(entry) if v.rule == "R5"]
     if approval == "none" and side_effects != "read_only":
         assert len(r5_violations) == 1
     else:
@@ -272,7 +272,7 @@ def test_high_risk_always_requires_approval(risk: str, approval: str, side_effec
     entry = WorkflowEntry.model_construct(
         id="wf.x", approval=approval, side_effects=side_effects, risk=risk
     )
-    r10_violations = [v for v in _check_r5_r10_approval_policy(entry) if v.rule == "R10"]
+    r10_violations = [v for v in _check_r5_r10_r15_approval_policy(entry) if v.rule == "R10"]
     if risk == "high" and approval != "required":
         assert len(r10_violations) == 1
     else:

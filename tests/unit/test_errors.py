@@ -246,9 +246,10 @@ def test_scrub_does_not_alter_ordinary_details() -> None:
 
 
 @pytest.mark.unit
-def test_taxonomy_has_exactly_27_codes() -> None:
-    """24 original v1 codes plus the 3 environment codes stage 04 adds."""
-    assert len(TAXONOMY) == 27
+def test_taxonomy_has_exactly_28_codes() -> None:
+    """24 original v1 codes, the 3 environment codes stage 04 adds, and the 1
+    approval code stage 05 adds."""
+    assert len(TAXONOMY) == 28
 
 
 @pytest.mark.unit

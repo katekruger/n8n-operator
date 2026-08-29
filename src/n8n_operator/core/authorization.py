@@ -54,6 +54,7 @@ __all__ = [
     "AuthorizationDecision",
     "Role",
     "capabilities_for_role",
+    "environment_scope_covers",
     "evaluate",
     "has_role",
     "match_workflow_scope",
@@ -217,6 +218,18 @@ def _environment_scope_satisfied(
         # (module docstring, "Environment-scope today").
         return scope == ["*"]
     return "*" in scope or environment_id in scope
+
+
+def environment_scope_covers(
+    membership: OrganizationMembership,
+    environment_id: str | None,
+    environment_organization_id: str | None,
+) -> bool:
+    """Public wrapper over :func:`_environment_scope_satisfied` — a caller outside
+    this module (stage 05's eligible-approver enumeration, ``core.service``) needs
+    the identical org-boundary-then-scope-pattern check :func:`evaluate` already
+    applies per membership, without duplicating it."""
+    return _environment_scope_satisfied(membership, environment_id, environment_organization_id)
 
 
 def evaluate(

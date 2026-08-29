@@ -42,20 +42,56 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from n8n_operator.config import resolve_database_url, resolve_v2_identity_flags
+from n8n_operator.config import (
+    resolve_database_url,
+    resolve_notification_sink_config,
+    resolve_v2_identity_flags,
+)
 from n8n_operator.core import service
 from n8n_operator.core.identity import resolve_cli_principal_id
-from n8n_operator.core.models import ApprovalDecisionContext, Operation
+from n8n_operator.core.models import (
+    ApprovalDecisionContext,
+    DeliveryOutcome,
+    NotificationEvent,
+    Operation,
+)
 from n8n_operator.errors import (
+    ApproverNotInPolicyError,
     InvalidArgumentsError,
     InvalidStateTransitionError,
     OperationNotFoundError,
 )
+from n8n_operator.notifications.local import LocalNotificationSink
+from n8n_operator.notifications.webhook import WebhookNotificationSink
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
     session_scope,
 )
+
+
+class _CliNotificationSinkAdapter:
+    """Converts a ``notifications/`` package sink's local ``DeliveryOutcome`` into
+    ``core.models.DeliveryOutcome`` — the same real-type-behind-a-port conversion
+    ``mcp/server.py``'s own ``_NotificationSinkAdapter`` performs, duplicated here in
+    miniature rather than imported (this command is its own composition root, like
+    ``cli/commands/health.py``'s ``_CliHealthAdapter``)."""
+
+    def __init__(self, impl: LocalNotificationSink | WebhookNotificationSink) -> None:
+        self._impl = impl
+
+    def deliver(self, event: NotificationEvent) -> DeliveryOutcome:
+        raw = self._impl.deliver(event)
+        return DeliveryOutcome(delivered=raw.delivered, detail=raw.detail)
+
+
+def _cli_notification_sink() -> _CliNotificationSinkAdapter:
+    sink, url, token = resolve_notification_sink_config()
+    if sink == "webhook":
+        assert url is not None and token is not None
+        return _CliNotificationSinkAdapter(WebhookNotificationSink(url=url, bearer_token=token))
+    return _CliNotificationSinkAdapter(LocalNotificationSink())
+
 
 app = typer.Typer(
     help="List, inspect, cancel, approve, reject, and expire operations.", no_args_is_help=True
@@ -119,6 +155,15 @@ def _render_context(context: ApprovalDecisionContext) -> None:
         typer.echo(f"execution_deadline:  {context.execution_deadline.isoformat()}")
     if not context.approval_required:
         typer.echo("approval:            not required (read_only + approval: none)")
+    elif context.quorum_count > 1:
+        decided_count = len(context.decisions)
+        typer.echo(f"approval:            {decided_count} of {context.quorum_count} decided")
+        for entry in context.decisions:
+            typer.echo(
+                f"  {entry.decision:<8} by {entry.principal_id} at {entry.decided_at.isoformat()}"
+            )
+        for principal_id in context.outstanding_approvers:
+            typer.echo(f"  outstanding: {principal_id}")
     elif context.decided:
         typer.echo(
             f"approval:            {context.decision} by {context.decided_by} "
@@ -334,6 +379,60 @@ def approval_status(
             _operation_not_found_or_exit(operation_id)
             return
     _render_context(context)
+
+
+@app.command("request-approval")
+def request_approval(
+    operation_id: str = typer.Argument(..., help="The operation to route for approval."),
+    approvers: str | None = typer.Option(
+        None,
+        "--approvers",
+        help="Comma-separated principal IDs — a subset of the operation's own approval-"
+        "policy snapshot. Omit to notify every eligible approver.",
+    ),
+    message: str | None = typer.Option(
+        None, "--message", help="Advisory text shown alongside the notification (ADR-007)."
+    ),
+) -> None:
+    """Route a pending operation's approval to its eligible approvers and send
+    notifications. Routing only — this command can never approve, choose a weaker
+    quorum, or add an approver outside the operation's own snapshot."""
+    approver_list = [a.strip() for a in approvers.split(",") if a.strip()] if approvers else None
+    with _connected() as session_factory:
+        try:
+            sink = _cli_notification_sink()
+        except ValueError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        try:
+            with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
+                result = service.request_approval(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    sink=sink,
+                    approvers=approver_list,
+                    message=message,
+                    enable_v2=enable_v2,
+                )
+        except OperationNotFoundError:
+            _operation_not_found_or_exit(operation_id)
+            return
+        except ApproverNotInPolicyError as exc:
+            typer.secho(f"Not eligible approvers: {exc.details}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        except InvalidStateTransitionError:
+            typer.secho(
+                "This operation is not PENDING_APPROVAL; nothing to route.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+
+    typer.secho(f"Routed. notified={result.notified}", fg=typer.colors.GREEN)
+    typer.echo(f"quorum_count:             {result.quorum_count}")
+    typer.echo(f"approval_policy_snapshot: {result.approval_policy_snapshot}")
 
 
 @app.command("approve")

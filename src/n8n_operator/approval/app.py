@@ -61,7 +61,9 @@ async def _sweep_loop(session_factory: sessionmaker[Session]) -> None:
             logger.exception("approval app: best-effort expiry sweep failed")
 
 
-def build_app(approval_bind: str, session_factory: sessionmaker[Session]) -> FastAPI:
+def build_app(
+    approval_bind: str, session_factory: sessionmaker[Session], *, enable_v2: bool = False
+) -> FastAPI:
     """Construct the approval app. Does not bind or serve — see :func:`run_approval_app`.
 
     Takes ``approval_bind`` as a plain ``HOST:PORT`` string, not a full
@@ -97,19 +99,24 @@ def build_app(approval_bind: str, session_factory: sessionmaker[Session]) -> Fas
         session_factory=session_factory,
         expected_host=expected_host,
         expected_origin=expected_origin,
+        enable_v2=enable_v2,
     )
     app.include_router(build_router(deps, templates))
     return app
 
 
 def run_approval_app(
-    approval_bind: str, session_factory: sessionmaker[Session], *, log_level: str = "info"
+    approval_bind: str,
+    session_factory: sessionmaker[Session],
+    *,
+    log_level: str = "info",
+    enable_v2: bool = False,
 ) -> None:
     """Bind and serve the approval app on ``approval_bind``. Blocks until stopped.
     Always loopback (boundary B10) — :func:`~n8n_operator.config.resolve_approval_bind`
     already refuses to resolve anything else."""
     host, port_str = approval_bind.rsplit(":", 1)
-    app = build_app(approval_bind, session_factory)
+    app = build_app(approval_bind, session_factory, enable_v2=enable_v2)
     config = uvicorn.Config(
         app,
         host=host,

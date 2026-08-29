@@ -37,6 +37,7 @@ from n8n_operator.storage.models import (
     AuditLogEntry,
     Environment,
     ExecutionResult,
+    NotificationDelivery,
     Operation,
     OperationEvent,
     Organization,
@@ -278,6 +279,24 @@ class OperationRepository:
 
     def get(self, operation_id: str) -> Operation | None:
         return self._session.get(Operation, operation_id)
+
+    def get_for_update(self, operation_id: str) -> Operation | None:
+        """As :meth:`get`, but with a row lock (``SELECT ... FOR UPDATE``) held for
+        the rest of the caller's transaction — stage 05's own concurrency need: two
+        genuinely concurrent quorum decisions on the same operation must serialize
+        around reading-then-tallying its ``Approval`` rows, or each could read the
+        other's not-yet-committed vote as absent and neither would ever see quorum
+        reached (a lost-update race distinct from, and in addition to, the
+        ``state_version`` compare-and-set :meth:`compare_and_set_state` already
+        guards for the T06/T07 transition itself). A plain no-op serialization
+        boundary on SQLite (ADR-004 rule D4 portability — SQLite's single-writer
+        model already serializes every write, so ``FOR UPDATE`` there adds nothing
+        but costs nothing either), a real row lock on PostgreSQL.
+        """
+        stmt: Select[tuple[Operation]] = (
+            select(Operation).where(Operation.id == operation_id).with_for_update()
+        )
+        return self._session.scalars(stmt).one_or_none()
 
     def find_by_idempotency(
         self, *, principal_id: str, environment: str, workflow_id: str, idempotency_key: str
@@ -584,6 +603,8 @@ class ApprovalRepository:
         token_hash: str,
         binding_hash: str,
         expires_at: datetime,
+        quorum_count: int = 1,
+        assigned_to: str | None = None,
         id: str | None = None,  # noqa: A002
     ) -> Approval:
         approval = Approval(
@@ -592,6 +613,8 @@ class ApprovalRepository:
             token_hash=token_hash,
             binding_hash=binding_hash,
             expires_at=expires_at,
+            quorum_count=quorum_count,
+            assigned_to=assigned_to,
         )
         self._session.add(approval)
         self._session.flush()
@@ -603,9 +626,36 @@ class ApprovalRepository:
 
     def get_by_operation_id(self, operation_id: str) -> Approval | None:
         """The approval row minted for ``operation_id`` at T04, if this operation ever
-        entered ``PENDING_APPROVAL`` (an auto-approved T05 operation has none)."""
+        entered ``PENDING_APPROVAL`` (an auto-approved T05 operation has none). v1
+        only — assumes exactly one row per operation, which is no longer true once
+        stage 05's quorum mode mints one row per eligible approver; a v2 call site
+        wants :meth:`list_for_operation` or :meth:`get_by_operation_and_decider`
+        instead."""
         stmt: Select[tuple[Approval]] = select(Approval).where(
             Approval.operation_id == operation_id
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def list_for_operation(self, operation_id: str) -> builtins.list[Approval]:
+        """Every approval row for one operation — v1 has exactly one; v2 quorum mode
+        has one per eligible approver who has been minted a row (via
+        ``request_approval`` or a direct CLI decision). Ordered by ``issued_at`` for
+        a stable, reproducible tally/display order."""
+        stmt: Select[tuple[Approval]] = (
+            select(Approval)
+            .where(Approval.operation_id == operation_id)
+            .order_by(Approval.issued_at)
+        )
+        return list(self._session.scalars(stmt))
+
+    def get_by_operation_and_decider(self, operation_id: str, principal_id: str) -> Approval | None:
+        """This principal's own row for this operation — decided or still pending —
+        matched by ``assigned_to`` (minted via ``request_approval``) or by
+        ``decided_by`` (already decided, however the row was minted). Stage 05's own
+        "have I already got a slot / have I already decided" check."""
+        stmt: Select[tuple[Approval]] = select(Approval).where(
+            Approval.operation_id == operation_id,
+            or_(Approval.assigned_to == principal_id, Approval.decided_by == principal_id),
         )
         return self._session.scalars(stmt).one_or_none()
 
@@ -628,6 +678,77 @@ class ApprovalRepository:
             approval.client_fingerprint = client_fingerprint
         self._session.flush()
         return approval
+
+
+class NotificationDeliveryRepository:
+    """The ``notification_deliveries`` table (ADR-018) — one row per distinct
+    idempotency key (``(subject_id, principal_id, event_type)``), tracking bounded
+    retry state for approval-routing and (stage 08) alert-hook notifications alike."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def get_by_idempotency_key(self, idempotency_key: str) -> NotificationDelivery | None:
+        stmt: Select[tuple[NotificationDelivery]] = select(NotificationDelivery).where(
+            NotificationDelivery.idempotency_key == idempotency_key
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def create(
+        self,
+        *,
+        idempotency_key: str,
+        subject_type: str,
+        subject_id: str,
+        event_type: str,
+        principal_id: str | None = None,
+        id: str | None = None,  # noqa: A002
+    ) -> NotificationDelivery:
+        delivery = NotificationDelivery(
+            id=id or new_ulid(),
+            idempotency_key=idempotency_key,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            principal_id=principal_id,
+            event_type=event_type,
+            attempts=0,
+            status="pending",
+        )
+        self._session.add(delivery)
+        self._session.flush()
+        return delivery
+
+    def record_attempt(
+        self, delivery_id: str, *, delivered: bool, attempted_at: datetime | None = None
+    ) -> NotificationDelivery:
+        delivery = self._session.get(NotificationDelivery, delivery_id)
+        if delivery is None:
+            raise LookupError(f"no such notification delivery: {delivery_id}")
+        now = attempted_at or utc_now()
+        delivery.attempts += 1
+        delivery.last_attempted_at = now
+        if delivered:
+            delivery.status = "delivered"
+            delivery.delivered_at = now
+        self._session.flush()
+        return delivery
+
+    def mark_failed(self, delivery_id: str) -> NotificationDelivery:
+        """Bounded retry exhausted — fail-visible, never retried again (ADR-018 §2)."""
+        delivery = self._session.get(NotificationDelivery, delivery_id)
+        if delivery is None:
+            raise LookupError(f"no such notification delivery: {delivery_id}")
+        delivery.status = "failed"
+        self._session.flush()
+        return delivery
+
+    def list_pending(self) -> builtins.list[NotificationDelivery]:
+        stmt: Select[tuple[NotificationDelivery]] = (
+            select(NotificationDelivery)
+            .where(NotificationDelivery.status == "pending")
+            .order_by(NotificationDelivery.attempts, NotificationDelivery.last_attempted_at)
+        )
+        return list(self._session.scalars(stmt))
 
 
 class ExecutionResultRepository:
@@ -847,6 +968,25 @@ class OrganizationMembershipRepository:
         )
         return list(self._session.scalars(stmt))
 
+    def list_active_for_organization(
+        self, organization_id: str
+    ) -> builtins.list[OrganizationMembership]:
+        """Every active membership *in* one organization, across every principal —
+        the complement of :meth:`list_active_for_principal` (one principal, every
+        org). Stage 05's own read path: computing an operation's eligible-approver
+        snapshot means enumerating every member of the operation's organization, not
+        one principal's own memberships. Queried fresh, never cached, for the same
+        reason every other membership read here is."""
+        stmt: Select[tuple[OrganizationMembership]] = (
+            select(OrganizationMembership)
+            .where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.removed_at.is_(None),
+            )
+            .order_by(OrganizationMembership.created_at)
+        )
+        return list(self._session.scalars(stmt))
+
     def list_for_organization(
         self, organization_id: str, *, include_removed: bool = False
     ) -> builtins.list[OrganizationMembership]:
@@ -1006,6 +1146,7 @@ __all__ = [
     "AuditLogRepository",
     "EnvironmentRepository",
     "ExecutionResultRepository",
+    "NotificationDeliveryRepository",
     "OperationEventRepository",
     "OperationRepository",
     "OrganizationMembershipRepository",

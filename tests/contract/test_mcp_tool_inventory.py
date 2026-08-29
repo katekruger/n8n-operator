@@ -219,9 +219,10 @@ async def test_same_tool_schemas_across_local_and_remote_deps() -> None:
 
 def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
     """Stage 02's completion gate: v1 mode (``enable_v2`` unset, the default) stays
-    exactly the twelve tools AC-23 requires; ``whoami`` and ``list_environments``
-    (stage 04) are a thirteenth and fourteenth tool that exist only when an operator
-    opts in (BUILD_PLAN section 7.2)."""
+    exactly the twelve tools AC-23 requires; ``whoami``, ``list_environments``
+    (stage 04), ``request_approval``, and ``get_approval_status`` (stage 05) are a
+    thirteenth through sixteenth tool that exist only when an operator opts in
+    (BUILD_PLAN section 7.2)."""
     v1_tools = build_tools(_make_deps())
     v2_tools = build_tools(ToolDeps(**{**_make_deps().__dict__, "enable_v2": True}))
 
@@ -229,5 +230,10 @@ def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
     v2_names = {t.name for t in v2_tools}
     assert v1_names == EXPECTED_TOOL_NAMES
     assert len(v1_tools) == 12
-    assert v2_names == EXPECTED_TOOL_NAMES | {"whoami", "list_environments"}
-    assert len(v2_tools) == 14
+    assert v2_names == EXPECTED_TOOL_NAMES | {
+        "whoami",
+        "list_environments",
+        "request_approval",
+        "get_approval_status",
+    }
+    assert len(v2_tools) == 16

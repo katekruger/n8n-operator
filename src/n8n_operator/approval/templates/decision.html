@@ -86,10 +86,12 @@
   button.approve { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
   button.reject { background: var(--panel); color: var(--danger); border-color: var(--danger); }
   .hint { font-size: 0.8rem; color: var(--muted); margin-top: 1rem; }
+  .quorum-list { margin: 0.3rem 0 0; padding-left: 1.2rem; }
+  .quorum-list li { margin: 0.15rem 0; }
 </style>
 </head>
 <body>
-<div class="card">
+<main class="card">
   <h1>n8n Operator — Approval</h1>
 
   {% if error %}
@@ -135,6 +137,20 @@
       </div>
     {% endif %}
 
+    {% if context.quorum_count > 1 %}
+      <div class="field">
+        <h3 class="label">Approval status ({{ context.decisions|length }} of {{ context.quorum_count }} decided)</h3>
+        <ul class="quorum-list">
+          {% for entry in context.decisions %}
+            <li>{{ entry.decision }} by {{ entry.principal_id }} at {{ entry.decided_at.isoformat() }}</li>
+          {% endfor %}
+          {% for principal_id in context.outstanding_approvers %}
+            <li>outstanding: {{ principal_id }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+
     {% if context.decided %}
       <div class="banner decided">
         Decision recorded: {{ context.decision }} by {{ context.decided_by }}
@@ -157,6 +173,6 @@
 
     <p class="hint">You can also decide from the Operator machine: <code>n8n-operator operations approve {{ context.operation_id }}</code>.</p>
   {% endif %}
-</div>
+</main>
 </body>
 </html>

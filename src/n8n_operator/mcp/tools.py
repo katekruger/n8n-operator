@@ -116,6 +116,10 @@ class ToolDeps:
     # keeps using the fixed `preflight`/`health`/`dispatch` fields above — v1's own
     # n8n I/O is completely unaffected by this field's mere presence.
     n8n_client_factory: Callable[[str], N8nAdapterBundle] | None = None
+    # Stage 05: injected by the composition root's `_build_notification_sink` — `None`
+    # in v1 and whenever `enable_v2` is False, since `request_approval`/notification
+    # delivery are v2-only concepts (ADR-018).
+    notification_sink: service.NotificationSink | None = None
 
 
 def _resolve_principal_id(deps: ToolDeps) -> str:
@@ -1189,14 +1193,119 @@ def _make_list_environments(deps: ToolDeps) -> Tool:
     )
 
 
+# ======================================================================================
+# request_approval (v2 — stage 05, MCP_TOOLS.md section 5.3)
+# ======================================================================================
+
+
+class RequestApprovalArgs(_ToolArgs):
+    operation_id: str
+    approvers: list[str] | None = None
+    message: str | None = None
+
+
+def _make_request_approval(deps: ToolDeps) -> Tool:
+    async def handler(
+        operation_id: str, approvers: list[str] | None = None, message: str | None = None
+    ) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        assert deps.notification_sink is not None  # only registered when enable_v2
+        with session_scope(deps.session_factory) as session:
+            try:
+                result = service.request_approval(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    sink=deps.notification_sink,
+                    approvers=approvers,
+                    message=message,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        return {
+            "operation_id": result.operation_id,
+            "quorum_count": result.quorum_count,
+            "approval_policy_snapshot": result.approval_policy_snapshot,
+            "notified": result.notified,
+            "state": result.state,
+        }
+
+    return _build_tool(
+        name="request_approval",
+        description=(
+            "Route a pending operation's approval to its eligible approvers and send "
+            "notifications. Routing only — this tool can never approve, choose a "
+            "weaker quorum, or add an approver outside the operation's own "
+            "approval-policy snapshot."
+        ),
+        args_model=RequestApprovalArgs,
+        handler=handler,
+        annotations=ToolAnnotations(
+            read_only_hint=False, idempotent_hint=True, open_world_hint=True
+        ),
+    )
+
+
+# ======================================================================================
+# get_approval_status (v2 — stage 05, MCP_TOOLS.md section 5.4)
+# ======================================================================================
+
+
+class GetApprovalStatusArgs(_ToolArgs):
+    operation_id: str
+
+
+def _make_get_approval_status(deps: ToolDeps) -> Tool:
+    async def handler(operation_id: str) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        with session_scope(deps.session_factory) as session:
+            try:
+                status = service.get_approval_status(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        return {
+            "operation_id": status.operation_id,
+            "quorum_count": status.quorum_count,
+            "approval_policy_snapshot": status.approval_policy_snapshot,
+            "decisions": [
+                {
+                    "principal_id": d.principal_id,
+                    "decision": d.decision,
+                    "decided_at": _iso(d.decided_at),
+                }
+                for d in status.decisions
+            ],
+            "outstanding": status.outstanding,
+            "ready": status.ready,
+        }
+
+    return _build_tool(
+        name="get_approval_status",
+        description=(
+            "A scoped, redacted read of a pending operation's approval quorum: who has "
+            "decided, who is still outstanding, and whether quorum is reached."
+        ),
+        args_model=GetApprovalStatusArgs,
+        handler=handler,
+        annotations=_READ_ONLY,
+    )
+
+
 def build_tools(deps: ToolDeps) -> list[Tool]:
     """Every v1 tool, bound to ``deps`` — the list ``mcp/server.py`` hands to
     ``MCPServer(tools=...)``. Exactly BUILD_PLAN section 7.1's twelve; a contract test
     (``tests/contract/test_mcp_tool_inventory.py``) asserts this list's names against
-    that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2) and
-    ``list_environments`` (stage 04) are appended, a thirteenth and fourteenth tool,
-    only when ``deps.enable_v2`` is set — v1's exact twelve-tool surface (AC-23) is
-    otherwise untouched."""
+    that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2),
+    ``list_environments`` (stage 04), ``request_approval``, and ``get_approval_status``
+    (stage 05) are appended, a thirteenth through sixteenth tool, only when
+    ``deps.enable_v2`` is set — v1's exact twelve-tool surface (AC-23) is otherwise
+    untouched."""
     tools = [
         _make_list_workflows(deps),
         _make_describe_workflow(deps),
@@ -1214,4 +1323,6 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
     if deps.enable_v2:
         tools.append(_make_whoami(deps))
         tools.append(_make_list_environments(deps))
+        tools.append(_make_request_approval(deps))
+        tools.append(_make_get_approval_status(deps))
     return tools

@@ -97,6 +97,16 @@ class Limits(BaseModel):
     stays ``None`` to mean "use the server ceiling" — resolved per-operation, not at
     registry-load time, since the server ceiling is a deployment setting, not a
     property of the registry document itself (ADR-011).
+
+    ``quorum_count`` (stage 05, ADR-017) is the N in N-of-M team approval — always
+    concrete like ``max_concurrent``, never ``None``, since "how many distinct
+    approvers" is meaningful even for a workflow that never overrides it (v1's own
+    single-approver behavior *is* ``quorum_count: 1``, not a different code path).
+    Meaningless when ``approval: none`` (such a workflow never enters
+    ``PENDING_APPROVAL`` to begin with) — rule R15 rejects a registry entry that sets
+    both. Strengthen-only under an environment overlay, same direction as
+    ``approval_ttl_seconds`` (raise only — more distinct approvers is the stricter
+    direction, ADR-016).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -107,6 +117,7 @@ class Limits(BaseModel):
     max_concurrent: int = 1
     rate_limit_per_minute: int | None = None
     max_argument_bytes: int | None = None
+    quorum_count: int = Field(default=1, ge=1)
 
 
 # --------------------------------------------------------------------------------------

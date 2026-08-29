@@ -62,6 +62,11 @@ class ApprovalAppDeps:
     session_factory: sessionmaker[Session]
     expected_host: str
     expected_origin: str
+    # Stage 05: gates the quorum-aware branch in `approve_operation`/`reject_operation`/
+    # `get_approval_decision_context` — `False` (v1, the default) keeps this app's exact
+    # pre-stage-05 behavior; an operation with a real v2 approval-policy snapshot needs
+    # this set, or `approve_operation` silently takes the v1 single-row branch instead.
+    enable_v2: bool = False
 
 
 def _no_store(response: HTMLResponse) -> HTMLResponse:
@@ -184,20 +189,23 @@ def build_router(deps: ApprovalAppDeps, templates: Jinja2Templates) -> APIRouter
                 # Re-resolve rather than trusting the form: a token that was valid
                 # when the page rendered may have been decided, or expired, since.
                 resolved = service.resolve_approval_token(session, token=token)
+                decided_by = resolved.assigned_to or "local"
                 fingerprint = _client_fingerprint(request)
                 if decision == "approved":
                     operation = service.approve_operation(
                         session,
                         operation_id=resolved.operation_id,
-                        decided_by="local",
+                        decided_by=decided_by,
                         client_fingerprint=fingerprint,
+                        enable_v2=deps.enable_v2,
                     )
                 else:
                     operation = service.reject_operation(
                         session,
                         operation_id=resolved.operation_id,
-                        decided_by="local",
+                        decided_by=decided_by,
                         client_fingerprint=fingerprint,
+                        enable_v2=deps.enable_v2,
                     )
         except (
             ApprovalTokenInvalidError,
@@ -218,7 +226,10 @@ def build_router(deps: ApprovalAppDeps, templates: Jinja2Templates) -> APIRouter
 
         with session_scope(deps.session_factory) as session:
             context = service.get_approval_decision_context(
-                session, operation_id=operation.id, principal_id="local"
+                session,
+                operation_id=operation.id,
+                principal_id=decided_by,
+                enable_v2=deps.enable_v2,
             )
         response = templates.TemplateResponse(
             request,

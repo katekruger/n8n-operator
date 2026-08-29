@@ -35,8 +35,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from n8n_operator.config import Settings, resolve_secret_reference
 from n8n_operator.core.identity import ensure_dev_principal, resolve_user_principal
 from n8n_operator.core.models import (
+    DeliveryOutcome,
     DispatchOutcome,
     HealthCheckResult,
+    NotificationEvent,
     PreflightCheck,
     PreflightResult,
     WorkflowContract,
@@ -50,6 +52,8 @@ from n8n_operator.n8n.client import N8nClient
 from n8n_operator.n8n.dispatch import N8nDispatch
 from n8n_operator.n8n.health import N8nHealth
 from n8n_operator.n8n.preflight import N8nPreflight
+from n8n_operator.notifications.local import LocalNotificationSink
+from n8n_operator.notifications.webhook import WebhookNotificationSink
 from n8n_operator.storage.repository import EnvironmentRepository, PrincipalRepository
 from n8n_operator.storage.session import session_scope
 
@@ -119,6 +123,36 @@ class _DispatchAdapter:
 
     def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None:
         return self._impl.fetch_node_trace(execution_id)
+
+
+class _NotificationSinkAdapter:
+    """Bridges a ``notifications/`` package sink's local ``DeliveryOutcome`` onto
+    ``core.models.DeliveryOutcome`` — as :class:`_PreflightAdapter` and friends do for
+    ``n8n/`` (``notifications/`` may not import ``core/`` either, ARCHITECTURE.md
+    section 2.1). ``core.models.NotificationEvent`` already satisfies the sink's own
+    ``NotificationEventLike`` structurally, so it is passed through unconverted."""
+
+    def __init__(self, impl: LocalNotificationSink | WebhookNotificationSink) -> None:
+        self._impl = impl
+
+    def deliver(self, event: NotificationEvent) -> DeliveryOutcome:
+        raw = self._impl.deliver(event)
+        return DeliveryOutcome(delivered=raw.delivered, detail=raw.detail)
+
+
+def _build_notification_sink(settings: Settings) -> _NotificationSinkAdapter:
+    if settings.notification_sink == "webhook":
+        assert settings.notification_webhook_url is not None
+        assert settings.notification_webhook_bearer_token is not None
+        bearer_token = settings.notification_webhook_bearer_token.get_secret_value()
+        register_secret(bearer_token)
+        return _NotificationSinkAdapter(
+            WebhookNotificationSink(
+                url=str(settings.notification_webhook_url),
+                bearer_token=bearer_token,
+            )
+        )
+    return _NotificationSinkAdapter(LocalNotificationSink())
 
 
 class _EnvironmentAdapterFactory:
@@ -336,6 +370,7 @@ def build_server(
         approval_base_url=f"http://{settings.approval_bind}",
         known_secrets=client.known_secrets(),
         enable_v2=settings.enable_v2,
+        notification_sink=_build_notification_sink(settings) if settings.enable_v2 else None,
         n8n_client_factory=(
             _EnvironmentAdapterFactory(
                 session_factory=session_factory,

@@ -16,7 +16,7 @@ D4  The v1 tool inventory is consistent: the count claimed in the heading matche
     table, MCP_TOOLS.md documents exactly those tools, and no tool is invented elsewhere.
 D5  v2 and v3 inventory arithmetic holds (12 + 8 = 20, 20 + 8 = 28).
 D6  Acceptance criteria AC-01..AC-25 are each defined once, and every reference resolves.
-D7  Invariants I1-I12, boundary controls B1-B13, registry rules R1-R12, and threat IDs
+D7  Invariants I1-I14, boundary controls B1-B17, registry rules R1-R15, and threat IDs
     are each defined, and every reference resolves.
 D8  Every relative Markdown link between documents resolves to a real file.
 D9  The repository tree published in BUILD_PLAN section 4 matches the filesystem.
@@ -312,9 +312,9 @@ if defined_b != expected_b:
 
 r_block = section(plan, "### 6.6 Load-time validation rules", "### 6.7 Snapshots")
 defined_r = set(re.findall(r"^\| (R\d+) \|", r_block, re.MULTILINE))
-expected_r = {f"R{n}" for n in range(1, 15)}
+expected_r = {f"R{n}" for n in range(1, 16)}
 if defined_r != expected_r:
-    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R14")
+    fail("D7", f"registry rules {sorted(defined_r)} != expected R1-R15")
 
 for path, text in all_docs.items():
     for used in set(re.findall(r"\b(?:invariant |invariants )(I\d+)\b", text)):
