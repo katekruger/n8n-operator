@@ -348,3 +348,49 @@ def test_full_cli_only_stdio_flow_prepare_to_approve_to_execute(
         assert operation.state == "EXECUTING"
     finally:
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_v2_cli_cannot_approve_its_own_operation(
+    cli_env: None, cli_db_url: str, registry_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage 03: the CLI's own identity in v2 mode is always the fixed dev/service
+    principal (``core.identity.resolve_cli_principal_id``) — preparing an operation as
+    that same principal and then approving it, also as that same principal, is exactly
+    the self-decision case ADR-015's approve/reject capability forbids regardless of
+    role (``core.authorization.evaluate``'s ``requester_principal_id ==
+    decider_principal_id`` check), proven here against the real CLI rather than only
+    against ``core.service`` directly."""
+    monkeypatch.setenv("N8N_OPERATOR_ENABLE_V2", "true")
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0, init_result.output
+    reload_result = runner.invoke(app, ["registry", "reload", "--path", str(registry_path)])
+    assert reload_result.exit_code == 0, reload_result.output
+    # Triggers `resolve_cli_principal_id` -> `ensure_dev_principal`, idempotently
+    # granting the fixed dev principal its real admin membership — needed before
+    # `prepare_operation` below, called directly (standing in for the MCP tool), can
+    # authorize "dev" for anything at all.
+    bootstrap_result = runner.invoke(app, ["operations", "list"])
+    assert bootstrap_result.exit_code == 0, bootstrap_result.output
+
+    engine = create_engine_for_url(cli_db_url)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_scope(session_factory) as session:
+            operation, _replay, _token = service.prepare_operation(
+                session,
+                principal_id="dev",
+                environment="default",
+                workflow_id="wf.approval",
+                arguments={"email": "a@b.com"},
+                preflight=FakePreflight(),
+                server_max_argument_bytes=262_144,
+                enable_v2=True,
+            )
+            operation_id = operation.id
+    finally:
+        engine.dispose()
+
+    result = runner.invoke(app, ["operations", "approve", operation_id, "--yes"])
+    assert result.exit_code == 1
+    assert "not authorized to decide this operation" in result.output

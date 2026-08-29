@@ -195,7 +195,12 @@ def _make_list_workflows(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 summaries = service.list_workflows(
-                    session, tags=tags, risk=risk, side_effects=side_effects
+                    session,
+                    tags=tags,
+                    risk=risk,
+                    side_effects=side_effects,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
                 snapshot = service.get_active_snapshot(session)
             except OperatorError as exc:
@@ -232,7 +237,12 @@ def _make_describe_workflow(deps: ToolDeps) -> Tool:
     async def handler(workflow_id: str) -> dict[str, Any]:
         with session_scope(deps.session_factory) as session:
             try:
-                detail = service.describe_workflow(session, workflow_id=workflow_id)
+                detail = service.describe_workflow(
+                    session,
+                    workflow_id=workflow_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
+                )
                 snapshot = service.get_active_snapshot(session)
             except OperatorError as exc:
                 return _error_result(exc)
@@ -305,7 +315,11 @@ def _make_validate_input(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 errors = service.validate_input(
-                    session, workflow_id=workflow_id, arguments=arguments
+                    session,
+                    workflow_id=workflow_id,
+                    arguments=arguments,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -338,7 +352,11 @@ def _make_preflight_workflow(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 result = service.preflight_workflow(
-                    session, workflow_id=workflow_id, preflight=deps.preflight
+                    session,
+                    workflow_id=workflow_id,
+                    preflight=deps.preflight,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -458,6 +476,7 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
                     server_max_argument_bytes=deps.server_max_argument_bytes,
                     idempotency_key=idempotency_key,
                     reason=reason,
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -507,7 +526,10 @@ def _make_get_operation(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -576,6 +598,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
                     handle=handle,
                     principal_id=_resolve_principal_id(deps),
                     preflight=deps.preflight,
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -614,7 +637,10 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -678,6 +704,7 @@ def _make_cancel_operation(deps: ToolDeps) -> Tool:
                     operation_id=operation_id,
                     principal_id=_resolve_principal_id(deps),
                     reason=reason,
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -744,6 +771,7 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
                     since=since_dt,
                     limit=limit,
                     cursor=cursor,
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -786,10 +814,16 @@ def _make_get_execution_result(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -835,11 +869,23 @@ def _make_get_execution_log(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
+                    session,
+                    operation_id=operation_id,
+                    principal_id=_resolve_principal_id(deps),
+                    enable_v2=deps.enable_v2,
                 )
+                # Not re-authorized against the caller's own workflow-scope here:
+                # `get_operation` above already proved the caller may see this exact
+                # operation (and therefore its workflow) — a second, independent
+                # workflow-scope check against the same workflow_id would only be able
+                # to agree or disagree with a decision already made this same request,
+                # never add real coverage.
                 workflow = service.describe_workflow(session, workflow_id=operation.workflow_id)
             except OperatorError as exc:
                 return _error_result(exc)

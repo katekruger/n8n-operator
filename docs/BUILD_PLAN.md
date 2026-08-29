@@ -220,6 +220,7 @@ n8n-operator/
 │   ├── V2_TRACEABILITY.md          # v2 outcome/tool -> AC/test/doc/stage matrix (stage 00)
 │   ├── POSTGRES_OPERATIONS.md      # backup/restore/rollback, capacity, dev setup (stage 01)
 │   ├── OIDC_SETUP.md               # provider-neutral OIDC setup + reference config (stage 02)
+│   ├── LEAST_PRIVILEGE.md          # worked role/scope profiles for three org shapes (stage 03)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -281,7 +282,8 @@ n8n-operator/
 │       │   ├── redaction.py        # output redaction engine
 │       │   ├── service.py          # use-case orchestration (the portable core)
 │       │   ├── postgres_migration.py  # SQLite -> Postgres migration orchestration (stage 01)
-│       │   └── identity.py         # JIT provisioning, whoami (ADR-013, ADR-014; stage 02)
+│       │   ├── identity.py         # JIT provisioning, whoami, CLI identity (ADR-013, ADR-014; stage 02/03)
+│       │   └── authorization.py    # RBAC evaluator: role x workflow-scope x environment-scope (ADR-015; stage 03)
 │       ├── registry/               # section 6 — YAML registry
 │       │   ├── __init__.py
 │       │   ├── schema.py           # Pydantic v2 models for registry entries
@@ -2300,13 +2302,58 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 03 — RBAC and authorization boundaries
 
-- [ ] Role-capability matrix evaluator implementing the full (role, tool) table in
-      ADR-015, driven by the AC-38 property test rather than hand-enumerated cases
-- [ ] Workflow-scope AND environment-scope AND role-capability intersection (never
-      union) enforced on every tool call (ADR-015)
-- [ ] No `FORBIDDEN` error code anywhere; denial for authorization and denial for
-      nonexistence are the same response shape (invariant I14)
-- [ ] AC-38, AC-39, AC-44 demonstrable
+- [x] Role-capability matrix evaluator (`core/authorization.py`, new — pure domain
+      logic, not a capability package, the same shape as `core/state_machine.py`)
+      implementing the full (role, tool) table in ADR-015 exactly, driven by
+      `tests/property/test_rbac_matrix.py`'s Hypothesis-generated (role, tool) pairs
+      across all 20 v1+v2 tool names rather than hand-enumerated cases (AC-38). One
+      evaluation function (`evaluate`); MCP, CLI, and `core/service.py`'s audit/approve/
+      reject paths all call it — no adapter reimplements a role check, enforced
+      automatically by a new layering contract test
+      (`tests/contract/test_layering.py::test_no_adapter_reconstructs_the_role_vocabulary_itself`).
+- [x] Workflow-scope AND role-capability intersection (never union) enforced on every
+      v1 tool call and `whoami`'s own visibility path is unaffected (organization-wide
+      by design). Cross-organization semantics: each membership's grant is tried
+      independently — union *across* self-contained grants, never union *within* one
+      grant's fields (ADR-015's own distinction) —
+      `tests/integration/test_authorization_service.py::test_a_principal_in_two_organizations_is_authorized_by_either_grant_independently`.
+      Environment-scope is fully implemented and exhaustively property-tested
+      (AC-39) but not reachable from a real v1 tool call yet — no v1 tool carries an
+      `environment` argument until stage 04 — a documented, explicit partial-scoping
+      decision (`core/authorization.py`'s own module docstring, THREAT_MODEL.md RR-13),
+      the direct continuation of stage 02's AC-36 partial-scoping precedent.
+- [x] No `FORBIDDEN` error code anywhere; denial for authorization and denial for
+      nonexistence are the same response shape (invariant I14) — every gated
+      `core/service.py` function raises the *identical* existing not-found exception on
+      denial as it already raised for genuine absence, never a second code path.
+      `tests/property/test_no_enumeration.py::test_unauthorized_and_nonexistent_are_bitwise_identical_across_four_tools`
+      proves this against real callers, real operations, and four different tools.
+- [x] `list_operations` (and its backing `OperationRepository.list`) filters by scope
+      *before* `LIMIT`, not after — a `workflow_scope` glob is translated into a SQL
+      `LIKE` pattern (`workflow_scope_to_sql_like`) rather than filtered in Python
+      post-fetch, closing the pagination side channel the completion gate names
+      explicitly. `tests/integration/test_authorization_service.py::test_list_operations_scope_filter_applies_before_the_page_limit`.
+- [x] Admin CLI: `identity add-membership` validates `workflow_scope`/
+      `environment_scope` against real registry/environment data at grant time (ADR-015's
+      own stated requirement — an unmatchable pattern fails loudly, never silently
+      grants nothing while looking like a real grant), prompts for confirmation on an
+      `admin` grant (`--yes` to skip), and a new `identity preview-permissions` command
+      shows a principal's real, effective (role, tool) matrix — read-only, changes
+      nothing. `cli/commands/operations.py`/`audit.py` gain real CLI identity for the
+      first time (`core.identity.resolve_cli_principal_id`, mirroring ADR-014 §5's
+      stdio rule exactly: `enable_v2=False` unchanged, `enable_v2=True` always the
+      fixed dev/service principal); `ensure_dev_principal` now also idempotently grants
+      that principal a real `admin` membership in one canonical "Local development"
+      organization, so local dev stays easy under real enforcement (stage 02's own
+      stated goal) without a bypass.
+- [x] A principal may never decide (approve/reject) their own operation, regardless of
+      role — buildable now with data (`operations.principal_id`) that already exists,
+      without ADR-017's full quorum/snapshot machinery (stage 05). Proven at the
+      `core.service` level and through the real CLI.
+      `tests/integration/test_authorization_service.py::test_an_approver_may_never_decide_their_own_operation`,
+      `tests/integration/test_cli_operations.py::test_v2_cli_cannot_approve_its_own_operation`.
+- [x] Least-privilege guidance for three org shapes: [LEAST_PRIVILEGE.md](LEAST_PRIVILEGE.md).
+- [x] AC-38, AC-39 (partial — see above), AC-44 demonstrable.
 
 #### Stage 04 — Multi-environment registry
 

@@ -417,3 +417,26 @@ print(json.dumps({{"ok": result.ok, "first_break_seq": result.first_break_seq}})
     reverified = json.loads(completed.stdout)
     assert reverified["ok"] is False
     assert reverified["first_break_seq"] == 2
+
+
+@pytest.mark.integration
+def test_audit_verify_succeeds_under_v2_with_the_dev_principal(
+    cli_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage 03: ``audit verify``/``audit export`` now require the ``admin`` role in
+    v2 mode (``core.service._require_admin``) — the CLI's own identity (Stage 03,
+    ``core.identity.resolve_cli_principal_id``) is always the fixed dev/service
+    principal, which ``ensure_dev_principal`` idempotently grants a real ``admin``
+    membership (Stage 03's "dev principal needs a real membership to be usable"
+    decision), so this command keeps working exactly as it always did under
+    ``enable_v2=True`` — "insufficient role" itself is proven against a real,
+    non-admin principal at the ``core.service`` level
+    (``tests/integration/test_authorization_service.py``), since the CLI's own
+    identity can never be anything other than admin by this stage's design."""
+    monkeypatch.setenv("N8N_OPERATOR_ENABLE_V2", "true")
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0, init_result.output
+
+    result = runner.invoke(app, ["audit", "verify"])
+    assert result.exit_code == 0, result.output
+    assert "OK" in result.output

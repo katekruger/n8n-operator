@@ -86,7 +86,7 @@ Three commitments shape every structural decision:
 | Layer | Modules | May do | Must not do |
 |---|---|---|---|
 | **Adapter** | `mcp/`, `cli/`, `approval/` | Parse and validate transport-level input, call one `core.service` use case, shape the result for the transport. | Decide policy, touch the database, call n8n, or write audit records. |
-| **Core** | `core/` | Orchestrate use cases, apply the state machine, mint and burn handles, compute fingerprints, redact output, and commit transitions with their audit records. | Import any adapter, `fastapi`, `typer`, or the MCP SDK. |
+| **Core** | `core/` | Orchestrate use cases, apply the state machine, mint and burn handles, compute fingerprints, redact output, evaluate RBAC authorization (`core/authorization.py`, *v2, stage 03*), and commit transitions with their audit records. | Import any adapter, `fastapi`, `typer`, or the MCP SDK. |
 | **Capability** | `registry/`, `storage/`, `audit/`, `n8n/`, `identity/` *(v2, stage 02)* | Own one external concern each: the allowlist, persistence, the audit chain, the n8n API, OIDC token validation. | Depend on each other or on `core/`. |
 
 The dependency graph is a DAG pointing inward. A contract test walks the import graph

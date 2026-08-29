@@ -25,6 +25,42 @@ def _init(cli_env: None) -> None:
     assert result.exit_code == 0, result.output
 
 
+_REGISTRY_YAML = """apiVersion: n8n-operator/v1
+metadata:
+  name: identity-cli-test
+workflows:
+  - id: crm.sync_contact
+    n8n_workflow_id: n8n-1
+    title: Sync contact
+    description: Read-only sync.
+    owner: carolyn
+    version: 1
+    definition_hash: sha256:{hash}
+    risk: low
+    side_effects: read_only
+    approval: none
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/a
+      auth: none
+    input_schema:
+      type: object
+      properties: {{}}
+      additionalProperties: false
+    limits:
+      approval_ttl_seconds: 900
+      execution_ttl_seconds: 300
+""".format(hash="a" * 64)
+
+
+def _load_registry(cli_env: None, tmp_path: Path) -> None:
+    registry_path = tmp_path / "workflows.yaml"
+    registry_path.write_text(_REGISTRY_YAML)
+    result = runner.invoke(app, ["registry", "reload", "--path", str(registry_path)])
+    assert result.exit_code == 0, result.output
+
+
 @pytest.mark.integration
 def test_bootstrap_creates_an_organization_and_its_first_admin(cli_env: None) -> None:
     _init(cli_env)
@@ -587,5 +623,213 @@ def test_identity_help_lists_every_subcommand() -> None:
         "create-service-principal",
         "rotate-service-credential",
         "list-service-principals",
+        "preview-permissions",
     ):
         assert name in result.stdout
+
+
+@pytest.mark.integration
+def test_add_membership_rejects_a_workflow_scope_matching_nothing(
+    cli_env: None, tmp_path: Path
+) -> None:
+    _init(cli_env)
+    _load_registry(cli_env, tmp_path)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "operator",
+            "--workflow-scope",
+            "billing.*",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "matches no workflow" in result.output
+
+
+@pytest.mark.integration
+def test_add_membership_accepts_a_workflow_scope_matching_a_real_workflow(
+    cli_env: None, tmp_path: Path
+) -> None:
+    _init(cli_env)
+    _load_registry(cli_env, tmp_path)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "operator",
+            "--workflow-scope",
+            "crm.*",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.integration
+def test_add_membership_rejects_an_environment_scope_naming_a_nonexistent_environment(
+    cli_env: None,
+) -> None:
+    _init(cli_env)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "viewer",
+            "--environment-scope",
+            "env-does-not-exist",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "do not exist in this organization" in result.output
+
+
+@pytest.mark.integration
+def test_add_membership_rejects_a_garbled_case_role_rather_than_silently_storing_it(
+    cli_env: None,
+) -> None:
+    """Case normalization: a role string that doesn't exactly match
+    ``viewer``/``operator``/``approver``/``admin`` is rejected loudly at grant time —
+    never silently stored as an unmatched string that would later authorize nothing
+    while looking, to a casual reader of ``list-memberships``, like a real grant."""
+    _init(cli_env)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "Admin",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Invalid role" in result.output
+
+
+@pytest.mark.integration
+def test_add_membership_of_admin_prompts_for_confirmation_and_aborts_on_no(
+    cli_env: None,
+) -> None:
+    _init(cli_env)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "admin",
+        ],
+        input="n\n",
+    )
+    assert result.exit_code == 1
+    assert "Not granted" in result.output
+
+
+@pytest.mark.integration
+def test_add_membership_of_admin_with_yes_skips_confirmation(cli_env: None) -> None:
+    _init(cli_env)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    result = runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "admin",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.integration
+def test_preview_permissions_for_a_principal_with_no_memberships(cli_env: None) -> None:
+    _init(cli_env)
+    result = runner.invoke(app, ["identity", "preview-permissions", "no-such-principal"])
+    assert result.exit_code == 0
+    assert "authorized for nothing" in result.output
+
+
+@pytest.mark.integration
+def test_preview_permissions_reflects_a_real_grant(cli_env: None, tmp_path: Path) -> None:
+    _init(cli_env)
+    _load_registry(cli_env, tmp_path)
+    org_result = runner.invoke(app, ["identity", "create-org", "--name", "Acme"])
+    org_id = org_result.output.split(": ")[1].split(" (")[0]
+    runner.invoke(
+        app,
+        [
+            "identity",
+            "add-membership",
+            "--org",
+            org_id,
+            "--issuer",
+            "https://idp.example.com",
+            "--subject",
+            "alice",
+            "--roles",
+            "viewer",
+        ],
+    )
+    memberships = runner.invoke(app, ["identity", "list-memberships", "--org", org_id])
+    principal_id = next(
+        line.split()[0] for line in memberships.output.splitlines() if "alice" in line
+    )
+
+    result = runner.invoke(app, ["identity", "preview-permissions", principal_id])
+    assert result.exit_code == 0
+    assert "list_workflows" in result.output
+    assert "prepare_operation" not in result.output.split("Denied")[0]  # viewer: not allowed
+    assert "prepare_operation" in result.output.split("Denied")[1]

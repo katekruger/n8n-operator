@@ -29,8 +29,10 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from n8n_operator.config import resolve_database_url
+from n8n_operator.config import resolve_database_url, resolve_v2_identity_flags
 from n8n_operator.core import service
+from n8n_operator.core.identity import resolve_cli_principal_id
+from n8n_operator.errors import InsufficientRoleError
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
@@ -63,6 +65,28 @@ def _database_not_initialized_or_exit() -> None:
     raise typer.Exit(code=1)
 
 
+def _resolve_principal(session: Session) -> tuple[str, bool]:
+    """``(principal_id, enable_v2)`` for the current invocation (Stage 03) — v1 (the
+    default) resolves the fixed ``"local"`` identity; v2 resolves the CLI's own
+    identity (``core.identity.resolve_cli_principal_id``), used here to gate these
+    system-wide, cross-principal commands to the ``admin`` role
+    (``core.service._require_admin``)."""
+    enable_v2, dev_principal_id = resolve_v2_identity_flags()
+    principal_id = resolve_cli_principal_id(
+        session, enable_v2=enable_v2, dev_principal_id=dev_principal_id
+    )
+    return principal_id, enable_v2
+
+
+def _insufficient_role_or_exit() -> None:
+    typer.secho(
+        "This command requires the admin role.",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command("verify")
 def verify(
     as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
@@ -78,9 +102,15 @@ def verify(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
-                result = service.verify_audit_chain(session)
+                principal_id, enable_v2 = _resolve_principal(session)
+                result = service.verify_audit_chain(
+                    session, principal_id=principal_id, enable_v2=enable_v2
+                )
         except OperationalError:
             _database_not_initialized_or_exit()
+            return
+        except InsufficientRoleError:
+            _insufficient_role_or_exit()
             return
 
     if as_json:
@@ -123,9 +153,15 @@ def export(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
-                record = service.export_audit_record(session)
+                principal_id, enable_v2 = _resolve_principal(session)
+                record = service.export_audit_record(
+                    session, principal_id=principal_id, enable_v2=enable_v2
+                )
         except OperationalError:
             _database_not_initialized_or_exit()
+            return
+        except InsufficientRoleError:
+            _insufficient_role_or_exit()
             return
 
     payload = json.dumps(record, indent=2, sort_keys=True)

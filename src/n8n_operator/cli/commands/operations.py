@@ -42,8 +42,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from n8n_operator.config import resolve_database_url
+from n8n_operator.config import resolve_database_url, resolve_v2_identity_flags
 from n8n_operator.core import service
+from n8n_operator.core.identity import resolve_cli_principal_id
 from n8n_operator.core.models import ApprovalDecisionContext, Operation
 from n8n_operator.errors import (
     InvalidArgumentsError,
@@ -60,7 +61,17 @@ app = typer.Typer(
     help="List, inspect, cancel, approve, reject, and expire operations.", no_args_is_help=True
 )
 
-_PRINCIPAL_ID = "local"  # v1 has exactly one principal (BUILD_PLAN section 8.1)
+
+def _resolve_principal(session: Session) -> tuple[str, bool]:
+    """``(principal_id, enable_v2)`` for the current invocation — v1 (the default)
+    resolves the same fixed ``"local"`` identity every command already hardcoded
+    (BUILD_PLAN section 8.1); v2 resolves the CLI's own identity (Stage 03,
+    ``core.identity.resolve_cli_principal_id``)."""
+    enable_v2, dev_principal_id = resolve_v2_identity_flags()
+    principal_id = resolve_cli_principal_id(
+        session, enable_v2=enable_v2, dev_principal_id=dev_principal_id
+    )
+    return principal_id, enable_v2
 
 
 @contextmanager
@@ -167,12 +178,14 @@ def list_operations(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 operations = service.list_operations(
                     session,
-                    principal_id=_PRINCIPAL_ID,
+                    principal_id=principal_id,
                     workflow_id=workflow_id,
                     states=state,
                     limit=limit,
+                    enable_v2=enable_v2,
                 )
         except InvalidArgumentsError as exc:
             typer.secho(exc.message, fg=typer.colors.RED, err=True)
@@ -218,8 +231,12 @@ def show(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
                 )
         except OperationNotFoundError:
             _operation_not_found_or_exit(operation_id)
@@ -256,8 +273,12 @@ def cancel(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
                 )
         except OperationNotFoundError:
             _operation_not_found_or_exit(operation_id)
@@ -274,7 +295,11 @@ def cancel(
         try:
             with session_scope(session_factory) as session:
                 updated = service.cancel_operation(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID, reason=reason
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    reason=reason,
+                    enable_v2=enable_v2,
                 )
         except InvalidStateTransitionError:
             typer.secho(
@@ -298,8 +323,12 @@ def approval_status(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 context = service.get_approval_decision_context(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
                 )
         except OperationNotFoundError:
             _operation_not_found_or_exit(operation_id)
@@ -319,8 +348,12 @@ def approve(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 context = service.get_approval_decision_context(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
                 )
         except OperationNotFoundError:
             _operation_not_found_or_exit(operation_id)
@@ -342,8 +375,19 @@ def approve(
         try:
             with session_scope(session_factory) as session:
                 operation = service.approve_operation(
-                    session, operation_id=operation_id, decided_by=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    decided_by=principal_id,
+                    enable_v2=enable_v2,
                 )
+        except OperationNotFoundError:
+            typer.secho(
+                "You are not authorized to decide this operation (or it does not "
+                "exist) — an approver may not decide their own request.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
         except InvalidStateTransitionError:
             typer.secho(
                 "This operation changed state while you were deciding; run "
@@ -365,8 +409,12 @@ def reject(
     with _connected() as session_factory:
         try:
             with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
                 context = service.get_approval_decision_context(
-                    session, operation_id=operation_id, principal_id=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
                 )
         except OperationNotFoundError:
             _operation_not_found_or_exit(operation_id)
@@ -388,8 +436,19 @@ def reject(
         try:
             with session_scope(session_factory) as session:
                 operation = service.reject_operation(
-                    session, operation_id=operation_id, decided_by=_PRINCIPAL_ID
+                    session,
+                    operation_id=operation_id,
+                    decided_by=principal_id,
+                    enable_v2=enable_v2,
                 )
+        except OperationNotFoundError:
+            typer.secho(
+                "You are not authorized to decide this operation (or it does not "
+                "exist) — an approver may not decide their own request.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
         except InvalidStateTransitionError:
             typer.secho(
                 "This operation changed state while you were deciding; run "
