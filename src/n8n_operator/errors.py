@@ -182,6 +182,17 @@ class EnvironmentArchivedError(DomainError):
     default_message = "This environment is archived; no new work may target it."
 
 
+class ApproverNotInPolicyError(DomainError):
+    """Stage 05 (ADR-017 section 1): ``request_approval``'s ``approvers`` argument
+    named a principal who is not in the operation's own approval-policy snapshot —
+    never a way to route to (or imply the existence of) someone outside it."""
+
+    code = "APPROVER_NOT_IN_POLICY"
+    retryable = False
+    remediation = "Omit approvers, or check get_approval_status for the real snapshot."
+    default_message = "One or more named approvers are not in this operation's approval policy."
+
+
 class InvalidArgumentsError(DomainError):
     code = "INVALID_ARGUMENTS"
     retryable = False
@@ -314,13 +325,16 @@ class InsufficientRoleError(AuthorizationError):
 
 
 # --------------------------------------------------------------------------------------
-# Approval-channel errors (phase 6, ADR-010) — raised only by the loopback approval web
-# page's own token-verification path (``core.service.resolve_approval_token``). The CLI
-# approval channel identifies an operation by ID directly and has no token to verify, so
-# it never raises these; both channels still apply the identical PENDING_APPROVAL check
-# through the shared ``approve_operation``/``reject_operation`` use case. Never returned
-# by an MCP tool (there is no tool that approves, boundary B4) — deliberately not part
-# of MCP_TOOLS.md's tool-facing taxonomy or the ``TAXONOMY`` registry below.
+# Approval-channel errors (phase 6, ADR-010; stage 05, ADR-017) — raised only by the
+# loopback approval web page's own token-verification path
+# (``core.service.resolve_approval_token``) and by the shared
+# ``approve_operation``/``reject_operation`` use case both the CLI and the web page
+# call to actually decide. The CLI approval channel identifies an operation by ID
+# directly and has no token to verify, so it never raises the token-specific ones;
+# both channels apply the identical PENDING_APPROVAL and one-decision-per-principal
+# checks. Never returned by an MCP tool (there is no tool that approves, boundary
+# B4) — deliberately not part of MCP_TOOLS.md's tool-facing taxonomy or the
+# ``TAXONOMY`` registry below.
 # --------------------------------------------------------------------------------------
 
 
@@ -343,6 +357,18 @@ class ApprovalNotPendingError(AuthorizationError):
     retryable = False
     remediation = "Check n8n-operator operations approval-status for the operation's current state."
     default_message = "This operation is no longer awaiting approval."
+
+
+class ApprovalAlreadyDecidedError(AuthorizationError):
+    """Stage 05 (ADR-017 section 3): a principal in the operation's approval-policy
+    snapshot who has already cast a decision (either direction) tries to decide
+    again. Deliberately an explicit error, not a silently-ignored no-op — a second
+    click should never be indistinguishable from "my first click didn't register.\""""
+
+    code = "APPROVAL_ALREADY_DECIDED"
+    retryable = False
+    remediation = "Check n8n-operator operations approval-status; you already decided this one."
+    default_message = "You have already decided this operation."
 
 
 # --------------------------------------------------------------------------------------
@@ -481,6 +507,7 @@ TAXONOMY: dict[str, type[OperatorError]] = {
         EnvironmentNotFoundError,
         EnvironmentRequiredError,
         EnvironmentArchivedError,
+        ApproverNotInPolicyError,
         InvalidArgumentsError,
         IdempotencyConflictError,
         ArgumentsTooLargeError,
@@ -505,18 +532,20 @@ TAXONOMY: dict[str, type[OperatorError]] = {
         InternalError,
     )
 }
-"""24 original v1 codes plus the 3 environment codes stage 04 adds (the first
-``*(v2)*``-marked MCP_TOOLS.md rows to gain an implementation) — verified by a
-contract test that parses that table and asserts this dict's keys are a subset of it,
-and that each implemented class's ``remediation`` matches the table's "Model's correct
-next move" column verbatim."""
+"""24 original v1 codes, the 3 environment codes stage 04 adds, and the 1 approval
+code (``APPROVER_NOT_IN_POLICY``) stage 05 adds — verified by a contract test that
+parses that table and asserts this dict's keys are a subset of it, and that each
+implemented class's ``remediation`` matches the table's "Model's correct next move"
+column verbatim."""
 
 __all__ = [
     "TAXONOMY",
+    "ApprovalAlreadyDecidedError",
     "ApprovalNotPendingError",
     "ApprovalRequiredError",
     "ApprovalTokenAlreadyUsedError",
     "ApprovalTokenInvalidError",
+    "ApproverNotInPolicyError",
     "ArgumentMismatchError",
     "ArgumentsTooLargeError",
     "AuthorizationError",

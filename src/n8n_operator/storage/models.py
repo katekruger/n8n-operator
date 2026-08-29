@@ -344,6 +344,13 @@ class Approval(Base):
     token_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     binding_hash: Mapped[str] = mapped_column(String, nullable=False)
     quorum_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Stage 05 (ADR-017): which eligible approver this *pending, undecided* row
+    # belongs to — `NULL` for a v1 shared token (unchanged) and for a v2 decision
+    # cast directly through the CLI without a prior `request_approval` minting it.
+    # Once decided, `decided_by` is the authoritative record; `assigned_to` only ever
+    # matters before that, to let the web channel's per-approver link know who it
+    # decides as without a login system (`core.service.resolve_approval_token`).
+    assigned_to: Mapped[str | None] = mapped_column(String, nullable=True)
     issued_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
     expires_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
     decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)

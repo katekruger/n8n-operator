@@ -285,7 +285,7 @@ def _check_r4_input_schema(entry: WorkflowEntry) -> RuleViolation | None:
     return None
 
 
-def _check_r5_r10_approval_policy(resolved: WorkflowEntry) -> list[RuleViolation]:
+def _check_r5_r10_r15_approval_policy(resolved: WorkflowEntry) -> list[RuleViolation]:
     violations = []
     assert resolved.approval is not None  # resolved entries always have a concrete value
     if resolved.approval == "none" and resolved.side_effects != "read_only":
@@ -302,6 +302,20 @@ def _check_r5_r10_approval_policy(resolved: WorkflowEntry) -> list[RuleViolation
             RuleViolation(
                 "R10",
                 "risk: high requires approval: required (defaults may not weaken this)",
+                resolved.id,
+            )
+        )
+    # A workflow that never enters PENDING_APPROVAL has nothing for a quorum count to
+    # govern — a quorum_count > 1 alongside approval: none is dead configuration, all
+    # but certainly an authoring mistake, refused loudly rather than silently ignored
+    # (stage 05, ADR-017).
+    if resolved.approval == "none" and resolved.limits.quorum_count > 1:
+        violations.append(
+            RuleViolation(
+                "R15",
+                f"approval: none can never reach PENDING_APPROVAL, so "
+                f"limits.quorum_count ({resolved.limits.quorum_count}) can never apply "
+                "— remove it or set approval: required",
                 resolved.id,
             )
         )
@@ -418,6 +432,9 @@ _LIMITS_STRENGTHEN_DIRECTION: dict[str, str] = {
     "max_concurrent": "lower",
     "rate_limit_per_minute": "lower",
     "max_argument_bytes": "lower",
+    # Stage 05, ADR-017: requiring more distinct approvers is the strict direction,
+    # the same "raise" side as approval_ttl_seconds (more deliberation, more people).
+    "quorum_count": "raise",
 }
 
 
@@ -556,7 +573,7 @@ def check_rules(
         r4 = _check_r4_input_schema(raw_entry)
         if r4:
             violations.append(r4)
-        violations.extend(_check_r5_r10_approval_policy(resolved))
+        violations.extend(_check_r5_r10_r15_approval_policy(resolved))
         r6 = _check_r6_secret_ref(raw_entry)
         if r6:
             violations.append(r6)

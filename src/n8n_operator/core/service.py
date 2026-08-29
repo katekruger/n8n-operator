@@ -47,20 +47,28 @@ from n8n_operator.core.idempotency import (
 )
 from n8n_operator.core.models import (
     ApprovalDecisionContext,
+    ApprovalDecisionEntry,
+    ApprovalStatus,
+    DeliveryOutcome,
+    DeliveryReceipt,
     DispatchOutcome,
     EnvironmentSummary,
     ExecutionResult,
     HealthCheckResult,
+    NotificationEvent,
     Operation,
     PreflightResult,
+    RequestApprovalResult,
     WorkflowContract,
 )
 from n8n_operator.core.redaction import cap_output, redact, scrub_secrets
 from n8n_operator.errors import (
+    ApprovalAlreadyDecidedError,
     ApprovalNotPendingError,
     ApprovalRequiredError,
     ApprovalTokenAlreadyUsedError,
     ApprovalTokenInvalidError,
+    ApproverNotInPolicyError,
     ArgumentMismatchError,
     ArgumentsTooLargeError,
     ConcurrencyLimitReachedError,
@@ -103,6 +111,7 @@ from n8n_operator.storage.repository import (
     AuditLogRepository,
     EnvironmentRepository,
     ExecutionResultRepository,
+    NotificationDeliveryRepository,
     OperationEventRepository,
     OperationRepository,
     OrganizationMembershipRepository,
@@ -117,6 +126,7 @@ _logger = logging.getLogger(__name__)
 __all__ = [
     "DispatchPort",
     "HealthPort",
+    "NotificationSink",
     "PreflightPort",
     "approve_operation",
     "cancel_operation",
@@ -127,6 +137,7 @@ __all__ = [
     "export_audit_record",
     "get_active_snapshot",
     "get_approval_decision_context",
+    "get_approval_status",
     "get_execution_result",
     "get_instance_health",
     "get_operation",
@@ -137,7 +148,9 @@ __all__ = [
     "record_execution_outcome",
     "reject_operation",
     "reload_registry",
+    "request_approval",
     "resolve_approval_token",
+    "retry_failed_notifications",
     "validate_input",
     "validate_registry",
     "verify_audit_chain",
@@ -188,6 +201,19 @@ class DispatchPort(Protocol):
     ) -> DispatchOutcome: ...
 
     def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None: ...
+
+
+class NotificationSink(Protocol):
+    """What ``request_approval`` (and, stage 08, alert hooks) need from a delivery
+    channel (ADR-018) — one interface for both event sources, the same "one seam,
+    several implementations" shape :class:`PreflightPort`/:class:`HealthPort`/
+    :class:`DispatchPort` already establish. The composition root injects a real
+    local or webhook sink (``notifications/``); tests inject a fake. Dedup and
+    bounded retry live in :func:`_deliver_with_dedup`, one layer above this port —
+    an implementation's ``deliver`` is called at most once per delivery attempt, not
+    responsible for deciding whether *to* attempt."""
+
+    def deliver(self, event: NotificationEvent) -> DeliveryOutcome: ...
 
 
 # ----------------------------------------------------------------------------------
@@ -372,6 +398,18 @@ def _get_operation_row(session: Session, operation_id: str) -> OperationRow:
     return _apply_lazy_expiry(session, row)
 
 
+def _get_operation_row_for_update(session: Session, operation_id: str) -> OperationRow:
+    """As :func:`_get_operation_row`, but holds a row lock for the rest of the
+    caller's transaction — used only by the approve/reject decision path, where two
+    genuinely concurrent decisions on the same operation must serialize around
+    reading-then-tallying (:meth:`OperationRepository.get_for_update`'s own
+    docstring has the full reasoning)."""
+    row = OperationRepository(session).get_for_update(operation_id)
+    if row is None:
+        raise OperationNotFoundError()
+    return _apply_lazy_expiry(session, row)
+
+
 def _authorize(
     session: Session,
     *,
@@ -496,6 +534,52 @@ def _apply_environment(
     )
     merged_entry = resolve_overlay(base_entry, overlay_entry)
     return resolved_env.id, merged_entry
+
+
+def _compute_eligible_approvers(
+    session: Session,
+    *,
+    organization_id: str,
+    workflow_id: str,
+    environment_id: str,
+    requester_principal_id: str,
+) -> list[str]:
+    """The approval-policy snapshot's eligible-approver list (stage 05, ADR-017
+    section 1): every distinct principal, active in this organization, whose roles
+    include ``approver`` or ``admin`` (both carry
+    ``authorization.APPROVE_REJECT_CAPABILITY`` — ``ROLE_CAPABILITIES``) *and* whose
+    grant's ``workflow_scope``/``environment_scope`` covers this workflow and
+    environment (the identical per-membership conjunction ``authorization.evaluate``
+    already applies, reused here rather than re-derived) — **excluding the
+    requester, structurally**, regardless of whether they hold ``approver``
+    elsewhere. A principal holding two qualifying memberships counts once (a
+    `principal_id` set, not a membership-row count) — the same identity can never
+    occupy two quorum slots.
+
+    Returns a sorted list for a deterministic, reproducible snapshot — the exact
+    list this function returns *is* the policy from this moment forward, frozen onto
+    the operation row by the caller (T04) and never recomputed.
+    """
+    memberships = OrganizationMembershipRepository(session).list_active_for_organization(
+        organization_id
+    )
+    eligible: set[str] = set()
+    for membership in memberships:
+        if membership.principal_id == requester_principal_id:
+            continue
+        capable_roles = [
+            role
+            for role in membership.roles
+            if authorization.APPROVE_REJECT_CAPABILITY in authorization.capabilities_for_role(role)
+        ]
+        if not capable_roles:
+            continue
+        if not authorization.match_workflow_scope(membership.workflow_scope, workflow_id):
+            continue
+        if not authorization.environment_scope_covers(membership, environment_id, organization_id):
+            continue
+        eligible.add(membership.principal_id)
+    return sorted(eligible)
 
 
 def _get_owned_operation_row(
@@ -1107,12 +1191,19 @@ def prepare_operation(
             existing = _apply_lazy_expiry(session, existing)
             return _to_domain(existing), True, None
 
+    resolved_organization_id: str | None = None
+    if enable_v2 and resolved_environment_id is not None:
+        resolved_environment_row = EnvironmentRepository(session).get(resolved_environment_id)
+        assert resolved_environment_row is not None  # just resolved above; cannot vanish mid-call
+        resolved_organization_id = resolved_environment_row.organization_id
+
     handle = mint_operation_handle()
     operation = op_repo.create(
         id=handle,
         principal_id=principal_id,
         environment=environment_value,
         environment_id=resolved_environment_id,
+        organization_id=resolved_organization_id,
         snapshot_id=snapshot.id,
         workflow_id=workflow_id,
         definition_hash=entry.definition_hash,
@@ -1171,31 +1262,99 @@ def prepare_operation(
         approval_expires_at = now + timedelta(
             seconds=_resolved_ttl(entry.limits.approval_ttl_seconds)
         )
+        field_updates: dict[str, Any] = {"approval_expires_at": approval_expires_at}
+        if enable_v2:
+            # Stage 05 (ADR-017 section 1): the eligible-approver snapshot is
+            # computed and frozen right here, at T04 entry — never recomputed, never
+            # re-expanded by a later membership change (invariant I13, AC-40).
+            assert resolved_organization_id is not None  # every v2 operation has one
+            assert resolved_environment_id is not None
+            eligible_approvers = _compute_eligible_approvers(
+                session,
+                organization_id=resolved_organization_id,
+                workflow_id=workflow_id,
+                environment_id=resolved_environment_id,
+                requester_principal_id=principal_id,
+            )
+            field_updates["approval_policy_snapshot"] = {
+                "quorum_count": entry.limits.quorum_count,
+                "eligible_approvers": eligible_approvers,
+            }
         operation = _apply_and_audit(
             session,
             operation,
             "T04",
             actor="system",
             detail=checks_detail,
-            approval_expires_at=approval_expires_at,
+            **field_updates,
         )
-        minted = mint_approval_token()
-        binding_hash = compute_approval_binding(
-            operation_id=operation.id,
-            principal_id=principal_id,
-            argument_fingerprint=fingerprint,
-            snapshot_id=snapshot.id,
-            definition_hash=entry.definition_hash,
-        )
-        ApprovalRepository(session).create(
-            operation_id=operation.id,
-            token_hash=minted.token_hash,
-            binding_hash=binding_hash,
-            expires_at=approval_expires_at,
-        )
-        approval_token = minted.token
+        if not enable_v2:
+            # v1 only: one shared token, minted immediately, returned to the caller —
+            # byte-identical to every pre-stage-05 behavior. v2's eligible approvers
+            # exclude the requester by construction, so a token returned to *them*
+            # here would never be usable — v2 callers mint per-approver tokens
+            # lazily, in `request_approval`, once notification actually routes.
+            minted = mint_approval_token()
+            binding_hash = compute_approval_binding(
+                operation_id=operation.id,
+                principal_id=principal_id,
+                argument_fingerprint=fingerprint,
+                snapshot_id=snapshot.id,
+                definition_hash=entry.definition_hash,
+            )
+            ApprovalRepository(session).create(
+                operation_id=operation.id,
+                token_hash=minted.token_hash,
+                binding_hash=binding_hash,
+                expires_at=approval_expires_at,
+            )
+            approval_token = minted.token
 
     return _to_domain(operation), False, approval_token
+
+
+def _v2_quorum_snapshot(row: OperationRow) -> dict[str, Any] | None:
+    """``row.approval_policy_snapshot`` if this operation actually went through the
+    v2 T04 path (a real dict with both keys) — ``None`` otherwise, including the
+    defensive case where ``enable_v2`` was flipped between prepare and decide time
+    (a deployment misconfiguration, not something a caller can cause), in which case
+    every v2 caller falls back to the exact v1 shape rather than crashing on a
+    missing snapshot."""
+    snapshot = row.approval_policy_snapshot
+    if not snapshot or "eligible_approvers" not in snapshot or "quorum_count" not in snapshot:
+        return None
+    return snapshot
+
+
+def _get_or_mint_own_approval_row(
+    session: Session, row: OperationRow, *, decided_by: str
+) -> ApprovalRow:
+    """This decider's own row for ``row``'s operation — the one
+    ``request_approval`` already minted for them (``assigned_to``), or, if they are
+    deciding directly (CLI, no prior routing call), a freshly minted one. The token
+    on a freshly minted row here is never handed to anyone — deciding through the
+    CLI has no token to present — it exists only to satisfy this table's
+    ``NOT NULL``/unique ``token_hash`` invariant uniformly, the same way a v1 row
+    always has one whether or not a human ever clicked the link."""
+    existing = ApprovalRepository(session).get_by_operation_and_decider(row.id, decided_by)
+    if existing is not None:
+        return existing
+    minted = mint_approval_token()
+    binding_hash = compute_approval_binding(
+        operation_id=row.id,
+        principal_id=decided_by,
+        argument_fingerprint=row.argument_fingerprint,
+        snapshot_id=row.snapshot_id,
+        definition_hash=row.definition_hash,
+    )
+    assert row.approval_expires_at is not None  # every PENDING_APPROVAL row has one
+    return ApprovalRepository(session).create(
+        operation_id=row.id,
+        token_hash=minted.token_hash,
+        binding_hash=binding_hash,
+        expires_at=row.approval_expires_at,
+        assigned_to=decided_by,
+    )
 
 
 def approve_operation(
@@ -1206,35 +1365,78 @@ def approve_operation(
     client_fingerprint: str | None = None,
     enable_v2: bool = False,
 ) -> Operation:
-    """T06: a human approves (ADR-010; both the CLI and the approval-page channel call
-    this one use case). Not scoped to a preparing principal in v1's single-principal
-    model, where the approver and preparer are always the same ``local`` identity.
+    """T06: a human approves (ADR-010, ADR-017; both the CLI and the approval-page
+    channel call this one use case). Not scoped to a preparing principal in v1's
+    single-principal model, where the approver and preparer are always the same
+    ``local`` identity.
 
-    v2 (``enable_v2=True``, CLI-only — the web approval channel stays token-based per
-    ADR-010, Stage 03 does not add identity to it; see ``docs/OIDC_SETUP.md``-adjacent
-    scoping notes in the Stage 03 PR): ``decided_by`` must hold ``approver`` or
-    ``admin`` with workflow-scope covering this operation's workflow (ADR-015's own
-    "out-of-band approve/reject" matrix row), and — regardless of role — may never be
-    the operation's own requester (``row.principal_id``, already recorded at prepare
-    time). Both denials raise the identical :class:`~n8n_operator.errors.OperationNotFoundError`
-    a nonexistent operation ID would (invariant I14).
+    v2 (``enable_v2=True``): ``decided_by`` may never be the operation's own
+    requester (structurally excluded from the snapshot to begin with, ADR-017
+    section 1 — checked again here regardless, defense in depth), must be a member
+    of the operation's own frozen ``approval_policy_snapshot`` (never a *live*
+    role/scope re-check — the policy in force at ``PENDING_APPROVAL`` entry is what
+    governs, invariant I13, not whatever it drifted to since), and must not have
+    already decided (:class:`~n8n_operator.errors.ApprovalAlreadyDecidedError`).
+    Every denial except the last raises the identical
+    :class:`~n8n_operator.errors.OperationNotFoundError` a nonexistent operation ID
+    would (invariant I14). Reaching quorum (``quorum_count`` approvals, zero
+    rejections — always true here, since a reject already moved the operation to
+    ``REJECTED`` and this call would have failed the state check) applies T06; short
+    of quorum, the vote is recorded and the operation stays ``PENDING_APPROVAL``.
 
     ``client_fingerprint`` is coarse request provenance for the audit trail
     (BUILD_PLAN section 8.1) — set by the web approval channel, left ``None`` by the
     CLI, which has no request to fingerprint.
     """
-    row = _get_operation_row(session, operation_id)
-    decision = _authorize(
-        session,
-        principal_id=decided_by,
-        tool_name=authorization.APPROVE_REJECT_CAPABILITY,
-        workflow_id=row.workflow_id,
-        enable_v2=enable_v2,
-        requester_principal_id=row.principal_id,
-        decider_principal_id=decided_by,
-    )
-    if not decision.allowed:
+    row = _get_operation_row_for_update(session, operation_id)
+    snapshot = _v2_quorum_snapshot(row) if enable_v2 else None
+    if snapshot is None:
+        decision = _authorize(
+            session,
+            principal_id=decided_by,
+            tool_name=authorization.APPROVE_REJECT_CAPABILITY,
+            workflow_id=row.workflow_id,
+            enable_v2=enable_v2,
+            requester_principal_id=row.principal_id,
+            decider_principal_id=decided_by,
+        )
+        if not decision.allowed:
+            raise OperationNotFoundError()
+        entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+        execution_deadline = datetime.now(UTC) + timedelta(
+            seconds=_resolved_ttl(entry.limits.execution_ttl_seconds)
+        )
+        updated = _apply_and_audit(
+            session, row, "T06", actor=decided_by, execution_deadline=execution_deadline
+        )
+        approval = ApprovalRepository(session).get_by_operation_id(operation_id)
+        if approval is not None:
+            ApprovalRepository(session).record_decision(
+                approval_id=approval.id,
+                decision="approved",
+                decided_by=decided_by,
+                client_fingerprint=client_fingerprint,
+            )
+        return _to_domain(updated)
+
+    if decided_by == row.principal_id or decided_by not in snapshot["eligible_approvers"]:
         raise OperationNotFoundError()
+    own_row = _get_or_mint_own_approval_row(session, row, decided_by=decided_by)
+    if own_row.decision is not None:
+        raise ApprovalAlreadyDecidedError()
+    ApprovalRepository(session).record_decision(
+        approval_id=own_row.id,
+        decision="approved",
+        decided_by=decided_by,
+        client_fingerprint=client_fingerprint,
+    )
+    approved_count = sum(
+        1
+        for a in ApprovalRepository(session).list_for_operation(operation_id)
+        if a.decision == "approved"
+    )
+    if approved_count < snapshot["quorum_count"]:
+        return _to_domain(row)
     entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
     execution_deadline = datetime.now(UTC) + timedelta(
         seconds=_resolved_ttl(entry.limits.execution_ttl_seconds)
@@ -1242,14 +1444,6 @@ def approve_operation(
     updated = _apply_and_audit(
         session, row, "T06", actor=decided_by, execution_deadline=execution_deadline
     )
-    approval = ApprovalRepository(session).get_by_operation_id(operation_id)
-    if approval is not None:
-        ApprovalRepository(session).record_decision(
-            approval_id=approval.id,
-            decision="approved",
-            decided_by=decided_by,
-            client_fingerprint=client_fingerprint,
-        )
     return _to_domain(updated)
 
 
@@ -1261,29 +1455,47 @@ def reject_operation(
     client_fingerprint: str | None = None,
     enable_v2: bool = False,
 ) -> Operation:
-    """T07: a human rejects (ADR-010). ``client_fingerprint``/authorization as
-    :func:`approve_operation`."""
-    row = _get_operation_row(session, operation_id)
-    decision = _authorize(
-        session,
-        principal_id=decided_by,
-        tool_name=authorization.APPROVE_REJECT_CAPABILITY,
-        workflow_id=row.workflow_id,
-        enable_v2=enable_v2,
-        requester_principal_id=row.principal_id,
-        decider_principal_id=decided_by,
-    )
-    if not decision.allowed:
-        raise OperationNotFoundError()
-    updated = _apply_and_audit(session, row, "T07", actor=decided_by)
-    approval = ApprovalRepository(session).get_by_operation_id(operation_id)
-    if approval is not None:
-        ApprovalRepository(session).record_decision(
-            approval_id=approval.id,
-            decision="rejected",
-            decided_by=decided_by,
-            client_fingerprint=client_fingerprint,
+    """T07: a human rejects (ADR-010, ADR-017 section 2 — one reject is final,
+    regardless of how many approvals are already in; no tallying, unlike
+    :func:`approve_operation`). ``client_fingerprint``/authorization as that
+    function."""
+    row = _get_operation_row_for_update(session, operation_id)
+    snapshot = _v2_quorum_snapshot(row) if enable_v2 else None
+    if snapshot is None:
+        decision = _authorize(
+            session,
+            principal_id=decided_by,
+            tool_name=authorization.APPROVE_REJECT_CAPABILITY,
+            workflow_id=row.workflow_id,
+            enable_v2=enable_v2,
+            requester_principal_id=row.principal_id,
+            decider_principal_id=decided_by,
         )
+        if not decision.allowed:
+            raise OperationNotFoundError()
+        updated = _apply_and_audit(session, row, "T07", actor=decided_by)
+        approval = ApprovalRepository(session).get_by_operation_id(operation_id)
+        if approval is not None:
+            ApprovalRepository(session).record_decision(
+                approval_id=approval.id,
+                decision="rejected",
+                decided_by=decided_by,
+                client_fingerprint=client_fingerprint,
+            )
+        return _to_domain(updated)
+
+    if decided_by == row.principal_id or decided_by not in snapshot["eligible_approvers"]:
+        raise OperationNotFoundError()
+    own_row = _get_or_mint_own_approval_row(session, row, decided_by=decided_by)
+    if own_row.decision is not None:
+        raise ApprovalAlreadyDecidedError()
+    ApprovalRepository(session).record_decision(
+        approval_id=own_row.id,
+        decision="rejected",
+        decided_by=decided_by,
+        client_fingerprint=client_fingerprint,
+    )
+    updated = _apply_and_audit(session, row, "T07", actor=decided_by)
     return _to_domain(updated)
 
 
@@ -1291,14 +1503,46 @@ def _approval_decision_context(
     session: Session, row: OperationRow, approval_row: ApprovalRow | None
 ) -> ApprovalDecisionContext:
     """Build the shared decision-surface shape from an already-fetched, already-lazily-
-    expired operation row. Not exported — both public entry points below fetch and
-    lazy-expire the row their own way (one by operation ID, one by token), then share
-    this one assembly step, so the two can never render the workflow/drift/deadline
-    fields differently."""
+    expired operation row. Not exported — every public entry point below fetches and
+    lazy-expires the row its own way (by operation ID, by token, or via
+    ``request_approval``/``get_approval_status``), then shares this one assembly
+    step, so none of them can ever render the workflow/drift/deadline/quorum fields
+    differently.
+
+    ``approval_row``, when given, is *this specific caller's own* row (a token's
+    assigned approver, or a CLI caller's own decision) — it drives the legacy scalar
+    fields (``decision``/``decided_by``/``decided_at``/``assigned_to``) only. The
+    quorum-wide fields (``quorum_count``/``decisions``/``outstanding_approvers``) are
+    independent of it, computed straight from ``row``'s own frozen
+    ``approval_policy_snapshot`` and every ``Approval`` row for the operation — v1
+    (no snapshot) leaves them at their defaults (``quorum_count=1``, empty lists).
+    """
     entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
     current_document = _require_active_document(session)
     current_entry = _find_entry(current_document, row.workflow_id)
     current_hash = current_entry.definition_hash if current_entry is not None else None
+
+    snapshot = _v2_quorum_snapshot(row)
+    quorum_count = snapshot["quorum_count"] if snapshot is not None else 1
+    decisions: list[ApprovalDecisionEntry] = []
+    outstanding_approvers: list[str] = []
+    if snapshot is not None:
+        decided_principals: set[str] = set()
+        for a in ApprovalRepository(session).list_for_operation(row.id):
+            if a.decision is not None and a.decided_by is not None and a.decided_at is not None:
+                decisions.append(
+                    ApprovalDecisionEntry(
+                        principal_id=a.decided_by,
+                        decision=a.decision,  # type: ignore[arg-type]
+                        decided_at=a.decided_at,
+                    )
+                )
+                decided_principals.add(a.decided_by)
+        if not any(d.decision == "rejected" for d in decisions):
+            outstanding_approvers = [
+                p for p in snapshot["eligible_approvers"] if p not in decided_principals
+            ]
+
     return ApprovalDecisionContext(
         operation_id=row.id,
         workflow_id=row.workflow_id,
@@ -1314,11 +1558,15 @@ def _approval_decision_context(
         created_at=row.created_at,
         approval_expires_at=row.approval_expires_at,
         execution_deadline=row.execution_deadline,
-        approval_required=approval_row is not None,
+        approval_required=approval_row is not None or snapshot is not None,
         decided=approval_row is not None and approval_row.decision is not None,
         decision=approval_row.decision if approval_row is not None else None,  # type: ignore[arg-type]
         decided_at=approval_row.decided_at if approval_row is not None else None,
         decided_by=approval_row.decided_by if approval_row is not None else None,
+        assigned_to=approval_row.assigned_to if approval_row is not None else None,
+        quorum_count=quorum_count,
+        decisions=decisions,
+        outstanding_approvers=outstanding_approvers,
     )
 
 
@@ -1327,7 +1575,13 @@ def get_approval_decision_context(
 ) -> ApprovalDecisionContext:
     """Everything needed to render or review an approval decision by operation ID
     (ADR-010) — the CLI's ``operations approve``/``reject`` (before confirming) and
-    ``operations approval-status`` both call this."""
+    ``operations approval-status`` both call this.
+
+    v2 quorum mode: the scalar decision fields reflect *this caller's own* row
+    (``ApprovalRepository.get_by_operation_and_decider``) — pending, decided, or
+    absent if they were never routed a slot — never an arbitrary other approver's.
+    v1: unchanged, the operation's one shared row regardless of caller.
+    """
     row = _get_owned_operation_row(
         session,
         operation_id,
@@ -1335,7 +1589,12 @@ def get_approval_decision_context(
         tool_name="get_approval_status",
         enable_v2=enable_v2,
     )
-    approval_row = ApprovalRepository(session).get_by_operation_id(operation_id)
+    if enable_v2 and _v2_quorum_snapshot(row) is not None:
+        approval_row = ApprovalRepository(session).get_by_operation_and_decider(
+            operation_id, principal_id
+        )
+    else:
+        approval_row = ApprovalRepository(session).get_by_operation_id(operation_id)
     return _approval_decision_context(session, row, approval_row)
 
 
@@ -1364,9 +1623,15 @@ def resolve_approval_token(session: Session, *, token: str) -> ApprovalDecisionC
     if row.state != "PENDING_APPROVAL":
         raise ApprovalNotPendingError(details={"current_state": row.state})
 
+    # v1 (approval_row.assigned_to is None): bound to the requester, exactly as
+    # every pre-stage-05 token was. v2 (a per-approver token): bound to the specific
+    # approver it was minted for — a token minted for one eligible approver can never
+    # verify as another's, structurally, not by a runtime "is this the right person"
+    # check (closes the forged-token/cross-approver-reuse edge case).
+    binding_principal_id = approval_row.assigned_to or row.principal_id
     expected_binding = compute_approval_binding(
         operation_id=row.id,
-        principal_id=row.principal_id,
+        principal_id=binding_principal_id,
         argument_fingerprint=row.argument_fingerprint,
         snapshot_id=row.snapshot_id,
         definition_hash=row.definition_hash,
@@ -1379,6 +1644,215 @@ def resolve_approval_token(session: Session, *, token: str) -> ApprovalDecisionC
     )
 
     return _approval_decision_context(session, row, approval_row)
+
+
+def _deliver_with_dedup(
+    session: Session, *, sink: NotificationSink, event: NotificationEvent
+) -> DeliveryReceipt:
+    """The one place ``NotificationSink.deliver`` is ever called (ADR-018 section 2)
+    — computes the idempotency key, and if a ``delivered`` row already exists for
+    it, returns that receipt **without calling the sink again**: this is what makes
+    ``request_approval`` called twice, or the same event handed to this function
+    twice by operator error, produce exactly one received notification. A fresh
+    attempt is recorded ``delivered`` or left ``pending`` (never retried inline —
+    :func:`retry_failed_notifications` is the bounded, swept retry path, the same
+    "lazy expiry now, sweep later" shape ``expire_overdue_operations`` already has
+    for operations, applied here to notifications).
+    """
+    idempotency_key = f"{event.subject_id}:{event.principal_id or ''}:{event.event_type}"
+    repo = NotificationDeliveryRepository(session)
+    existing = repo.get_by_idempotency_key(idempotency_key)
+    if existing is not None and existing.status == "delivered":
+        return DeliveryReceipt(
+            idempotency_key=idempotency_key,
+            delivered=True,
+            attempts=existing.attempts,
+            status="delivered",
+            detail="already delivered (deduplicated)",
+        )
+    delivery = existing or repo.create(
+        idempotency_key=idempotency_key,
+        subject_type=event.subject_type,
+        subject_id=event.subject_id,
+        event_type=event.event_type,
+        principal_id=event.principal_id,
+    )
+    try:
+        receipt = sink.deliver(event)
+        delivered = receipt.delivered
+    except Exception as exc:
+        delivered = False
+        _logger.warning(
+            "notification_delivery_failed",
+            extra={
+                "idempotency_key": idempotency_key,
+                "event_type": event.event_type,
+                "error": str(exc),
+            },
+        )
+    updated = repo.record_attempt(delivery.id, delivered=delivered)
+    return DeliveryReceipt(
+        idempotency_key=idempotency_key,
+        delivered=delivered,
+        attempts=updated.attempts,
+        status=updated.status,  # type: ignore[arg-type]
+    )
+
+
+def retry_failed_notifications(
+    session: Session, *, sink: NotificationSink, max_attempts: int = 5
+) -> int:
+    """Re-attempt every ``pending`` delivery, oldest/least-attempted first
+    (``NotificationDeliveryRepository.list_pending``'s own ordering). A delivery
+    that exhausts ``max_attempts`` becomes ``DELIVERY_FAILED`` — fail-visible, never
+    retried again (ADR-018 section 2) — rather than retried forever. Returns the
+    count of deliveries that succeeded on this sweep. Mirrors
+    ``expire_overdue_operations``'s own "swept reconciliation, safe to run on a
+    timer, idempotent" shape exactly.
+    """
+    repo = NotificationDeliveryRepository(session)
+    delivered_count = 0
+    for delivery in repo.list_pending():
+        event = NotificationEvent(
+            event_type=delivery.event_type,
+            subject_type=delivery.subject_type,
+            subject_id=delivery.subject_id,
+            principal_id=delivery.principal_id,
+            occurred_at=delivery.last_attempted_at or datetime.now(UTC),
+            fetch_reference=f"n8n-operator operations approval-status {delivery.subject_id}",
+        )
+        try:
+            receipt = sink.deliver(event)
+            delivered = receipt.delivered
+        except Exception as exc:
+            delivered = False
+            _logger.warning(
+                "notification_delivery_retry_failed",
+                extra={"delivery_id": delivery.id, "error": str(exc)},
+            )
+        updated = repo.record_attempt(delivery.id, delivered=delivered)
+        if delivered:
+            delivered_count += 1
+        elif updated.attempts >= max_attempts:
+            repo.mark_failed(delivery.id)
+    return delivered_count
+
+
+def request_approval(
+    session: Session,
+    *,
+    operation_id: str,
+    principal_id: str,
+    sink: NotificationSink,
+    approvers: list[str] | None = None,
+    message: str | None = None,
+    enable_v2: bool = True,
+) -> RequestApprovalResult:
+    """Route a ``PENDING_APPROVAL`` operation's approval to its eligible approvers
+    and (re)send notifications (MCP_TOOLS.md section 5.3, ADR-017/018). **Still
+    cannot grant approval** — the out-of-band decision itself crosses only the CLI
+    or the approval app, exactly as v1's already does (boundary B4).
+
+    For each target principal (``approvers``, validated as a subset of the
+    operation's own snapshot, or the full snapshot when omitted) who has not yet
+    decided: get-or-creates their own ``Approval`` row (reused, not re-minted, on a
+    second call — the same row's token keeps working across a re-send) and delivers
+    one notification, deduplicated by ``(operation_id, principal_id,
+    "approval.requested")`` (:func:`_deliver_with_dedup`). A principal who already
+    decided is silently skipped from ``notified`` — nothing left to route to them.
+
+    ``message`` is advisory only (ADR-007) — shown alongside the notification,
+    never affects policy.
+    """
+    row = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="request_approval", enable_v2=enable_v2
+    )
+    if row.state != "PENDING_APPROVAL":
+        raise InvalidStateTransitionError(
+            details={"current_state": row.state, "requested": "PENDING_APPROVAL"}
+        )
+    snapshot = _v2_quorum_snapshot(row)
+    if snapshot is None:
+        raise InvalidStateTransitionError(
+            details={"reason": "operation has no v2 approval-policy snapshot"}
+        )
+    eligible_approvers: list[str] = snapshot["eligible_approvers"]
+    quorum_count: int = snapshot["quorum_count"]
+
+    if approvers is not None:
+        unknown = sorted(set(approvers) - set(eligible_approvers))
+        if unknown:
+            raise ApproverNotInPolicyError(details={"unknown_approvers": unknown})
+        targets = [p for p in eligible_approvers if p in approvers]
+    else:
+        targets = eligible_approvers
+
+    already_decided = {
+        a.decided_by
+        for a in ApprovalRepository(session).list_for_operation(operation_id)
+        if a.decision is not None
+    }
+    notified: list[str] = []
+    for target in targets:
+        if target in already_decided:
+            continue
+        _get_or_mint_own_approval_row(session, row, decided_by=target)
+        event = NotificationEvent(
+            event_type="approval.requested",
+            subject_type="operation",
+            subject_id=operation_id,
+            principal_id=target,
+            occurred_at=datetime.now(UTC),
+            fetch_reference=f"n8n-operator operations approval-status {operation_id}",
+        )
+        _deliver_with_dedup(session, sink=sink, event=event)
+        notified.append(target)
+
+    audit_writer.write(
+        AuditLogRepository(session),
+        actor=principal_id,
+        action="approval.routed",
+        subject_type="operation",
+        subject_id=operation_id,
+        outcome="allowed",
+        detail={"notified": notified, "message": message} if message else {"notified": notified},
+    )
+    return RequestApprovalResult(
+        operation_id=operation_id,
+        quorum_count=quorum_count,
+        approval_policy_snapshot=eligible_approvers,
+        notified=notified,
+        state=row.state,
+    )
+
+
+def get_approval_status(
+    session: Session, *, operation_id: str, principal_id: str, enable_v2: bool = True
+) -> ApprovalStatus:
+    """Which approvals have been collected, which are outstanding, against the
+    required quorum (MCP_TOOLS.md section 5.4, ADR-017)."""
+    row = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="get_approval_status", enable_v2=enable_v2
+    )
+    snapshot = _v2_quorum_snapshot(row)
+    if snapshot is None:
+        return ApprovalStatus(
+            operation_id=operation_id,
+            quorum_count=1,
+            approval_policy_snapshot=[],
+            decisions=[],
+            outstanding=[],
+            ready=row.state == "APPROVED",
+        )
+    context = _approval_decision_context(session, row, approval_row=None)
+    return ApprovalStatus(
+        operation_id=operation_id,
+        quorum_count=context.quorum_count,
+        approval_policy_snapshot=snapshot["eligible_approvers"],
+        decisions=context.decisions,
+        outstanding=context.outstanding_approvers,
+        ready=row.state == "APPROVED",
+    )
 
 
 def cancel_operation(

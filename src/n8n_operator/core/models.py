@@ -31,17 +31,23 @@ from n8n_operator.registry.schema import WorkflowEntry as WorkflowContract
 __all__ = [
     "Approval",
     "ApprovalDecisionContext",
+    "ApprovalDecisionEntry",
+    "ApprovalStatus",
     "AuditEvent",
+    "DeliveryOutcome",
+    "DeliveryReceipt",
     "DispatchOutcome",
     "Environment",
     "EnvironmentSummary",
     "ExecutionResult",
     "HealthCheckResult",
+    "NotificationEvent",
     "Operation",
     "OperationEvent",
     "PreflightCheck",
     "PreflightResult",
     "Principal",
+    "RequestApprovalResult",
     "WorkflowContract",
 ]
 
@@ -155,6 +161,18 @@ class Approval(BaseModel):
     client_fingerprint: str | None
 
 
+class ApprovalDecisionEntry(BaseModel):
+    """One eligible approver's decision (or lack of one) — stage 05, ADR-017. The
+    per-principal element both ``ApprovalDecisionContext.decisions`` and
+    ``ApprovalStatus.decisions`` are built from."""
+
+    model_config = ConfigDict(frozen=True)
+
+    principal_id: str
+    decision: Literal["approved", "rejected"]
+    decided_at: datetime
+
+
 class ApprovalDecisionContext(BaseModel):
     """Everything a human needs to make an approve/reject decision, or to check one
     already made — the one shape both approval channels render from (ADR-010: "the CLI
@@ -170,6 +188,15 @@ class ApprovalDecisionContext(BaseModel):
     frozen hash against the *current* active snapshot's hash for the same workflow ID;
     ``current_definition_hash`` is ``None`` when the workflow is no longer registered
     or enabled at all, which is itself reported as drift.
+
+    ``decision``/``decided_by``/``decided_at``/``decided`` (v1, unchanged) reflect the
+    operation's one shared decision — or, in v2 quorum mode, the specific decider's
+    own row when this context was resolved via *their* token
+    (``resolve_approval_token``) or their own CLI call. ``quorum_count``/``decisions``/
+    ``outstanding_approvers`` (v2 only, ``quorum_count`` defaults to 1) are the
+    operation-wide tally: every decision cast so far, and who in the snapshot has not
+    yet decided. ``assigned_to`` is which principal a *pending* per-approver token
+    decides as (``None`` for a v1 shared token).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -193,6 +220,35 @@ class ApprovalDecisionContext(BaseModel):
     decision: Literal["approved", "rejected"] | None
     decided_at: datetime | None
     decided_by: str | None
+    assigned_to: str | None = None
+    quorum_count: int = 1
+    decisions: list[ApprovalDecisionEntry] = []
+    outstanding_approvers: list[str] = []
+
+
+class RequestApprovalResult(BaseModel):
+    """``request_approval``'s result (MCP_TOOLS.md section 5.3, stage 05)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation_id: str
+    quorum_count: int
+    approval_policy_snapshot: list[str]
+    notified: list[str]
+    state: str
+
+
+class ApprovalStatus(BaseModel):
+    """``get_approval_status``'s result (MCP_TOOLS.md section 5.4, stage 05)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation_id: str
+    quorum_count: int
+    approval_policy_snapshot: list[str]
+    decisions: list[ApprovalDecisionEntry]
+    outstanding: list[str]
+    ready: bool
 
 
 class ExecutionResult(BaseModel):
@@ -293,3 +349,46 @@ class DispatchOutcome(BaseModel):
     result: Any | None
     execution_id: str | None
     correlation_available: bool
+
+
+class NotificationEvent(BaseModel):
+    """One event to deliver via ``core.service.NotificationSink`` — approval routing
+    and (stage 08) alert hooks alike (ADR-018). Carries only what section 4 permits:
+    never operation arguments, a workflow's title/description, or an execution
+    result — ``fetch_reference`` is a pointer (a CLI command, in v2) to the real
+    detail through an *authenticated* channel, not the detail itself."""
+
+    model_config = ConfigDict(frozen=True)
+
+    event_type: str
+    subject_type: str
+    subject_id: str
+    principal_id: str | None
+    occurred_at: datetime
+    fetch_reference: str
+
+
+class DeliveryOutcome(BaseModel):
+    """The result of exactly *one* ``NotificationSink.deliver`` attempt — all a sink
+    itself can possibly know, since dedup/attempt-count/status bookkeeping is
+    ``core.service._deliver_with_dedup``'s own concern, computed *after* calling the
+    sink, never something the sink is asked to track or report back."""
+
+    model_config = ConfigDict(frozen=True)
+
+    delivered: bool
+    detail: str | None = None
+
+
+class DeliveryReceipt(BaseModel):
+    """The result of one ``core.service._deliver_with_dedup`` call — either a real
+    delivery attempt (wrapping the sink's own :class:`DeliveryOutcome`) or a dedup
+    lookup that never called the sink at all (ADR-018 section 2)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    idempotency_key: str
+    delivered: bool
+    attempts: int
+    status: Literal["delivered", "pending", "failed"]
+    detail: str | None = None

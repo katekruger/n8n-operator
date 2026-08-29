@@ -21,7 +21,13 @@ from __future__ import annotations
 import typer
 
 from n8n_operator.approval.app import run_approval_app
-from n8n_operator.config import Settings, load_settings, resolve_approval_bind, resolve_database_url
+from n8n_operator.config import (
+    Settings,
+    load_settings,
+    resolve_approval_bind,
+    resolve_database_url,
+    resolve_v2_identity_flags,
+)
 from n8n_operator.logging_setup import configure_logging, register_secret
 from n8n_operator.mcp.transports import serve_http, serve_stdio
 from n8n_operator.storage.session import create_engine_for_url, create_session_factory
@@ -75,6 +81,7 @@ def approval() -> None:
     (boundary B10)."""
     database_url = resolve_database_url()
     approval_bind = resolve_approval_bind()
+    enable_v2, _ = resolve_v2_identity_flags()
     engine = create_engine_for_url(database_url)
     session_factory = create_session_factory(engine)
-    run_approval_app(approval_bind, session_factory)
+    run_approval_app(approval_bind, session_factory, enable_v2=enable_v2)

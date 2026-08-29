@@ -318,7 +318,13 @@ n8n-operator/
 │       │           ├── 0001_initial.py    # AC-24: empty DB upgrades to head
 │       │           ├── 0002_approval_binding_hash.py  # phase 6, ADR-010
 │       │           ├── 0003_v2_foundation_schema.py   # v2 data model (stage 01)
-│       │           └── 0004_service_principal_credential_ref.py  # stage 02
+│       │           ├── 0004_service_principal_credential_ref.py  # stage 02
+│       │           └── 0005_approval_assigned_to.py  # stage 05
+│       ├── notifications/          # NotificationSink implementations (ADR-018; stage 05)
+│       │   ├── __init__.py
+│       │   ├── base.py             # local NotificationEventLike/DeliveryOutcome shapes
+│       │   ├── local.py            # LocalNotificationSink — structured log line
+│       │   └── webhook.py          # WebhookNotificationSink — authenticated HTTPS POST
 │       ├── audit/                  # append-only, hash-chained
 │       │   ├── __init__.py
 │       │   ├── chain.py            # chain construction + verification
@@ -346,7 +352,8 @@ n8n-operator/
 │               ├── health.py       # get_instance_health, from the command line
 │               ├── db.py           # init, migrate, status, migrate-to-postgres
 │               ├── identity.py     # orgs, memberships, service principals (stage 02)
-│               └── environment.py  # environments, overlays (stage 04)
+│               ├── environment.py  # environments, overlays (stage 04)
+│               └── notifications.py  # retry-failed (stage 05)
 └── tests/
     ├── conftest.py
     ├── fixtures/
@@ -596,6 +603,7 @@ a bad registry never degrades into a partially-live allowlist.
 | R12 | `trigger.correlation` is one of `none` / `response_envelope`, and `response_envelope` is only valid for `trigger.type: webhook`. |
 | R13 | *(v2)* An environment overlay ([ADR-016](adr/ADR-016-environment-registry-overlays.md)) may only set `n8n_workflow_id`, `definition_hash`, `trigger.path`, `trigger.secret_ref`, `approval`, or `limits`. An overlay setting any other field — `input_schema`, `side_effects`, `risk`, `title`, `description`, or `tags` — fails to load. |
 | R14 | *(v2)* An overlay's `approval`/`limits` may only strengthen relative to the base entry (raise `approval` toward `required`, tighten a limit), never weaken it. A `(workflow_id, environment_id)` pair has at most one overlay, enforced by a database unique constraint, not an application check. |
+| R15 | *(v2)* `limits.quorum_count` greater than 1 requires `approval: required` — a workflow that never reaches `PENDING_APPROVAL` has nothing for a quorum count to govern (stage 05, [ADR-017](adr/ADR-017-team-approval-quorum-semantics.md)). |
 
 ### 6.7 Snapshots
 
