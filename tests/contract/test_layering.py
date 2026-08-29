@@ -99,6 +99,58 @@ def test_capability_packages_do_not_import_core_or_each_other(package_name: str)
         assert not violations, f"{path.relative_to(SRC)} imports {violations}"
 
 
+_ROLE_NAMES = frozenset({"viewer", "operator", "approver", "admin"})
+
+# The one documented exception (Stage 03): `VALID_ROLES` is grant-time *input*
+# validation (is this a legal role name to write into `organization_memberships`?),
+# never an authorization *decision* — it never appears on either side of an allow/deny
+# branch. Every other adapter file must route role-capability logic through
+# `core.authorization`/`core.service`, never reconstruct the role vocabulary itself.
+_ROLE_SET_EXEMPT = {SRC / "cli" / "commands" / "identity.py"}
+
+
+def _contains_a_reconstructed_role_set(path: Path) -> bool:
+    """Whether ``path`` defines a collection literal (list/set/tuple) containing two or
+    more of the four exact role-name strings together — the signature of redefining
+    ADR-015's role vocabulary locally, rather than importing it from
+    ``core.authorization``. A single membership check against one role name (e.g. "is
+    this a broad, confirmation-worthy grant?") is a UX nudge, not a policy
+    reimplementation, and is deliberately not what this flags."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+            continue
+        literal_role_names = {
+            elt.value
+            for elt in node.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        } & _ROLE_NAMES
+        if len(literal_role_names) >= 2:
+            return True
+    return False
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    "path",
+    [p for adapter in ("mcp", "cli", "approval") for p in sorted((SRC / adapter).rglob("*.py"))],
+    ids=lambda p: str(p.relative_to(SRC)),
+)
+def test_no_adapter_reconstructs_the_role_vocabulary_itself(path: Path) -> None:
+    """Stage 03's completion gate: "no adapter may contain ad hoc role logic". Every
+    adapter that needs a role-capability decision calls
+    ``core.authorization.evaluate``/``core.service``'s gated functions, which own
+    ``ROLE_CAPABILITIES`` exclusively — an adapter redefining the four-role set locally
+    would be exactly the "reproducing role checks" the policy boundary exists to
+    prevent, even if it happened to agree with the real matrix today."""
+    if path in _ROLE_SET_EXEMPT:
+        return
+    assert not _contains_a_reconstructed_role_set(path), (
+        f"{path.relative_to(SRC)} defines a local collection of role names — "
+        f"role-capability logic belongs in core.authorization/core.service only"
+    )
+
+
 @pytest.mark.contract
 def test_adapters_do_not_import_each_other() -> None:
     """``mcp/``, ``cli/``, and ``approval/`` all sit at the same layer over ``core`` —

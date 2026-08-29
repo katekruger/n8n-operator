@@ -33,10 +33,17 @@ __all__ = [
     "WhoAmI",
     "build_whoami",
     "ensure_dev_principal",
+    "resolve_cli_principal_id",
     "resolve_user_principal",
 ]
 
 DEV_PRINCIPAL_DISPLAY_NAME = "local development (identity_mode=dev — never for production)"
+
+# A fixed, well-known ID (not a random ULID) so `ensure_dev_principal` can check for
+# this organization's existence with a plain get-by-id — no name-based lookup needed,
+# and idempotent by construction the same way `ensure_dev_principal` itself already is.
+DEV_ORGANIZATION_ID = "org_local_development"
+DEV_ORGANIZATION_NAME = "Local development"
 
 
 @dataclass(frozen=True)
@@ -101,17 +108,42 @@ def ensure_dev_principal(session: Session, *, principal_id: str) -> Principal:
     stdio to also cover a non-OIDC local HTTP deployment — both are "not real identity,
     kept easy for local development" in the same way).
 
+    Also idempotently ensures this principal holds a real, ordinary ``admin`` membership
+    in one canonical "Local development" organization (Stage 03) — under real RBAC
+    enforcement, a bare principal with zero memberships authorizes for nothing, which
+    would silently defeat "local dev stays easy" the moment authorization is enforced.
+    This is a real grant through the real grant mechanism (``organization_memberships``,
+    visible via ``whoami``, revocable via ``identity remove-membership`` like any other),
+    not a bypass — the dev principal is simply, deliberately, always an admin of its own
+    always-existing development organization.
+
     Idempotent — safe to call on every server startup, not just once at ``db init``:
     an operator flipping ``enable_v2``/``identity_mode`` on an existing database should
     not have to remember a separate seeding step first.
     """
     principals = PrincipalRepository(session)
     principal = principals.get(principal_id)
-    if principal is not None:
-        return principal
-    return principals.create(
-        id=principal_id, kind="service", display_name=DEV_PRINCIPAL_DISPLAY_NAME
-    )
+    if principal is None:
+        principal = principals.create(
+            id=principal_id, kind="service", display_name=DEV_PRINCIPAL_DISPLAY_NAME
+        )
+
+    organizations = OrganizationRepository(session)
+    organization = organizations.get(DEV_ORGANIZATION_ID)
+    if organization is None:
+        organization = organizations.create(id=DEV_ORGANIZATION_ID, name=DEV_ORGANIZATION_NAME)
+
+    memberships = OrganizationMembershipRepository(session)
+    if memberships.get_active(principal_id=principal.id, organization_id=organization.id) is None:
+        memberships.create(
+            principal_id=principal.id,
+            organization_id=organization.id,
+            roles=["admin"],
+            workflow_scope="*",
+            environment_scope=["*"],
+        )
+
+    return principal
 
 
 def build_whoami(session: Session, principal: Principal) -> WhoAmI:
@@ -146,3 +178,33 @@ def build_whoami(session: Session, principal: Principal) -> WhoAmI:
         display_name=principal.display_name,
         organizations=organizations,
     )
+
+
+def resolve_cli_principal_id(session: Session, *, enable_v2: bool, dev_principal_id: str) -> str:
+    """The CLI's own identity resolution (Stage 03) — every command before this stage
+    either hardcoded the fixed v1 identity ``"local"`` (``cli/commands/operations.py``)
+    or resolved no principal at all (``cli/commands/audit.py``).
+
+    Takes ``enable_v2``/``dev_principal_id`` as plain values, not a full ``Settings``
+    (``config.resolve_v2_identity_flags()`` resolves them without requiring
+    ``n8n_base_url``/``n8n_api_key`` — both otherwise-required ``Settings`` fields — to
+    be present, the same "schema/identity management is orthogonal to n8n
+    configuration" reasoning ``config.resolve_database_url`` already established) —
+    this module stays independent of ``config.py``, matching every other module here.
+
+    ``enable_v2=False`` (v1, the default): returns ``"local"`` unchanged — v1's CLI
+    behavior is byte-identical to before this stage, the completion gate's explicit
+    requirement.
+
+    ``enable_v2=True``: the CLI, like stdio, is a local-machine trust boundary with no
+    network listener — it always resolves to the same fixed dev/service principal
+    :func:`ensure_dev_principal` provisions (and grants a real ``admin`` membership,
+    per that function's own docstring), regardless of ``identity_mode``. This mirrors
+    ADR-014 section 5's existing stdio rule exactly rather than inventing a second
+    identity mechanism for a command-line invocation, which has no bearer token to
+    resolve an OIDC identity from in the first place.
+    """
+    if not enable_v2:
+        return "local"
+    principal = ensure_dev_principal(session, principal_id=dev_principal_id)
+    return principal.id

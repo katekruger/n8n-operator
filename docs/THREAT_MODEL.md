@@ -98,6 +98,11 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 | T-46 | Elevation | A valid token for principal A is used to see or influence principal B's organizations, roles, or environments — "token substitution across organizations". | Critical | `whoami` (and every future org-scoped v2 read) is built entirely from a database query keyed on the already-resolved `principal_id`; no tool argument or JWT claim is ever consulted to decide which organization a caller sees (B15, ADR-013). Two distinct principals, each a member of a different single-organization, each see only their own. `tests/integration/test_mcp_whoami_tool.py::test_whoami_reflects_only_database_membership_never_a_claim_the_caller_asserts`. | mitigated |
 | T-47 | Information disclosure | A service principal's resolved `credential_ref` value (or another identity-adjacent secret) leaks into a structured log line or a CLI's own output. | High | Never printed by any CLI command (`create-service-principal`, `rotate-service-credential`); registered with the existing log-scrubbing mechanism (`logging_setup.register_secret`) the instant it is resolved, in both the CLI validation path and the server's per-request service-credential match path — not only on a successful match, so scrubbing does not depend on which request happened to use it (extends B7/T-23 to a value that is resolved live, per request, rather than once at startup). `tests/integration/test_cli_identity.py::test_create_service_principal_registers_the_resolved_secret_for_log_scrubbing`, `tests/integration/test_operator_token_verifier.py::test_resolving_a_service_credential_registers_it_for_log_scrubbing`. `whoami`'s own result additionally never carries a provider token or raw claim — `tests/integration/test_mcp_whoami_tool.py::test_whoami_never_leaks_a_provider_token_or_raw_claim`. | mitigated |
 | T-48 | Elevation | `identity_mode=dev`'s fixed, unauthenticated development principal is reachable from a non-loopback (network-exposed) deployment, letting anyone who can reach the port act as a privileged, un-gated identity. | Critical | A `config.py` startup validator (`_validate_v2_identity_mode`) refuses to start with `identity_mode=dev` on a non-loopback HTTP bind; the dev principal's own `display_name` is set to `"local development (identity_mode=dev — never for production)"` so it is unmistakable in any audit trail or `whoami` result even in the loopback case it's meant for. stdio always uses this fixed principal regardless of configured mode (ADR-014 section 5) — but stdio has no network listener to expose in the first place, so that case carries no equivalent risk. | mitigated |
+| T-49 | Elevation | A caller whose role lacks a tool's capability (e.g. a `viewer` calling `prepare_operation`) reaches it anyway — a role-capability bypass. | Critical | One evaluator (`core.authorization.evaluate`), called from every gated `core.service` function; the caller-facing denial is `WORKFLOW_NOT_FOUND`/`OPERATION_NOT_FOUND`, identical to absence (invariant I14). Exhaustively property-tested against all 20 v1+v2 tool names × 4 roles (AC-38). `tests/property/test_rbac_matrix.py`. | mitigated |
+| T-50 | Elevation | A principal's memberships in two organizations are combined into a broader implicit grant than either alone authorizes — e.g. `operator` scope from org A applied to a workflow only org B's (narrower) grant covers. | Critical | Each membership's role ∧ workflow-scope ∧ environment-scope is evaluated as a single, independent, self-contained unit (`core.authorization.evaluate`'s per-membership loop) — a call is authorized only if *one* membership satisfies it entirely on its own terms, never by combining fields from two (ADR-015's own rejected alternative). `tests/integration/test_authorization_service.py::test_a_principal_in_two_organizations_is_authorized_by_either_grant_independently`; monotonicity proven generally by `tests/property/test_no_enumeration.py`. | mitigated |
+| T-51 | Information disclosure | A caller infers the existence of an out-of-scope operation via a pagination side channel — a page returned short of the requested `limit`, or a cursor that skips past a hidden row, reveals that *something* was filtered out. | Medium | Scope filtering (`workflow_id_like_patterns`, translated from `workflow_scope` glob patterns) is pushed into the SQL query itself, applied *before* `LIMIT`, never after (`storage.repository.OperationRepository.list`) — a page is always the true page, and a cursor never walks past a row a filter would have hidden. `tests/integration/test_authorization_service.py::test_list_operations_scope_filter_applies_before_the_page_limit`. | mitigated |
+| T-52 | Elevation | A principal holding `approver` (or `admin`) decides their own operation — the role-level self-dealing case, distinct from ADR-017's later per-operation `approval_policy_snapshot` exclusion (Stage 05, not yet built). | Critical | `core.authorization.evaluate`'s `requester_principal_id == decider_principal_id` check, using `operations.principal_id` (already recorded at prepare time) — denies regardless of role, raising the identical `OperationNotFoundError` a nonexistent operation would. Proven at the `core.service` level and through the real CLI (the CLI's own fixed identity in v2 mode makes this the *only* self-dealing shape currently reachable through it — see section 8 item 5's addendum). `tests/integration/test_authorization_service.py::test_an_approver_may_never_decide_their_own_operation`, `tests/integration/test_cli_operations.py::test_v2_cli_cannot_approve_its_own_operation`. | mitigated |
+| T-53 | Elevation | An adapter (MCP, CLI, or the approval app) reimplements a role check locally instead of calling the shared evaluator, drifting out of sync with the real matrix over time as tools are added. | Medium | A dedicated layering contract test statically scans every adapter file for a reconstructed role-name collection (two or more of the four role strings in one list/set/tuple literal) — the signature of redefining the role vocabulary locally — and fails the build if found, with one documented, narrow exception (`cli/commands/identity.py`'s `VALID_ROLES`, grant-time *input* validation, never a decision). `tests/contract/test_layering.py::test_no_adapter_reconstructs_the_role_vocabulary_itself`. | mitigated |
 
 ### 5.2 TB2 — Human to approval app
 
@@ -191,10 +196,13 @@ with no intent at all, doing the wrong thing confidently.
 | ADR-011 argument limits and namespaces | T-12 |
 | ADR-012 retry recalculation and anchoring | L-04, T-35 |
 | B14 identity through validated bearer token only *(v2, stage 02)* | T-14, T-42, T-45 |
-| B15 organization isolation *(v2, stage 02 — `whoami` only; per-tool enforcement is stage 03/04)* | T-46 |
+| B15 organization isolation *(v2, stage 02 — `whoami`; stage 03 — every v1 tool's `describe_workflow`/`list_workflows`/`prepare_operation`/etc.)* | T-46, T-50 |
 | ADR-014 OIDC trust and session model *(v2, stage 02)* | T-14, T-42, T-43, T-44, T-48 |
 | ADR-013 organization/tenant/principal model *(v2, stage 02)* | T-45, T-46 |
 | ADR-006 secret indirection, extended to service-principal credentials *(v2, stage 02)* | T-47 |
+| `core.authorization.evaluate` — the one RBAC evaluator *(v2, stage 03, ADR-015)* | T-14 (v2 half), T-49, T-50, T-52 |
+| SQL-level scope filtering before pagination *(v2, stage 03)* | T-51 |
+| Layering contract: no adapter role logic *(v2, stage 03)* | T-53 |
 
 Every boundary control traces to at least one threat, and every Critical or High threat
 traces to at least one control or an explicit acceptance in section 8.
@@ -233,6 +241,27 @@ Stated plainly so no one mistakes silence for coverage:
    remaining lifetime. No separate test exists for "deleted account" as such, because
    there is no distinguishable signal for a test to assert on — the code path is
    identical to, and already covered by, T-44's disabled-principal tests.
+   **Stage 03 update:** the gap this item named — "identity is resolved and recorded,
+   but does not yet gate anything" — is closed. Every v1 tool now calls
+   `core.authorization.evaluate` (T-49 through T-53), workflow-scope and role-capability
+   are real and enforced, and `list_operations` filters by scope before pagination.
+   What remains open, precisely: (a) **environment-scope enforcement against a real v1
+   tool call** — the evaluator's environment-scope conjunct is fully implemented and
+   property-tested, but no v1 tool carries an `environment` argument yet to check it
+   against, so a call today is honored only when a grant's `environment_scope` is `*`
+   (`core/authorization.py`'s own documented decision) — Stage 04's job to complete
+   once the argument exists; (b) **granting a role to an existing service principal**
+   — `identity add-membership` currently JIT-resolves a `user` principal via
+   `--issuer`/`--subject` only, with no CLI path to grant a membership to a
+   `service`-kind principal by ID (found while writing
+   [LEAST_PRIVILEGE.md](LEAST_PRIVILEGE.md)'s worked examples, tracked there rather
+   than worked around); (c) **"insufficient role" is untestable through the CLI's own
+   identity** — the CLI always resolves to the fixed dev/service principal in v2 mode
+   (ADR-014 section 5, extended stage 03), which `ensure_dev_principal` always grants
+   `admin`, so every CLI-issued command is, by this stage's design, maximally
+   privileged; the negative case is proven at the `core.service` level instead
+   (`tests/integration/test_authorization_service.py`), a deliberate consequence of
+   keeping local dev easy (stage 02's own stated goal), not an oversight.
 6. **Approval-fatigue as a systemic risk (T-20).** Mitigated by page design and honest
    risk labeling, but a human who always clicks approve is not a solvable software problem.
 7. **Availability.** Operator is not designed for high availability; an outage means
@@ -271,8 +300,11 @@ Stated plainly so no one mistakes silence for coverage:
 | RR-8 | Early canonicalization is deliberately over-inclusive, so cosmetic n8n edits produce false `DEFINITION_DRIFT` until the harness justifies exclusions. Friction on a security control invites routing around it (T-39, [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)). | Low–Medium | Engineering | Phase-4 harness narrows the allowlist on evidence; v2 `diff_workflow_definition` makes re-review a diff. |
 | RR-9 | In a stdio-only deployment with no sweeper and no scheduled `operations expire`, `EXPIRED` audit events are written at next touch rather than at the deadline, and may never be written for an operation nobody touches again. Audit-timeline fidelity only; no expired operation is executable (invariant I9). | Low | Operator | Run `operations expire` on a timer, or the approval app. |
 | RR-10 | An operation crash-stranded in `EXECUTING` (process killed between the handle burn and dispatch completing) has no automatic or CLI-driven resolution in v1 — it stays `EXECUTING` indefinitely, correctly inert but not resolved, and (since `max_concurrent` counts `EXECUTING` operations) permanently occupies one concurrency slot for that workflow until an operator manually confirms the outcome against n8n and updates the row directly (T-37). Narrower in practice than it sounds: the window is one process between two adjacent statements, not an extended period. | Low | Operator | v2: a supported reconciliation command instead of a direct database edit. |
-| RR-11 | Stage 02 resolves and records real identity (`(iss, sub)` → `principal_id`) but enforces no authorization on it yet — every v1 tool remains reachable by any authenticated v2 caller regardless of organization membership or role, since no tool takes an `environment`/organization argument to check against (T-14 residual half; see section 8 item 5). | Medium | Engineering | Stage 03: role-capability matrix evaluator and workflow×environment×role intersection enforcement (ADR-015). Closes in the very next stage, not deferred indefinitely. |
+| RR-11 | **Closed, stage 03.** Was: Stage 02 resolved and recorded real identity but enforced no authorization on it. Now: `core.authorization.evaluate` gates every v1 tool + the CLI's approve/reject/audit paths (T-49–T-53). Superseded by RR-13 for the one dimension still genuinely open (environment-scope). | — | — | Closed by this stage; see RR-13 for what remains. |
 | RR-12 | A deleted identity-provider account has no distinguishing signal Operator can detect on its own; a token issued before deletion remains valid until its natural expiry unless an admin proactively disables the mapped principal. | Low | Operator | No code change planned — this is the same live-recheck mechanism T-44 already provides; the residual risk is the admin's IdP-deletion → `identity disable-principal` operational habit, not a software gap. |
+| RR-13 | Environment-scope authorization is fully implemented and property-tested (AC-39) but not reachable from any real v1 tool call, since none carries an `environment` argument yet — a membership narrowed to specific environment IDs is therefore honored only in the trivial `["*"]` case today (section 8 item 5(a)). | Medium | Engineering | Stage 04: the `environment` tool argument, default-environment resolution, `ENVIRONMENT_REQUIRED`/`ENVIRONMENT_ARCHIVED` (ADR-016) — the evaluator itself needs no further change, only a real argument to check it against. |
+| RR-14 | No CLI path grants an organization membership to an existing `service`-kind principal by ID — `identity add-membership` JIT-resolves a `user` principal via `--issuer`/`--subject` only (section 8 item 5(b)). A service principal (a scheduled job, a webhook relay) therefore cannot be scoped narrower than whatever ad hoc workaround an operator improvises today. | Low–Medium | Engineering | No stage currently owns this explicitly; propose it as a small addition (a `--service-principal <id>` alternative to `--issuer`/`--subject` on `add-membership`) whenever service-principal authorization scoping is next touched. |
+| RR-15 | "Insufficient role" cannot be exercised through the CLI's own identity, since the CLI always resolves to the fixed dev/service principal in v2 mode, which is always granted `admin` (section 8 item 5(c)). Proven instead at the `core.service` level. | Low | Operator/Engineering | Accepted as a deliberate consequence of "local dev stays easy" (stage 02's own goal); revisit only if a real deployment needs the CLI itself to run as a non-admin identity, which would need a different CLI identity mechanism than "always the fixed dev principal." |
 
 ---
 
@@ -290,11 +322,15 @@ Re-run this analysis when any of the following changes:
   reduction in drift-detection coverage and must be reviewed as one);
 - an approval channel is added, or the rule deciding caller locality changes;
 - an `AuditAnchor` implementation is added.
-- a v1 or v2 tool gains an `environment`/organization-scoping argument (stage 03/04 —
-  this is the moment RR-11 needs re-review, since authorization enforcement then exists
-  to fail);
+- a v1 or v2 tool gains an `environment`/organization-scoping argument (stage 04 —
+  this is the moment RR-13 needs re-review, since environment-scope enforcement then
+  has something real to enforce against);
 - the OIDC algorithm allowlist, clock-skew tolerance, or JWKS re-fetch/rate-limit
   policy changes (ADR-014);
+- the ADR-015 role-capability matrix changes, a role or a tool is added or removed, or
+  the workflow-scope/environment-scope combination rule changes (stage 03 —
+  `tests/property/test_rbac_matrix.py` should already fail first, but this document's
+  own T-49–T-53 entries need re-checking against the new matrix by hand too);
 - a new identity provider becomes a supported reference configuration
   ([OIDC_SETUP.md](OIDC_SETUP.md)).
 

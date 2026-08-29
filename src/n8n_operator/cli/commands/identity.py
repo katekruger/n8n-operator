@@ -33,8 +33,11 @@ import typer
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.config import resolve_database_url, resolve_secret_reference
+from n8n_operator.core import service
+from n8n_operator.core.authorization import ROLE_CAPABILITIES, evaluate, match_workflow_scope
 from n8n_operator.core.identity import resolve_user_principal
 from n8n_operator.logging_setup import register_secret
+from n8n_operator.registry.schema import RegistryDocument
 from n8n_operator.storage.repository import (
     EnvironmentRepository,
     OrganizationMembershipRepository,
@@ -52,6 +55,12 @@ app = typer.Typer(
 )
 
 VALID_ROLES = frozenset({"viewer", "operator", "approver", "admin"})
+
+# All 20 v1+v2 tool names plus the approve/reject capability — the full set
+# `preview-permissions` reports over (ADR-015's matrix); a tool that has no live MCP
+# handler yet (v2 tools other than `whoami`, stage 04 onward) is still real, checkable
+# data — the matrix doesn't require a handler to exist to be evaluated.
+_ALL_CAPABILITIES = sorted({tool for tools in ROLE_CAPABILITIES.values() for tool in tools})
 
 
 @contextmanager
@@ -77,6 +86,76 @@ def _parse_roles(raw: str) -> list[str]:
         )
         raise typer.Exit(code=1)
     return roles
+
+
+def _parse_environment_scope(raw: str) -> list[str]:
+    if raw.strip() == "*":
+        return ["*"]
+    return [e.strip() for e in raw.split(",") if e.strip()]
+
+
+def _validate_workflow_scope_or_exit(session: Session, workflow_scope: str) -> None:
+    """ADR-015's own stated requirement (section "Negative" consequences): a
+    ``workflow_scope`` pattern other than ``*`` must match at least one real registry
+    entry at grant time, or the grant fails loudly here — never silently accepted as an
+    unmatchable typo that looks like access but grants none."""
+    if workflow_scope == "*":
+        return
+    snapshot = service.get_active_snapshot(session)
+    entries = (
+        RegistryDocument.model_validate(snapshot.document).workflows if snapshot is not None else []
+    )
+    if not any(match_workflow_scope(workflow_scope, entry.id) for entry in entries):
+        typer.secho(
+            f"workflow_scope {workflow_scope!r} matches no workflow in the active "
+            "registry. Use an exact or glob pattern that matches at least one "
+            "registered workflow ID, or '*' for all.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _validate_environment_scope_or_exit(
+    session: Session, *, organization_id: str, environment_scope: list[str]
+) -> None:
+    """Same discipline as :func:`_validate_workflow_scope_or_exit`, applied to named
+    environment IDs: each one must be a real ``environments`` row in this organization,
+    or the grant fails loudly — an environment CLI/API to create these doesn't exist
+    until stage 04, so a fresh organization has none yet and can only be granted ``*``
+    here, which is correct: there is nothing narrower to grant yet."""
+    if environment_scope == ["*"]:
+        return
+    real_ids = {
+        env.id
+        for env in EnvironmentRepository(session).list_for_organization(
+            organization_id, include_archived=True
+        )
+    }
+    unmatched = [e for e in environment_scope if e not in real_ids]
+    if unmatched:
+        typer.secho(
+            f"environment_scope names environment ID(s) that do not exist in this "
+            f"organization: {unmatched}. Use real environment IDs, or '*' for all.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _confirm_broad_grant_or_exit(*, roles: list[str], yes: bool) -> None:
+    """ "Confirmation for broad grants" — ``admin`` is the one role that can do
+    everything this stage of RBAC can express (create/execute/approve/retry, plus
+    every read), so it is the one that warrants a pause; ``viewer``/``operator``/
+    ``approver`` stay non-interactive by default even at the default unrestricted
+    scope, matching every other grant command's existing ergonomics. ``--yes`` skips
+    the prompt for scripted/CI use."""
+    if "admin" not in roles or yes:
+        return
+    typer.secho("This grants the admin role — full access to everything.", fg=typer.colors.YELLOW)
+    if not typer.confirm("Grant it anyway?"):
+        typer.echo("Not granted.")
+        raise typer.Exit(code=1)
 
 
 def _validate_credential_ref_or_exit(credential_ref: str) -> None:
@@ -166,15 +245,30 @@ def add_membership(
     ),
     display_name: str | None = typer.Option(None, "--display-name"),
     workflow_scope: str = typer.Option("*", "--workflow-scope"),
+    environment_scope: str = typer.Option(
+        "*", "--environment-scope", help="Comma-separated environment IDs, or '*' for all."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation for a broad grant."),
 ) -> None:
     """Grant a role set to a principal within one organization — provisioning the
-    principal now (JIT) if this is the first time Operator has seen this identity."""
+    principal now (JIT) if this is the first time Operator has seen this identity.
+
+    ``workflow_scope`` (other than ``*``) must match at least one workflow ID in the
+    active registry; ``environment_scope`` (other than ``*``) must name only real
+    ``environments`` rows in this organization — both fail loudly rather than silently
+    accepting an unmatchable pattern (ADR-015)."""
     parsed_roles = _parse_roles(roles)
+    parsed_environment_scope = _parse_environment_scope(environment_scope)
+    _confirm_broad_grant_or_exit(roles=parsed_roles, yes=yes)
     with _connected() as factory, session_scope(factory) as session:
         organization = OrganizationRepository(session).get(organization_id)
         if organization is None:
             typer.secho(f"No such organization: {organization_id}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1)
+        _validate_workflow_scope_or_exit(session, workflow_scope)
+        _validate_environment_scope_or_exit(
+            session, organization_id=organization_id, environment_scope=parsed_environment_scope
+        )
         principal = resolve_user_principal(
             session, issuer=issuer, subject=subject, display_name_hint=display_name
         )
@@ -201,6 +295,7 @@ def add_membership(
             organization_id=organization.id,
             roles=parsed_roles,
             workflow_scope=workflow_scope,
+            environment_scope=parsed_environment_scope,
         )
         principal_id = principal.id
     typer.secho(
@@ -265,6 +360,39 @@ def list_memberships(
         return
     for row in rows:
         typer.echo(row)
+
+
+@app.command("preview-permissions")
+def preview_permissions(
+    principal_id: str,
+    workflow_id: str | None = typer.Option(
+        None, "--workflow-id", help="Check against one specific workflow ID."
+    ),
+) -> None:
+    """A safe, read-only preview of what a principal can currently do — every
+    (role, tool) pair in ADR-015's capability matrix, evaluated against their real,
+    active memberships (across every organization they belong to), exactly the same
+    ``core.authorization.evaluate`` call every real tool call goes through. Nothing
+    here changes anything; run it before or after a grant to see its actual effect."""
+    with _connected() as factory, factory() as session:
+        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
+            principal_id
+        )
+    if not memberships:
+        typer.echo(f"{principal_id} has no active memberships anywhere — authorized for nothing.")
+        return
+    allowed = [
+        tool
+        for tool in _ALL_CAPABILITIES
+        if evaluate(memberships=memberships, tool_name=tool, workflow_id=workflow_id).allowed
+    ]
+    denied = [tool for tool in _ALL_CAPABILITIES if tool not in allowed]
+    typer.secho(f"Allowed ({len(allowed)}):", fg=typer.colors.GREEN)
+    for tool in allowed:
+        typer.echo(f"  {tool}")
+    typer.secho(f"Denied ({len(denied)}):", fg=typer.colors.YELLOW)
+    for tool in denied:
+        typer.echo(f"  {tool}")
 
 
 @app.command("disable-principal")

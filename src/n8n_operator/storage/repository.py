@@ -27,7 +27,7 @@ import builtins
 from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, Select, func, select, update
+from sqlalchemy import CursorResult, Select, false, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from n8n_operator.errors import OptimisticLockError
@@ -294,32 +294,61 @@ class OperationRepository:
     def list(
         self,
         *,
-        principal_id: str,
+        principal_id: str | None,
         environment: str | None = None,
         workflow_id: str | None = None,
-        states: list[str] | None = None,
+        workflow_id_like_patterns: builtins.list[str] | None = None,
+        states: builtins.list[str] | None = None,
         since: datetime | None = None,
         limit: int = 20,
         before_id: str | None = None,
     ) -> list[Operation]:
-        """Filtered, most-recent-first history for one principal (MCP_TOOLS.md 2.10).
+        """Filtered, most-recent-first history (MCP_TOOLS.md 2.10).
+
+        ``principal_id=None`` means "any principal" — v2 role-based visibility (ADR-015)
+        is scope-based, not ownership-based, so a caller whose grants cover a workflow
+        can see every principal's operations against it, not only their own;
+        ``core.service.list_operations`` passes ``None`` only when ``enable_v2`` and the
+        caller's own scope has already been resolved into ``workflow_id_like_patterns``.
+        ``workflow_id_like_patterns`` are pre-translated SQL ``LIKE`` patterns (see
+        ``core.authorization.workflow_scope_to_sql_like`` — this module does no glob
+        translation itself, staying storage-only per ADR-001) OR'd together with
+        ``ESCAPE '\\'``; a call with an empty (non-``None``) list matches nothing, by
+        SQL construction, rather than accidentally matching everything.
+
+        Filtering — including the scope filters above — is applied **before** ``LIMIT``,
+        never after: a cursor must never walk past a row a filter would have hidden, or
+        a page could come back short of a caller-visible row that exists beyond the
+        page boundary (the "pagination side channel" Stage 03's completion gate names).
 
         ``before_id`` pages backward through the same ordering: operation IDs are
         ``op_<ULID>``, lexicographically sortable the same way ``created_at`` is, so
         "strictly older than the last row of the previous page" is ``id < before_id``
         without a second sort key or an offset that shifts under concurrent inserts.
 
-        Applies no policy of its own (per the module docstring) — including no lazy
-        expiry, which is a state-machine concern; a caller that needs every returned row
-        current must apply it itself, per row, after this query returns.
+        Applies no other policy of its own (per the module docstring) — including no
+        lazy expiry, which is a state-machine concern; a caller that needs every
+        returned row current must apply it itself, per row, after this query returns.
         """
-        stmt: Select[tuple[Operation]] = select(Operation).where(
-            Operation.principal_id == principal_id
-        )
+        stmt: Select[tuple[Operation]] = select(Operation)
+        if principal_id is not None:
+            stmt = stmt.where(Operation.principal_id == principal_id)
         if environment is not None:
             stmt = stmt.where(Operation.environment == environment)
         if workflow_id is not None:
             stmt = stmt.where(Operation.workflow_id == workflow_id)
+        if workflow_id_like_patterns is not None:
+            if not workflow_id_like_patterns:
+                stmt = stmt.where(false())  # deliberately unsatisfiable
+            else:
+                stmt = stmt.where(
+                    or_(
+                        *(
+                            Operation.workflow_id.like(pattern, escape="\\")
+                            for pattern in workflow_id_like_patterns
+                        )
+                    )
+                )
         if states:
             stmt = stmt.where(Operation.state.in_(states))
         if since is not None:

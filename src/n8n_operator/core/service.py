@@ -21,6 +21,7 @@ Phase 3 adds the operation lifecycle, the state machine, redaction, and the audi
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,7 +31,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.audit import writer as audit_writer
 from n8n_operator.audit.chain import ChainVerificationResult, verify_chain
-from n8n_operator.core import state_machine
+from n8n_operator.core import authorization, state_machine
 from n8n_operator.core.handles import (
     compute_approval_binding,
     hash_approval_token,
@@ -66,6 +67,7 @@ from n8n_operator.errors import (
     HandleAlreadyUsedError,
     HandleInvalidError,
     InstanceUnreachableError,
+    InsufficientRoleError,
     InvalidArgumentsError,
     InvalidStateTransitionError,
     OperationCanceledError,
@@ -98,10 +100,13 @@ from n8n_operator.storage.repository import (
     ExecutionResultRepository,
     OperationEventRepository,
     OperationRepository,
+    OrganizationMembershipRepository,
     RegistrySnapshotRepository,
     WorkflowBindingRepository,
 )
 from n8n_operator.storage.session import session_scope
+
+_logger = logging.getLogger(__name__)
 
 __all__ = [
     "DispatchPort",
@@ -361,16 +366,91 @@ def _get_operation_row(session: Session, operation_id: str) -> OperationRow:
     return _apply_lazy_expiry(session, row)
 
 
+def _authorize(
+    session: Session,
+    *,
+    principal_id: str,
+    tool_name: str,
+    workflow_id: str | None,
+    enable_v2: bool,
+    environment_id: str | None = None,
+    requester_principal_id: str | None = None,
+    decider_principal_id: str | None = None,
+) -> authorization.AuthorizationDecision:
+    """The one authorization checkpoint every gated use case below calls (ADR-015,
+    Stage 03). ``enable_v2=False`` (v1, and v2's default before an operator opts in) is
+    always allowed without a database round trip — v1 behavior is byte-identical to
+    before this stage, the completion gate's explicit requirement, because this
+    function simply never runs its check in that mode. In v2 mode, fetches the
+    caller's active memberships fresh, on every call — never cached, the same
+    "disabled/removed is re-checked live" discipline Stage 02 already established for
+    identity, extended here to role and scope (mid-session revocation, conflicting
+    grants: yesterday's decision is never reused). Logs the outcome for operators
+    (``reason_code`` — internal-only, see ``core/authorization.py``'s module
+    docstring) but returns the decision rather than raising; each call site decides
+    which existing not-found exception a denial becomes, so a denial is indistinguishable
+    from absence by construction (invariant I14) rather than by a shared exception type
+    that could itself become an oracle.
+    """
+    if not enable_v2:
+        return authorization.AuthorizationDecision(allowed=True, reason_code="V1_UNGATED")
+    memberships = OrganizationMembershipRepository(session).list_active_for_principal(principal_id)
+    decision = authorization.evaluate(
+        memberships=memberships,
+        tool_name=tool_name,
+        workflow_id=workflow_id,
+        environment_id=environment_id,
+        requester_principal_id=requester_principal_id,
+        decider_principal_id=decider_principal_id,
+    )
+    _logger.info(
+        "authorization_decision",
+        extra={
+            "principal_id": principal_id,
+            "tool_name": tool_name,
+            "workflow_id": workflow_id,
+            "environment_id": environment_id,
+            "allowed": decision.allowed,
+            "reason_code": decision.reason_code,
+        },
+    )
+    return decision
+
+
 def _get_owned_operation_row(
-    session: Session, operation_id: str, principal_id: str
+    session: Session,
+    operation_id: str,
+    principal_id: str,
+    *,
+    tool_name: str = "get_operation",
+    enable_v2: bool = False,
 ) -> OperationRow:
-    """As :func:`_get_operation_row`, but also enforces that ``principal_id`` is the
-    operation's own principal. A mismatch raises the identical
+    """As :func:`_get_operation_row`, but also enforces that the caller may see this
+    operation: either it is their own (v1's rule, unchanged), or — only in v2 mode —
+    the evaluator authorizes ``tool_name`` for the operation's own ``workflow_id``
+    (ADR-015's role-based visibility: an approver/admin legitimately reaches operations
+    they did not personally create). A denial, either way, raises the identical
     :class:`~n8n_operator.errors.OperationNotFoundError` a nonexistent ID would — the
     same "no signal distinguishing X from Y" defense AC-01 states for the registry
-    (a caller probing another principal's operation IDs learns nothing)."""
+    (a caller probing another principal's operation IDs learns nothing), extended
+    across the organization boundary (invariant I14)."""
     row = _get_operation_row(session, operation_id)
-    if row.principal_id != principal_id:
+    if row.principal_id == principal_id:
+        return row
+    if not enable_v2:
+        # v1's rule, unchanged: ownership is the only check, and it already failed
+        # above. `_authorize` must not be consulted here — it always allows when
+        # `enable_v2=False` (v1 stays byte-identical to before this stage for every
+        # *gated* check), which would silently defeat the ownership check itself.
+        raise OperationNotFoundError()
+    decision = _authorize(
+        session,
+        principal_id=principal_id,
+        tool_name=tool_name,
+        workflow_id=row.workflow_id,
+        enable_v2=enable_v2,
+    )
+    if not decision.allowed:
         raise OperationNotFoundError()
     return row
 
@@ -577,6 +657,8 @@ def list_workflows(
     tags: Sequence[str] | None = None,
     risk: str | None = None,
     side_effects: str | None = None,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
 ) -> list[WorkflowSummary]:
     """Every enabled workflow in the active snapshot (MCP_TOOLS.md section 2.1).
 
@@ -585,6 +667,11 @@ def list_workflows(
     Filtering, not authorization: an unmatched filter narrows what is *listed*, the same
     way it would for a caller who scrolled through the unfiltered list by hand — it is
     not a second gate alongside ``enabled`` (ADR-002 default-deny already is that gate).
+
+    v2 (``enable_v2=True``): workflows outside the caller's role/workflow-scope are
+    excluded the same way (MCP_TOOLS.md section 5.9) — a caller's active memberships
+    are fetched once and each entry checked against them, rather than one database
+    round trip per workflow.
     """
     document = _require_active_document(session)
     summaries = [WorkflowSummary.from_entry(entry) for entry in document.workflows if entry.enabled]
@@ -595,10 +682,24 @@ def list_workflows(
         summaries = [s for s in summaries if s.risk == risk]
     if side_effects is not None:
         summaries = [s for s in summaries if s.side_effects == side_effects]
+    if enable_v2:
+        assert principal_id is not None  # every v2 caller is authenticated
+        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
+            principal_id
+        )
+        summaries = [
+            s
+            for s in summaries
+            if authorization.evaluate(
+                memberships=memberships, tool_name="list_workflows", workflow_id=s.workflow_id
+            ).allowed
+        ]
     return summaries
 
 
-def describe_workflow(session: Session, *, workflow_id: str) -> WorkflowDetail:
+def describe_workflow(
+    session: Session, *, workflow_id: str, principal_id: str | None = None, enable_v2: bool = False
+) -> WorkflowDetail:
     """One workflow's full contract (MCP_TOOLS.md section 2.2). Disabled and absent are
     the same ``WORKFLOW_NOT_FOUND`` here — unlike ``prepare_operation``, discovery does
     not distinguish them (WORKFLOW_REGISTRY.md section 9.3: disabled "disappears from
@@ -607,11 +708,26 @@ def describe_workflow(session: Session, *, workflow_id: str) -> WorkflowDetail:
     entry = _find_entry(document, workflow_id)
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
+    if principal_id is not None:
+        decision = _authorize(
+            session,
+            principal_id=principal_id,
+            tool_name="describe_workflow",
+            workflow_id=workflow_id,
+            enable_v2=enable_v2,
+        )
+        if not decision.allowed:
+            raise WorkflowNotFoundError()
     return WorkflowDetail.from_entry(entry)
 
 
 def validate_input(
-    session: Session, *, workflow_id: str, arguments: dict[str, Any]
+    session: Session,
+    *,
+    workflow_id: str,
+    arguments: dict[str, Any],
+    principal_id: str | None = None,
+    enable_v2: bool = False,
 ) -> list[ArgumentError]:
     """Check ``arguments`` against a workflow's schema without creating an operation
     (MCP_TOOLS.md section 2.4)."""
@@ -619,11 +735,26 @@ def validate_input(
     entry = _find_entry(document, workflow_id)
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
+    if principal_id is not None:
+        decision = _authorize(
+            session,
+            principal_id=principal_id,
+            tool_name="validate_input",
+            workflow_id=workflow_id,
+            enable_v2=enable_v2,
+        )
+        if not decision.allowed:
+            raise WorkflowNotFoundError()
     return validate_arguments(entry.input_schema, arguments)
 
 
 def preflight_workflow(
-    session: Session, *, workflow_id: str, preflight: PreflightPort
+    session: Session,
+    *,
+    workflow_id: str,
+    preflight: PreflightPort,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
 ) -> PreflightResult:
     """Run the same checks ``prepare_operation`` runs, without creating an operation
     (MCP_TOOLS.md section 2.5)."""
@@ -631,6 +762,16 @@ def preflight_workflow(
     entry = _find_entry(document, workflow_id)
     if entry is None or not entry.enabled:
         raise WorkflowNotFoundError()
+    if principal_id is not None:
+        decision = _authorize(
+            session,
+            principal_id=principal_id,
+            tool_name="preflight_workflow",
+            workflow_id=workflow_id,
+            enable_v2=enable_v2,
+        )
+        if not decision.allowed:
+            raise WorkflowNotFoundError()
     return preflight.check(entry)
 
 
@@ -642,6 +783,15 @@ def get_instance_health(health: HealthPort) -> HealthCheckResult:
     operation — so it takes no ``Session``. A thin pass-through over ``health.check()``,
     kept as a named use case (rather than the MCP adapter calling the port directly) so
     the "MCP calls core.service" rule (ADR-001) has no exception.
+
+    Not authorization-gated in Stage 03: MCP_TOOLS.md section 5.9's v2 form for this
+    tool is *environment*-scoped only ("unauthorized environment → ENVIRONMENT_NOT_FOUND"),
+    with no workflow to check a role/workflow-scope grant against — and no v1 tool
+    carries an ``environment`` argument yet (Stage 04's charter, this module's own
+    ``_authorize`` docstring). Every role already includes this tool in ADR-015's
+    matrix, so an authenticated v2 caller with any active membership anywhere would
+    pass regardless; wiring the check now would add a database round trip for a
+    decision that's Stage 04's to make correctly, not Stage 03's to approximate.
     """
     return health.check()
 
@@ -662,6 +812,7 @@ def prepare_operation(
     server_max_argument_bytes: int,
     idempotency_key: str | None = None,
     reason: str | None = None,
+    enable_v2: bool = False,
 ) -> tuple[Operation, bool, str | None]:
     """Validate, preflight, and mint an operation handle (ADR-003, ARCHITECTURE.md 4.1).
 
@@ -687,6 +838,16 @@ def prepare_operation(
     document = RegistryDocument.model_validate(snapshot.document)
     entry = _require_enabled_entry(document, workflow_id)
     assert entry.approval is not None  # resolved entries always carry a concrete value
+
+    decision = _authorize(
+        session,
+        principal_id=principal_id,
+        tool_name="prepare_operation",
+        workflow_id=workflow_id,
+        enable_v2=enable_v2,
+    )
+    if not decision.allowed:
+        raise WorkflowNotFoundError()
 
     canonical_bytes = canonicalize_arguments(arguments)
     fingerprint = fingerprint_arguments(canonical_bytes)
@@ -839,17 +1000,37 @@ def approve_operation(
     operation_id: str,
     decided_by: str,
     client_fingerprint: str | None = None,
+    enable_v2: bool = False,
 ) -> Operation:
     """T06: a human approves (ADR-010; both the CLI and the approval-page channel call
-    this one use case). Not scoped to a preparing principal — in v1's single-principal
-    model the approver and preparer are always the same ``local`` identity; v2's RBAC
-    would gate this differently, but that gate is not this function's job.
+    this one use case). Not scoped to a preparing principal in v1's single-principal
+    model, where the approver and preparer are always the same ``local`` identity.
+
+    v2 (``enable_v2=True``, CLI-only — the web approval channel stays token-based per
+    ADR-010, Stage 03 does not add identity to it; see ``docs/OIDC_SETUP.md``-adjacent
+    scoping notes in the Stage 03 PR): ``decided_by`` must hold ``approver`` or
+    ``admin`` with workflow-scope covering this operation's workflow (ADR-015's own
+    "out-of-band approve/reject" matrix row), and — regardless of role — may never be
+    the operation's own requester (``row.principal_id``, already recorded at prepare
+    time). Both denials raise the identical :class:`~n8n_operator.errors.OperationNotFoundError`
+    a nonexistent operation ID would (invariant I14).
 
     ``client_fingerprint`` is coarse request provenance for the audit trail
     (BUILD_PLAN section 8.1) — set by the web approval channel, left ``None`` by the
     CLI, which has no request to fingerprint.
     """
     row = _get_operation_row(session, operation_id)
+    decision = _authorize(
+        session,
+        principal_id=decided_by,
+        tool_name=authorization.APPROVE_REJECT_CAPABILITY,
+        workflow_id=row.workflow_id,
+        enable_v2=enable_v2,
+        requester_principal_id=row.principal_id,
+        decider_principal_id=decided_by,
+    )
+    if not decision.allowed:
+        raise OperationNotFoundError()
     entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
     execution_deadline = datetime.now(UTC) + timedelta(
         seconds=_resolved_ttl(entry.limits.execution_ttl_seconds)
@@ -874,9 +1055,22 @@ def reject_operation(
     operation_id: str,
     decided_by: str,
     client_fingerprint: str | None = None,
+    enable_v2: bool = False,
 ) -> Operation:
-    """T07: a human rejects (ADR-010). ``client_fingerprint`` as :func:`approve_operation`."""
+    """T07: a human rejects (ADR-010). ``client_fingerprint``/authorization as
+    :func:`approve_operation`."""
     row = _get_operation_row(session, operation_id)
+    decision = _authorize(
+        session,
+        principal_id=decided_by,
+        tool_name=authorization.APPROVE_REJECT_CAPABILITY,
+        workflow_id=row.workflow_id,
+        enable_v2=enable_v2,
+        requester_principal_id=row.principal_id,
+        decider_principal_id=decided_by,
+    )
+    if not decision.allowed:
+        raise OperationNotFoundError()
     updated = _apply_and_audit(session, row, "T07", actor=decided_by)
     approval = ApprovalRepository(session).get_by_operation_id(operation_id)
     if approval is not None:
@@ -925,12 +1119,18 @@ def _approval_decision_context(
 
 
 def get_approval_decision_context(
-    session: Session, *, operation_id: str, principal_id: str
+    session: Session, *, operation_id: str, principal_id: str, enable_v2: bool = False
 ) -> ApprovalDecisionContext:
     """Everything needed to render or review an approval decision by operation ID
     (ADR-010) — the CLI's ``operations approve``/``reject`` (before confirming) and
     ``operations approval-status`` both call this."""
-    row = _get_owned_operation_row(session, operation_id, principal_id)
+    row = _get_owned_operation_row(
+        session,
+        operation_id,
+        principal_id,
+        tool_name="get_approval_status",
+        enable_v2=enable_v2,
+    )
     approval_row = ApprovalRepository(session).get_by_operation_id(operation_id)
     return _approval_decision_context(session, row, approval_row)
 
@@ -978,7 +1178,12 @@ def resolve_approval_token(session: Session, *, token: str) -> ApprovalDecisionC
 
 
 def cancel_operation(
-    session: Session, *, operation_id: str, principal_id: str, reason: str | None = None
+    session: Session,
+    *,
+    operation_id: str,
+    principal_id: str,
+    reason: str | None = None,
+    enable_v2: bool = False,
 ) -> Operation:
     """T09/T12: the originating caller withdraws before execution (MCP_TOOLS.md 2.9).
 
@@ -986,7 +1191,9 @@ def cancel_operation(
     recorded on the transition's audit detail for a human reading the trail later, and
     never affects whether the cancellation is allowed.
     """
-    row = _get_owned_operation_row(session, operation_id, principal_id)
+    row = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="cancel_operation", enable_v2=enable_v2
+    )
     if row.state == "PENDING_APPROVAL":
         transition_id = "T09"
     elif row.state == "APPROVED":
@@ -1057,6 +1264,7 @@ def execute_operation(
     principal_id: str,
     preflight: PreflightPort,
     environment: str = "default",
+    enable_v2: bool = False,
 ) -> Operation:
     """T10: burn the handle and move to ``EXECUTING`` (ADR-003, ARCHITECTURE.md 4.3
     steps 0-6). Dispatching to n8n and resolving to T13/T14/T15 is deliberately **not**
@@ -1116,7 +1324,9 @@ def execute_operation(
     if handle != operation_id:
         raise ArgumentMismatchError(details={"operation_id": operation_id, "handle": handle})
 
-    row = _get_owned_operation_row(session, operation_id, principal_id)
+    row = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="execute_operation", enable_v2=enable_v2
+    )
     if row.environment != environment:
         raise OperationNotFoundError()
 
@@ -1322,7 +1532,9 @@ def dispatch_operation(
         )
 
 
-def get_operation(session: Session, *, operation_id: str, principal_id: str) -> Operation:
+def get_operation(
+    session: Session, *, operation_id: str, principal_id: str, enable_v2: bool = False
+) -> Operation:
     """Current state of one operation, applying any overdue expiry first (invariant I9,
     MCP_TOOLS.md section 2.7).
 
@@ -1331,7 +1543,9 @@ def get_operation(session: Session, *, operation_id: str, principal_id: str) -> 
     dispatch and fingerprint re-verification need, so redaction happens here, at the
     read boundary, not at rest.
     """
-    row = _get_owned_operation_row(session, operation_id, principal_id)
+    row = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="get_operation", enable_v2=enable_v2
+    )
     entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
     operation = _to_domain(row)
     return operation.model_copy(update={"arguments": redact(row.arguments, entry.output.redact)})
@@ -1347,6 +1561,7 @@ def list_operations(
     since: datetime | None = None,
     limit: int = 20,
     cursor: str | None = None,
+    enable_v2: bool = False,
 ) -> list[Operation]:
     """Filterable history (MCP_TOOLS.md section 2.10) — applies lazy expiry to every
     returned row, since a list is a read like any other (invariant I9).
@@ -1357,6 +1572,17 @@ def list_operations(
     "everything strictly older than this ID" is a stable page boundary without a
     separate offset concept. The MCP adapter mints the next page's cursor from the
     last operation in a full page and omits it once a page comes back short.
+
+    v1 (``enable_v2=False``): unchanged — every row belongs to ``principal_id``
+    (ownership-scoped). v2: visibility is role/scope-based, not ownership-based
+    (ADR-015) — an operator/approver/admin whose grants cover a workflow sees every
+    principal's operations against it, not only their own. The scope filter is pushed
+    into the SQL query itself, *before* ``LIMIT`` (``OperationRepository.list``'s own
+    ``workflow_id_like_patterns``), so a cursor can never walk past a row the filter
+    would have hidden (the pagination side channel the completion gate names). A
+    caller-supplied ``workflow_id`` filter that the caller isn't authorized for
+    resolves to zero rows, not an error — consistent with ``list_workflows``'s own
+    "filtering, not authorization" framing for a list endpoint.
     """
     if not (1 <= limit <= 100):
         raise InvalidArgumentsError(details={"limit": limit})
@@ -1364,10 +1590,43 @@ def list_operations(
         unknown = [s for s in states if s not in STATES]
         if unknown:
             raise InvalidArgumentsError(details={"unknown_states": unknown})
+
+    scoped_principal_id: str | None = principal_id
+    like_patterns: list[str] | None = None
+    if enable_v2:
+        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
+            principal_id
+        )
+        if workflow_id is not None:
+            decision = _authorize(
+                session,
+                principal_id=principal_id,
+                tool_name="list_operations",
+                workflow_id=workflow_id,
+                enable_v2=enable_v2,
+            )
+            if not decision.allowed:
+                return []
+        else:
+            patterns: list[str] = []
+            for membership in memberships:
+                if "list_operations" not in {
+                    tool
+                    for role in membership.roles
+                    for tool in authorization.capabilities_for_role(role)
+                }:
+                    continue
+                if membership.environment_scope != ["*"]:
+                    continue
+                patterns.append(authorization.workflow_scope_to_sql_like(membership.workflow_scope))
+            like_patterns = patterns
+        scoped_principal_id = None
+
     rows = OperationRepository(session).list(
-        principal_id=principal_id,
+        principal_id=scoped_principal_id,
         environment=environment,
         workflow_id=workflow_id,
+        workflow_id_like_patterns=like_patterns,
         states=states,
         since=since,
         limit=limit,
@@ -1377,10 +1636,12 @@ def list_operations(
 
 
 def get_execution_result(
-    session: Session, *, operation_id: str, principal_id: str
+    session: Session, *, operation_id: str, principal_id: str, enable_v2: bool = False
 ) -> ExecutionResult:
     """The redacted, size-capped result of a completed operation (MCP_TOOLS.md 2.11)."""
-    _get_owned_operation_row(session, operation_id, principal_id)
+    _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="get_execution_result", enable_v2=enable_v2
+    )
     result_row = ExecutionResultRepository(session).get(operation_id)
     if result_row is None:
         raise ResultNotAvailableError()
@@ -1422,16 +1683,39 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def verify_audit_chain(session: Session) -> ChainVerificationResult:
+def _require_admin(session: Session, *, principal_id: str | None, enable_v2: bool) -> None:
+    """Gate for the CLI's system-wide, cross-principal administrative reads
+    (``audit verify``/``audit export``, Stage 03) — not workflow-scoped, so
+    :func:`_authorize`'s ``WorkflowNotFoundError``/``OperationNotFoundError`` shapes
+    don't apply; there is no object being enumerated here for invariant I14 to protect,
+    only a capability being checked (``core/authorization.py``'s ``has_role``)."""
+    if not enable_v2:
+        return
+    assert principal_id is not None  # every v2 caller is authenticated
+    memberships = OrganizationMembershipRepository(session).list_active_for_principal(principal_id)
+    if not authorization.has_role(memberships, "admin"):
+        raise InsufficientRoleError()
+
+
+def verify_audit_chain(
+    session: Session, *, principal_id: str | None = None, enable_v2: bool = False
+) -> ChainVerificationResult:
     """AC-22: walk the full ``audit_log`` table, in ``seq`` order, and report the first
     break, if any — ``n8n-operator audit verify``'s entire read path. A clean database
     reports ``ok=True``; a single row mutated in place is caught at its exact sequence
     number (BUILD_PLAN section 9.4: tamper-*evidence*, not tamper-*proofing*)."""
+    _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
     entries = AuditLogRepository(session).list_all()
     return verify_chain(entries)
 
 
-def export_audit_record(session: Session, *, known_secrets: Sequence[str] = ()) -> dict[str, Any]:
+def export_audit_record(
+    session: Session,
+    *,
+    known_secrets: Sequence[str] = (),
+    principal_id: str | None = None,
+    enable_v2: bool = False,
+) -> dict[str, Any]:
     """AC-25: a complete, chain-verifiable, redacted export of every operation and the
     full audit log — everything a separate process needs to independently re-verify
     the hash chain and inspect what happened, without ever including a credential, a
@@ -1460,6 +1744,7 @@ def export_audit_record(session: Session, *, known_secrets: Sequence[str] = ()) 
     table at all — ``operation_events`` already carries the T06/T07 decision, actor,
     and timestamp verification needs, without a reason to touch that table.
     """
+    _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
     audit_entries = AuditLogRepository(session).list_all()
     chain_result = verify_chain(audit_entries)
     audit_log = [

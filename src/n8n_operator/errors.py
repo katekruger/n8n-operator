@@ -254,6 +254,24 @@ class HandleAlreadyUsedError(AuthorizationError):
     default_message = "This operation handle has already been used."
 
 
+class InsufficientRoleError(AuthorizationError):
+    """Stage 03 (ADR-015): raised only by CLI-only, system-wide administrative
+    commands (``audit verify``/``audit export``) that have no single workflow or
+    operation to intersect a scope against, so denial cannot be shaped as
+    ``WORKFLOW_NOT_FOUND``/``OPERATION_NOT_FOUND`` the way every workflow- or
+    operation-scoped v2 check is (invariant I14 governs *those* — enumeration of a
+    specific object — not "you lack administrative capability to run this command at
+    all", which is not an enumeration oracle since there is no object being
+    enumerated). Never raised by an MCP tool and deliberately not part of
+    MCP_TOOLS.md's tool-facing taxonomy or the ``TAXONOMY`` registry below, the same
+    carve-out the approval-channel errors above already use."""
+
+    code = "INSUFFICIENT_ROLE"
+    retryable = False
+    remediation = "Ask an organization admin to grant the admin role, or run this as one."
+    default_message = "This command requires the admin role."
+
+
 # --------------------------------------------------------------------------------------
 # Approval-channel errors (phase 6, ADR-010) — raised only by the loopback approval web
 # page's own token-verification path (``core.service.resolve_approval_token``). The CLI
@@ -465,6 +483,7 @@ __all__ = [
     "HandleInvalidError",
     "IdempotencyConflictError",
     "InstanceUnreachableError",
+    "InsufficientRoleError",
     "InternalError",
     "InvalidArgumentsError",
     "InvalidStateTransitionError",

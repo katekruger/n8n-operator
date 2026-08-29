@@ -138,6 +138,26 @@ def resolve_database_url(explicit: str | None = None) -> str:
     return _check_database_url(raw)
 
 
+def resolve_v2_identity_flags() -> tuple[bool, str]:
+    """``(enable_v2, dev_principal_id)``, resolved and validated *without* requiring
+    the rest of :class:`Settings` (notably ``n8n_base_url``/``n8n_api_key``, both
+    required fields) to be present — the same "schema/identity management is
+    orthogonal to n8n configuration" reasoning :func:`resolve_database_url` already
+    documents, extended to Stage 03's CLI identity resolution
+    (``core.identity.resolve_cli_principal_id``) so ``operations``/``audit`` commands
+    keep working without n8n configured, exactly as they always have.
+
+    Reads the same env vars :class:`Settings`' own fields do
+    (``N8N_OPERATOR_ENABLE_V2``, ``N8N_OPERATOR_DEV_PRINCIPAL_ID``) with the same
+    defaults, so a deployment's ``.env``/environment never has to agree with itself
+    twice.
+    """
+    raw_enable_v2 = os.environ.get("N8N_OPERATOR_ENABLE_V2", "false").strip().lower()
+    enable_v2 = raw_enable_v2 in {"1", "true", "yes", "on"}
+    dev_principal_id = os.environ.get("N8N_OPERATOR_DEV_PRINCIPAL_ID", "dev")
+    return enable_v2, dev_principal_id
+
+
 def redact_database_url(database_url: str) -> str:
     """``database_url`` with any embedded password replaced by SQLAlchemy's own
     ``***`` placeholder — never the literal value.
@@ -498,4 +518,5 @@ __all__ = [
     "resolve_max_argument_bytes",
     "resolve_registry_path",
     "resolve_secret_reference",
+    "resolve_v2_identity_flags",
 ]
