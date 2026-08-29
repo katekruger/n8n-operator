@@ -1,6 +1,6 @@
 """Contract: the dependency graph points inward only (ADR-001, BUILD_PLAN section 4).
 
-    cli, mcp, approval  ->  core  ->  registry, storage, audit, n8n
+    cli, mcp, approval  ->  core  ->  registry, storage, audit, n8n, identity
 
 ``core`` must not import ``mcp``, ``cli``, ``approval``, ``fastapi``, ``typer``, or the
 MCP SDK — this is what keeps the domain layer testable without a protocol, a terminal, or
@@ -33,9 +33,11 @@ FORBIDDEN_FOR_CORE = {
     "mcp",  # the MCP SDK itself, not this package's own n8n_operator.mcp
 }
 
-# Capability modules (registry, storage, audit, n8n) must not depend on each other or on
-# core — each owns exactly one external concern (ARCHITECTURE.md section 2.1).
-CAPABILITY_PACKAGES = ("registry", "storage", "audit", "n8n")
+# Capability modules (registry, storage, audit, n8n, identity) must not depend on each
+# other or on core — each owns exactly one external concern (ARCHITECTURE.md section
+# 2.1). identity/ added stage 02 (ADR-014): it owns the OIDC/JWKS vendor boundary the
+# same way n8n/ owns the n8n vendor boundary.
+CAPABILITY_PACKAGES = ("registry", "storage", "audit", "n8n", "identity")
 
 
 def _imported_module_names(path: Path) -> set[str]:

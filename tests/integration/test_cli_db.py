@@ -92,8 +92,8 @@ def test_db_status_after_init_is_up_to_date(cli_env: None) -> None:
     result = runner.invoke(app, ["db", "status"])
     assert result.exit_code == 0
     assert "up to date" in result.stdout
-    assert "current revision: 0003" in result.stdout
-    assert "head revision:    0003" in result.stdout
+    assert "current revision: 0004" in result.stdout
+    assert "head revision:    0004" in result.stdout
     assert "connectivity:     reachable" in result.stdout
 
 

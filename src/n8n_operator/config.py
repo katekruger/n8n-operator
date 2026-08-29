@@ -301,6 +301,30 @@ class Settings(BaseSettings):
     approval_url_exposure: Literal["auto", "never"] = Field(default="auto")  # ADR-010, I12
     log_level: str = Field(default="INFO")
 
+    # --- v2 identity (ADR-013, ADR-014; stage 02) -------------------------------------------
+    # Default off: v1's exact 12-tool surface (AC-23) is unaffected unless an operator
+    # deliberately opts in. When True, `whoami` registers as a 13th tool and identity_mode
+    # governs how every other tool call's caller is resolved.
+    enable_v2: bool = Field(default=False)
+    # "dev": every caller (stdio, and non-OIDC HTTP) is attributed to one fixed, clearly
+    # labeled, non-production service principal — v1's ergonomics, a real v2 identity row
+    # instead of a hardcoded exemption (ADR-014 section 5). "oidc": Streamable HTTP callers
+    # authenticate with a real bearer JWT against oidc_issuer_url/oidc_audience; stdio still
+    # uses the fixed service principal regardless (ADR-014 section 5 — no OIDC over stdio).
+    identity_mode: Literal["dev", "oidc"] = Field(default="dev")
+    oidc_issuer_url: HttpUrl | None = Field(default=None)
+    oidc_audience: str | None = Field(default=None)
+    # Optional: skips OIDC discovery when the provider's discovery document is unavailable
+    # or nonstandard. Most deployments should leave this unset.
+    oidc_jwks_uri: HttpUrl | None = Field(default=None)
+    # Operator's own externally-reachable URL — optional, used only to populate the
+    # WWW-Authenticate header's resource_metadata hint (RFC 9728) on a 401. Distinct
+    # from oidc_audience (what the JWT's `aud` claim must equal, which need not be a
+    # URL at all); leaving this unset only omits that one hint, never bearer-auth
+    # enforcement itself.
+    oidc_resource_server_url: HttpUrl | None = Field(default=None)
+    dev_principal_id: str = Field(default="dev")
+
     # ---- field-level validation -------------------------------------------------------
 
     @field_validator("n8n_api_key", mode="before")
@@ -352,14 +376,48 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_http_bind_guard(self) -> Settings:
-        # Boundary B9: a non-loopback MCP HTTP bind requires both a bearer token and an
-        # Origin allowlist, or startup must fail — never a silently-open listener.
+        # Boundary B9: a non-loopback MCP HTTP bind always requires an Origin
+        # allowlist (DNS-rebinding defense, independent of how identity is proven), or
+        # startup must fail — never a silently-open listener. It also requires a
+        # caller-authentication mechanism: v1's static bearer token, unless v2 OIDC
+        # identity is configured, which *replaces* — not layers onto — the static
+        # token (ADR-014 section 1). A real bearer JWT per request is what actually
+        # authenticates each caller once OIDC is active; the static token would be
+        # dead configuration alongside it.
         if _is_loopback(self.http_bind):
             return self
-        if self.http_bearer_token is None or not self.allowed_origins():
+        if not self.allowed_origins():
             raise ValueError(
-                "http_bind is non-loopback; a bearer token and an Origin allowlist are "
-                "both required, or startup must fail (boundary B9)"
+                "http_bind is non-loopback; an Origin allowlist is required, or "
+                "startup must fail (boundary B9)"
+            )
+        oidc_configured = self.enable_v2 and self.identity_mode == "oidc"
+        if self.http_bearer_token is None and not oidc_configured:
+            raise ValueError(
+                "http_bind is non-loopback; a bearer token is required unless v2 OIDC "
+                "identity is configured (identity_mode='oidc'), or startup must fail "
+                "(boundary B9, ADR-014 section 1)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_v2_identity_mode(self) -> Settings:
+        if not self.enable_v2:
+            return self
+        if self.identity_mode == "dev" and not _is_loopback(self.http_bind):
+            # A caller attributed to one shared, unauthenticated dev principal must
+            # never be reachable beyond the local machine — "dev" is unsafe non-loopback
+            # by construction, not by an operator remembering to keep it local.
+            raise ValueError(
+                "identity_mode is 'dev'; http_bind must stay loopback. Configure "
+                "identity_mode='oidc' with oidc_issuer_url/oidc_audience for a "
+                "non-loopback v2 deployment"
+            )
+        if self.identity_mode == "oidc" and (
+            self.oidc_issuer_url is None or not self.oidc_audience
+        ):
+            raise ValueError(
+                "identity_mode is 'oidc'; oidc_issuer_url and oidc_audience are both required"
             )
         return self
 

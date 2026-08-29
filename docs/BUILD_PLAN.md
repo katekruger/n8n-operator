@@ -219,6 +219,7 @@ n8n-operator/
 │   ├── RELEASE_ROLLBACK.md         # rollback/yank procedure for a bad release (phase 9)
 │   ├── V2_TRACEABILITY.md          # v2 outcome/tool -> AC/test/doc/stage matrix (stage 00)
 │   ├── POSTGRES_OPERATIONS.md      # backup/restore/rollback, capacity, dev setup (stage 01)
+│   ├── OIDC_SETUP.md               # provider-neutral OIDC setup + reference config (stage 02)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -279,7 +280,8 @@ n8n-operator/
 │       │   ├── idempotency.py      # canonical JSON + argument fingerprints
 │       │   ├── redaction.py        # output redaction engine
 │       │   ├── service.py          # use-case orchestration (the portable core)
-│       │   └── postgres_migration.py  # SQLite -> Postgres migration orchestration (stage 01)
+│       │   ├── postgres_migration.py  # SQLite -> Postgres migration orchestration (stage 01)
+│       │   └── identity.py         # JIT provisioning, whoami (ADR-013, ADR-014; stage 02)
 │       ├── registry/               # section 6 — YAML registry
 │       │   ├── __init__.py
 │       │   ├── schema.py           # Pydantic v2 models for registry entries
@@ -293,6 +295,9 @@ n8n-operator/
 │       │   ├── health.py           # reachability adapter (HealthPort)
 │       │   ├── dispatch.py         # webhook dispatch adapter (DispatchPort)
 │       │   └── types.py            # n8n API response models
+│       ├── identity/               # the only module that speaks OIDC (ADR-014; stage 02)
+│       │   ├── __init__.py
+│       │   └── oidc.py             # JWT/JWKS validation, discovery, key rotation
 │       ├── storage/                # section 8 — persistence
 │       │   ├── __init__.py
 │       │   ├── models.py           # SQLAlchemy 2.0 ORM
@@ -306,7 +311,8 @@ n8n-operator/
 │       │       └── versions/
 │       │           ├── 0001_initial.py    # AC-24: empty DB upgrades to head
 │       │           ├── 0002_approval_binding_hash.py  # phase 6, ADR-010
-│       │           └── 0003_v2_foundation_schema.py   # v2 data model (stage 01)
+│       │           ├── 0003_v2_foundation_schema.py   # v2 data model (stage 01)
+│       │           └── 0004_service_principal_credential_ref.py  # stage 02
 │       ├── audit/                  # append-only, hash-chained
 │       │   ├── __init__.py
 │       │   ├── chain.py            # chain construction + verification
@@ -332,7 +338,8 @@ n8n-operator/
 │               ├── operations.py   # list, show, cancel, expire
 │               ├── audit.py        # verify, export
 │               ├── health.py       # get_instance_health, from the command line
-│               └── db.py           # init, migrate, status
+│               ├── db.py           # init, migrate, status, migrate-to-postgres
+│               └── identity.py     # orgs, memberships, service principals (stage 02)
 └── tests/
     ├── conftest.py
     ├── fixtures/
@@ -2213,15 +2220,83 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 02 — Organizations and OIDC identity
 
-- [ ] `organizations`, `organization_memberships` tables; `principals` gains
-      `external_issuer` and `disabled_at` (section 8.3, ADR-013)
-- [ ] OIDC resource-server bearer validation: `(iss, sub)` identity pairing, JWKS
-      caching with rate-limited re-fetch on `kid` miss, ±60s clock-skew tolerance
-      (ADR-014)
-- [ ] `whoami` tool (MCP_TOOLS.md section 5.1)
-- [ ] Disabled-principal and removed-membership re-check on every call, no caching
-      (ADR-014 section 4)
-- [ ] AC-34, AC-35, AC-36, AC-45, AC-46 demonstrable
+- [x] `organizations`, `organization_memberships`, `environments` tables (already
+      landed schema-only in stage 01's migration `0003_v2_foundation_schema.py`);
+      `principals` gains `credential_ref` and the `uq_principals_external_identity`
+      unique constraint on `(external_issuer, external_subject)` this stage, via a new
+      migration `0004_service_principal_credential_ref.py`
+      (`batch_alter_table`, verified against both backends — empty-diff
+      `compare_metadata`, a downgrade/upgrade round trip, and a real backfill-safety
+      check against pre-existing rows). Repositories:
+      `storage/repository.py`'s new `OrganizationRepository`,
+      `OrganizationMembershipRepository`, `EnvironmentRepository` (read-only), and
+      `PrincipalRepository`'s new `get_by_external_identity`/`disable`/`enable`/
+      `set_credential_ref`/`list_service_principals` (section 8.3, ADR-013).
+- [x] Identity port and normalized principal context:
+      `identity/oidc.py`'s `OidcVerifier` (pure JWT/JWKS validation, no database
+      access — a new capability package, added to `tests/contract/test_layering.py`'s
+      checked set) and `core/identity.py`'s `resolve_user_principal`/
+      `ensure_dev_principal`/`build_whoami` (DB-backed orchestration). OIDC discovery,
+      issuer/audience/algorithm allowlist (RS/ES/PS 256/384/512 only — never `none` or
+      HS\*), JWKS caching by `kid` with exactly one rate-limited re-fetch on a miss,
+      ±60s clock-skew tolerance applied identically to `exp`/`nbf`/`iat`, subject
+      mapping via JIT provisioning (never with a membership), and disabled-principal
+      handling re-checked live on every call (ADR-014). The composition-root bridge,
+      `mcp/server.py`'s `_OperatorTokenVerifier`, implements the installed `mcp` SDK's
+      own `TokenVerifier` protocol — real per-request identity through the SDK's own
+      `AuthContextMiddleware`/`RequireAuthMiddleware`, not a hand-rolled parallel
+      mechanism.
+- [x] `identity_mode: "dev" | "oidc"` (default `"dev"` when `enable_v2` is set): stdio
+      always authenticates as one fixed, idempotently-provisioned service principal
+      regardless of configured mode (`ensure_dev_principal`, ADR-014 section 5),
+      visibly labeled `"local development (identity_mode=dev — never for
+      production)"`; a non-loopback HTTP bind with `identity_mode="dev"` is refused by
+      a new `config.py` validator (`_validate_v2_identity_mode`).
+- [x] Secure bootstrap and admin CLI: `n8n-operator identity bootstrap`/
+      `create-org`/`list-orgs`/`add-membership`/`remove-membership`/
+      `list-memberships`/`disable-principal`/`enable-principal`/
+      `create-service-principal`/`rotate-service-credential`/
+      `list-service-principals` (`cli/commands/identity.py`, 100% line/branch
+      coverage). A service-principal secret is a `credential_ref` indirection
+      (`env:NAME`/`keyring:SERVICE/ACCOUNT`, ADR-006) resolved only transiently to
+      validate it and register it for log scrubbing — never printed, never stored,
+      proven by `test_create_service_principal_never_prints_the_resolved_secret` and
+      `test_rotate_service_credential_never_prints_the_new_secret`.
+- [x] `whoami` tool (MCP_TOOLS.md section 5.1), byte-shape-identical to the documented
+      example: `principal_id`, `kind`, `display_name`,
+      `organizations[].{organization_id, name, roles, environments[]}` — no provider
+      token, no raw claim, ever (`test_whoami_never_leaks_a_provider_token_or_raw_claim`).
+      Registered as a thirteenth tool only when `ToolDeps.enable_v2` is set; v1's exact
+      twelve-tool surface (AC-23) is otherwise untouched
+      (`test_whoami_is_registered_only_when_v2_is_enabled`,
+      `test_whoami_is_the_thirteenth_tool_in_v2_mode`,
+      `test_whoami_is_not_registered_in_v1_mode`).
+- [x] Disabled-principal and removed-membership re-check on every call, no caching
+      (ADR-014 section 4) — proven against a real database with the identical,
+      still-cryptographically-valid token before and after the state change
+      (`test_a_disabled_principal_is_rejected_even_with_a_valid_token`,
+      `test_a_removed_membership_leaves_whoami_empty_but_the_principal_still_authenticates`).
+- [x] Actor and organization scope carried into logs, operations, and audit records:
+      every `core/service.py` write path resolves the real per-request principal via
+      `mcp/tools.py`'s `_resolve_principal_id` (the SDK's `AccessToken.claims` in OIDC
+      mode, `deps.principal_id` otherwise) rather than a hardcoded value, so
+      `operations.principal_id`/audit `actor` are attributable to the authenticated
+      caller. `operations.organization_id`/`environment_id` are deliberately **not**
+      populated this stage — no tool yet accepts an `environment` argument to resolve
+      an organization from (stage 03/04), so there is no organization scope to carry
+      yet without guessing one. Historical attribution survives a rename/disable
+      because `principal_id` is a stable row ID, never the display name or `sub`
+      itself — a renamed or disabled principal's past `operations`/audit rows are
+      unchanged.
+- [x] Required negative tests — see [OIDC_SETUP.md](OIDC_SETUP.md) section 5 for the
+      full table mapping each of the stage's fourteen named cases to its test(s),
+      including the two (deleted IdP account, disabled membership) that are the same
+      code path as an existing case and are documented rather than duplicated.
+- [x] Provider-neutral setup documentation plus one fully tested reference
+      configuration: [OIDC_SETUP.md](OIDC_SETUP.md).
+- [x] AC-34, AC-35, AC-45, AC-46 demonstrable; AC-36 partial (schema/resolution-path
+      half demonstrable now, implicit-environment-selection half is a named stage 04
+      dependency — see [V2_TRACEABILITY.md](V2_TRACEABILITY.md))
 
 #### Stage 03 — RBAC and authorization boundaries
 

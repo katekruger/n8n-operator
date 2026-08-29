@@ -151,15 +151,30 @@ class Principal(Base):
     """Who acted (BUILD_PLAN 8.1). v1 holds exactly one row, ``kind='local'``.
 
     ``external_issuer``/``disabled_at`` are v2-foundational (BUILD_PLAN section 8.3,
-    stage 01): schema only, unused by any v1 code path. Identity in v2 is the pair
-    ``(external_issuer, external_subject)``, never ``external_subject`` alone
-    (ADR-014) — v1 never populates either column. ``disabled_at`` is checked live on
-    every call once v2 authorization lands (stage 02); it has no effect while nothing
-    reads it.
+    stage 01), implemented stage 02. Identity in v2 is the pair ``(external_issuer,
+    external_subject)``, never ``external_subject`` alone (ADR-014) — enforced here by
+    ``uq_principals_external_identity``, a plain (non-partial) unique constraint: two
+    rows both carrying ``NULL`` (every ``local``/``service`` principal) never collide,
+    the same portable NULL-uniqueness rule the idempotency-namespace constraint already
+    documents (ADR-004 rule D4). ``disabled_at`` is checked live on every request that
+    resolves identity (ADR-014 section 4, stage 02) — no cache, ever.
+
+    ``credential_ref`` is stage 02's addition for ``kind='service'``: an ``env:NAME`` /
+    ``keyring:SERVICE/ACCOUNT`` reference (ADR-006's indirection, ADR-013 section 3),
+    never a literal secret or a hash Operator itself mints — the same pattern
+    ``config.n8n_api_key`` and ``environments.n8n_api_key_ref`` already use. Rotating a
+    service principal's credential is repointing this reference after the new secret
+    value has been set at the referenced location, not an Operator-side secret-issuance
+    flow.
     """
 
     __tablename__ = "principals"
-    __table_args__ = (_enum_check("kind", ("local", "user", "service"), name="ck_principals_kind"),)
+    __table_args__ = (
+        _enum_check("kind", ("local", "user", "service"), name="ck_principals_kind"),
+        UniqueConstraint(
+            "external_issuer", "external_subject", name="uq_principals_external_identity"
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
     kind: Mapped[str] = mapped_column(String, nullable=False)
@@ -167,6 +182,7 @@ class Principal(Base):
     external_subject: Mapped[str | None] = mapped_column(String, nullable=True)
     external_issuer: Mapped[str | None] = mapped_column(String, nullable=True)
     disabled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    credential_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
 
 

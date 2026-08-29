@@ -1,0 +1,58 @@
+{
+  "realm": "n8n-operator-test",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 300,
+  "clients": [
+    {
+      "clientId": "n8n-operator",
+      "name": "n8n-operator (Keycloak reference harness)",
+      "description": "Confidential client used only by docker/keycloak-test/ and tests/integration/keycloak/ to obtain real signed access tokens for the OidcVerifier/_OperatorTokenVerifier end-to-end harness. Not a production credential.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "n8n-operator-test-harness-secret-do-not-use-in-prod",
+      "redirectUris": [],
+      "webOrigins": [],
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "n8n-operator-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "n8n-operator",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "lightweight.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@n8n-operator-test.invalid",
+      "firstName": "Alice",
+      "lastName": "Tester",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice-test-password",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}
