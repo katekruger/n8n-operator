@@ -44,6 +44,7 @@ from n8n_operator.storage.models import (
     Principal,
     RegistrySnapshot,
     WorkflowBinding,
+    WorkflowEnvironmentOverlay,
     new_ulid,
     utc_now,
 )
@@ -243,6 +244,8 @@ class OperationRepository:
         idempotency_key: str | None = None,
         approval_expires_at: datetime | None = None,
         execution_deadline: datetime | None = None,
+        organization_id: str | None = None,
+        environment_id: str | None = None,
     ) -> Operation:
         """Insert a new operation row at ``state_version=1``.
 
@@ -266,6 +269,8 @@ class OperationRepository:
             idempotency_key=idempotency_key,
             approval_expires_at=approval_expires_at,
             execution_deadline=execution_deadline,
+            organization_id=organization_id,
+            environment_id=environment_id,
         )
         self._session.add(operation)
         self._session.flush()
@@ -863,15 +868,48 @@ class OrganizationMembershipRepository:
 
 
 class EnvironmentRepository:
-    """The ``environments`` table (ADR-016). Read-only here: stage 02 only needs
-    ``whoami`` to list an organization's environments; full CRUD (create, archive,
-    overlay validation) is stage 04's job. Every row this returns is real regardless —
-    there is no "stage 04 has not run yet" special case, only an empty table until an
-    admin (or stage 04's own tooling) creates the first one.
+    """The ``environments`` table (ADR-016). Full CRUD as of stage 04 — ``create``/
+    ``get``/``archive`` alongside the read-only ``list_for_organization`` stage 02
+    already added for ``whoami``. Archival only (``archived_at``, never a row delete —
+    ADR-016 section 4): historical operations must stay resolvable against an
+    environment an organization has since retired.
     """
 
     def __init__(self, session: Session) -> None:
         self._session = session
+
+    def create(
+        self,
+        *,
+        organization_id: str,
+        name: str,
+        n8n_base_url_ref: str,
+        n8n_api_key_ref: str,
+        is_production: bool = False,
+        id: str | None = None,  # noqa: A002
+    ) -> Environment:
+        environment = Environment(
+            id=id or new_ulid(),
+            organization_id=organization_id,
+            name=name,
+            n8n_base_url_ref=n8n_base_url_ref,
+            n8n_api_key_ref=n8n_api_key_ref,
+            is_production=is_production,
+        )
+        self._session.add(environment)
+        self._session.flush()
+        return environment
+
+    def get(self, environment_id: str) -> Environment | None:
+        return self._session.get(Environment, environment_id)
+
+    def archive(self, environment_id: str) -> Environment:
+        environment = self._session.get(Environment, environment_id)
+        if environment is None:
+            raise LookupError(f"no such environment: {environment_id}")
+        environment.archived_at = utc_now()
+        self._session.flush()
+        return environment
 
     def list_for_organization(
         self, organization_id: str, *, include_archived: bool = False
@@ -882,6 +920,85 @@ class EnvironmentRepository:
         if not include_archived:
             stmt = stmt.where(Environment.archived_at.is_(None))
         return list(self._session.scalars(stmt.order_by(Environment.created_at)))
+
+
+class WorkflowEnvironmentOverlayRepository:
+    """The ``workflow_environment_overlays`` table (ADR-016, rules R13-R14). Rows are
+    deliberately mutable — the one exception to this codebase's usual "insert once,
+    never update" storage discipline (``registry_snapshots``, ``workflow_bindings``,
+    ``operation_events``, ``audit_log`` are all append-only): an overlay is a *current
+    policy setting* for a workflow in an environment, not a historical record. What
+    must never change retroactively is what an already-*prepared* operation was
+    actually governed by — that guarantee comes from ``core.service`` resolving and
+    freezing the merged contract once, at ``prepare_operation`` time, onto the
+    operation's own row (``operations.definition_hash`` etc.), never from re-reading
+    this table later. See ``registry/schema.py``'s ``resolve_overlay`` docstring.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(
+        self,
+        *,
+        workflow_id: str,
+        environment_id: str,
+        n8n_workflow_id: str | None = None,
+        definition_hash: str | None = None,
+        trigger_path: str | None = None,
+        trigger_secret_ref: str | None = None,
+        approval_override: str | None = None,
+        limits_override: dict[str, int] | None = None,
+    ) -> WorkflowEnvironmentOverlay:
+        existing = self.get(workflow_id, environment_id)
+        if existing is not None:
+            existing.n8n_workflow_id = n8n_workflow_id
+            existing.definition_hash = definition_hash
+            existing.trigger_path = trigger_path
+            existing.trigger_secret_ref = trigger_secret_ref
+            existing.approval_override = approval_override
+            existing.limits_override = limits_override
+            self._session.flush()
+            return existing
+        overlay = WorkflowEnvironmentOverlay(
+            id=new_ulid(),
+            workflow_id=workflow_id,
+            environment_id=environment_id,
+            n8n_workflow_id=n8n_workflow_id,
+            definition_hash=definition_hash,
+            trigger_path=trigger_path,
+            trigger_secret_ref=trigger_secret_ref,
+            approval_override=approval_override,
+            limits_override=limits_override,
+        )
+        self._session.add(overlay)
+        self._session.flush()
+        return overlay
+
+    def get(self, workflow_id: str, environment_id: str) -> WorkflowEnvironmentOverlay | None:
+        stmt: Select[tuple[WorkflowEnvironmentOverlay]] = select(WorkflowEnvironmentOverlay).where(
+            WorkflowEnvironmentOverlay.workflow_id == workflow_id,
+            WorkflowEnvironmentOverlay.environment_id == environment_id,
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def list_for_environment(
+        self, environment_id: str
+    ) -> builtins.list[WorkflowEnvironmentOverlay]:
+        stmt: Select[tuple[WorkflowEnvironmentOverlay]] = select(WorkflowEnvironmentOverlay).where(
+            WorkflowEnvironmentOverlay.environment_id == environment_id
+        )
+        return list(self._session.scalars(stmt.order_by(WorkflowEnvironmentOverlay.workflow_id)))
+
+    def delete(self, workflow_id: str, environment_id: str) -> None:
+        """Remove one environment's overlay for one workflow — a real deletion (unlike
+        every append-only table in this module), matching this table's own "current
+        policy setting, not a historical record" nature (see this class's docstring).
+        A no-op if no such row exists."""
+        existing = self.get(workflow_id, environment_id)
+        if existing is not None:
+            self._session.delete(existing)
+            self._session.flush()
 
 
 __all__ = [
@@ -896,4 +1013,5 @@ __all__ = [
     "PrincipalRepository",
     "RegistrySnapshotRepository",
     "WorkflowBindingRepository",
+    "WorkflowEnvironmentOverlayRepository",
 ]

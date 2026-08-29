@@ -31,6 +31,7 @@ import typer
 
 from n8n_operator.cli.commands import audit as audit_commands
 from n8n_operator.cli.commands import db as db_commands
+from n8n_operator.cli.commands import environment as environment_commands
 from n8n_operator.cli.commands import health as health_commands
 from n8n_operator.cli.commands import identity as identity_commands
 from n8n_operator.cli.commands import operations as operations_commands
@@ -65,6 +66,7 @@ app.add_typer(serve_commands.app, name="serve")
 app.add_typer(operations_commands.app, name="operations")
 app.add_typer(audit_commands.app, name="audit")
 app.add_typer(identity_commands.app, name="identity")
+app.add_typer(environment_commands.app, name="environment")
 app.command("health")(health_commands.health)
 
 __all__ = ["app"]

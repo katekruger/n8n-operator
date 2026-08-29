@@ -48,6 +48,7 @@ Phase 5 (BUILD_PLAN section 12).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -59,7 +60,7 @@ from mcp_types import ToolAnnotations
 from pydantic import ConfigDict, Field
 from sqlalchemy.orm import sessionmaker
 
-from n8n_operator.core import service
+from n8n_operator.core import identity, service
 from n8n_operator.core.identity import build_whoami
 from n8n_operator.core.service import DispatchPort, HealthPort, PreflightPort
 from n8n_operator.errors import DispatchIndeterminateError, InvalidArgumentsError, OperatorError
@@ -70,10 +71,23 @@ from n8n_operator.storage.repository import (
 )
 from n8n_operator.storage.session import session_scope
 
-__all__ = ["ToolDeps", "build_tools"]
+__all__ = ["N8nAdapterBundle", "ToolDeps", "build_tools"]
 
 _RISK = Literal["low", "medium", "high"]
 _SIDE_EFFECTS = Literal["read_only", "external_write", "irreversible"]
+
+
+@dataclass(frozen=True)
+class N8nAdapterBundle:
+    """Preflight/health/dispatch bound to *one* environment's own n8n instance
+    (stage 04) — what ``ToolDeps.n8n_client_factory`` returns, mirroring the fixed
+    ``preflight``/``health``/``dispatch`` fields below exactly, so a v2 caller with a
+    real, resolved environment reaches that environment's own instance rather than
+    silently sharing the single v1/dev-mode client every fixed field still points at."""
+
+    preflight: PreflightPort
+    health: HealthPort
+    dispatch: DispatchPort
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,11 @@ class ToolDeps:
     # False (v1, the default) registers exactly the twelve tools AC-23 requires —
     # nothing here changes v1's tool surface unless an operator opts in.
     enable_v2: bool = False
+    # Stage 04: resolves a real, v2 environment_id to *that* environment's own n8n
+    # instance. `None` (v1, and v2 before an environment resolves) means every call
+    # keeps using the fixed `preflight`/`health`/`dispatch` fields above — v1's own
+    # n8n I/O is completely unaffected by this field's mere presence.
+    n8n_client_factory: Callable[[str], N8nAdapterBundle] | None = None
 
 
 def _resolve_principal_id(deps: ToolDeps) -> str:
@@ -128,6 +147,36 @@ def _iso(value: datetime | None) -> str | None:
 
 def _error_result(exc: OperatorError) -> dict[str, Any]:
     return {"error": exc.to_dict()}
+
+
+def _resolved_environment_id(
+    deps: ToolDeps, session: Any, *, principal_id: str, environment: str | None
+) -> str | None:
+    """The environment a discovery/preparation call resolved to, for the result
+    envelope (MCP_TOOLS.md's "result fields" column, stage 04) — ``None`` in v1
+    (``deps.enable_v2=False``), where the concept does not exist and the result shape
+    stays byte-identical to before this stage. Cheap to call ahead of the use case
+    itself doing the identical resolution internally (an indexed read, no writes) —
+    keeping ``core.service``'s own use cases as the single place resolution *rules*
+    live, per this module's existing "adapters are thin" discipline."""
+    if not deps.enable_v2:
+        return None
+    return identity.resolve_environment(
+        session, principal_id=principal_id, environment=environment
+    ).id
+
+
+def _adapters_for(
+    deps: ToolDeps, resolved_environment_id: str | None
+) -> tuple[PreflightPort, HealthPort, DispatchPort]:
+    """Which preflight/health/dispatch a call should use: that environment's own
+    instance when one resolved and a factory is configured, else the single fixed
+    client every v1 (and v2-before-a-factory-is-configured) call already used — never
+    a behavior change for a deployment that hasn't set up ``n8n_client_factory``."""
+    if resolved_environment_id is not None and deps.n8n_client_factory is not None:
+        bundle = deps.n8n_client_factory(resolved_environment_id)
+        return bundle.preflight, bundle.health, bundle.dispatch
+    return deps.preflight, deps.health, deps.dispatch
 
 
 def _latest_event_detail(session: Any, operation_id: str) -> dict[str, Any]:
@@ -184,6 +233,9 @@ class ListWorkflowsArgs(_ToolArgs):
     tags: list[str] | None = None
     risk: _RISK | None = None
     side_effects: _SIDE_EFFECTS | None = None
+    environment: str | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+    cursor: str | None = None
 
 
 def _make_list_workflows(deps: ToolDeps) -> Tool:
@@ -191,25 +243,39 @@ def _make_list_workflows(deps: ToolDeps) -> Tool:
         tags: list[str] | None = None,
         risk: _RISK | None = None,
         side_effects: _SIDE_EFFECTS | None = None,
+        environment: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
         with session_scope(deps.session_factory) as session:
             try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
                 summaries = service.list_workflows(
                     session,
                     tags=tags,
                     risk=risk,
                     side_effects=side_effects,
-                    principal_id=_resolve_principal_id(deps),
+                    principal_id=principal_id,
                     enable_v2=deps.enable_v2,
+                    environment=environment,
+                    limit=limit,
+                    cursor=cursor,
                 )
                 snapshot = service.get_active_snapshot(session)
             except OperatorError as exc:
                 return _error_result(exc)
-        return {
+        result = {
             "workflows": [s.model_dump(mode="json") for s in summaries],
             "registry_snapshot": snapshot.content_hash if snapshot else None,
             "count": len(summaries),
         }
+        if deps.enable_v2:
+            result["environment"] = resolved_environment_id
+            result["next_cursor"] = summaries[-1].workflow_id if len(summaries) == limit else None
+        return result
 
     return _build_tool(
         name="list_workflows",
@@ -231,23 +297,31 @@ def _make_list_workflows(deps: ToolDeps) -> Tool:
 
 class DescribeWorkflowArgs(_ToolArgs):
     workflow_id: str
+    environment: str | None = None
 
 
 def _make_describe_workflow(deps: ToolDeps) -> Tool:
-    async def handler(workflow_id: str) -> dict[str, Any]:
+    async def handler(workflow_id: str, environment: str | None = None) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
         with session_scope(deps.session_factory) as session:
             try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
                 detail = service.describe_workflow(
                     session,
                     workflow_id=workflow_id,
-                    principal_id=_resolve_principal_id(deps),
+                    principal_id=principal_id,
                     enable_v2=deps.enable_v2,
+                    environment=environment,
                 )
                 snapshot = service.get_active_snapshot(session)
             except OperatorError as exc:
                 return _error_result(exc)
         shaped = detail.model_dump(mode="json")
         shaped["registry_snapshot"] = snapshot.content_hash if snapshot else None
+        if deps.enable_v2:
+            shaped["environment"] = resolved_environment_id
         return shaped
 
     return _build_tool(
@@ -269,24 +343,36 @@ def _make_describe_workflow(deps: ToolDeps) -> Tool:
 
 
 class GetInstanceHealthArgs(_ToolArgs):
-    pass
+    environment: str | None = None
 
 
 def _make_get_instance_health(deps: ToolDeps) -> Tool:
-    async def handler() -> dict[str, Any]:
-        result = service.get_instance_health(deps.health)
-        if not result.reachable:
-            return {
-                "reachable": False,
-                "reason": result.reason,
+    async def handler(environment: str | None = None) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        resolved_environment_id: str | None = None
+        if deps.enable_v2:
+            with session_scope(deps.session_factory) as session:
+                try:
+                    resolved_environment_id = _resolved_environment_id(
+                        deps, session, principal_id=principal_id, environment=environment
+                    )
+                except OperatorError as exc:
+                    return _error_result(exc)
+        _, health_port, _ = _adapters_for(deps, resolved_environment_id)
+        result = service.get_instance_health(health_port)
+        shaped: dict[str, Any] = (
+            {"reachable": False, "reason": result.reason, "checked_at": _iso(result.checked_at)}
+            if not result.reachable
+            else {
+                "reachable": True,
+                "n8n_version": result.n8n_version,
+                "latency_ms": result.latency_ms,
                 "checked_at": _iso(result.checked_at),
             }
-        return {
-            "reachable": True,
-            "n8n_version": result.n8n_version,
-            "latency_ms": result.latency_ms,
-            "checked_at": _iso(result.checked_at),
-        }
+        )
+        if deps.enable_v2:
+            shaped["environment"] = resolved_environment_id
+        return shaped
 
     return _build_tool(
         name="get_instance_health",
@@ -308,22 +394,33 @@ def _make_get_instance_health(deps: ToolDeps) -> Tool:
 class ValidateInputArgs(_ToolArgs):
     workflow_id: str
     arguments: dict[str, Any]
+    environment: str | None = None
 
 
 def _make_validate_input(deps: ToolDeps) -> Tool:
-    async def handler(workflow_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def handler(
+        workflow_id: str, arguments: dict[str, Any], environment: str | None = None
+    ) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
         with session_scope(deps.session_factory) as session:
             try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
                 errors = service.validate_input(
                     session,
                     workflow_id=workflow_id,
                     arguments=arguments,
-                    principal_id=_resolve_principal_id(deps),
+                    principal_id=principal_id,
                     enable_v2=deps.enable_v2,
+                    environment=environment,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
-        return {"valid": not errors, "errors": [e.to_dict() for e in errors]}
+        result: dict[str, Any] = {"valid": not errors, "errors": [e.to_dict() for e in errors]}
+        if deps.enable_v2:
+            result["environment"] = resolved_environment_id
+        return result
 
     return _build_tool(
         name="validate_input",
@@ -345,26 +442,36 @@ def _make_validate_input(deps: ToolDeps) -> Tool:
 
 class PreflightWorkflowArgs(_ToolArgs):
     workflow_id: str
+    environment: str | None = None
 
 
 def _make_preflight_workflow(deps: ToolDeps) -> Tool:
-    async def handler(workflow_id: str) -> dict[str, Any]:
+    async def handler(workflow_id: str, environment: str | None = None) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
         with session_scope(deps.session_factory) as session:
             try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
+                preflight_port, _, _ = _adapters_for(deps, resolved_environment_id)
                 result = service.preflight_workflow(
                     session,
                     workflow_id=workflow_id,
-                    preflight=deps.preflight,
-                    principal_id=_resolve_principal_id(deps),
+                    preflight=preflight_port,
+                    principal_id=principal_id,
                     enable_v2=deps.enable_v2,
+                    environment=environment,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
-        return {
+        shaped: dict[str, Any] = {
             "ready": result.ready,
             "checks": [c.model_dump(mode="json") for c in result.checks],
             "checked_at": _iso(result.checked_at),
         }
+        if deps.enable_v2:
+            shaped["environment"] = resolved_environment_id
+        return shaped
 
     return _build_tool(
         name="preflight_workflow",
@@ -389,6 +496,7 @@ class PrepareOperationArgs(_ToolArgs):
     arguments: dict[str, Any]
     idempotency_key: str | None = None
     reason: str | None = None
+    environment: str | None = None
 
 
 def _shape_prepare_result(
@@ -402,24 +510,25 @@ def _shape_prepare_result(
     created_at: str | None,
     approval_expires_at: str | None,
     execution_deadline: str | None,
+    environment: str | None,
     deps: ToolDeps,
 ) -> dict[str, Any]:
     if state == "INVALID":
-        return {
+        result: dict[str, Any] = {
             "operation_id": operation_id,
             "state": state,
             "workflow_id": workflow_id,
             "errors": detail.get("errors", []),
         }
-    if state == "BLOCKED":
-        return {
+    elif state == "BLOCKED":
+        result = {
             "operation_id": operation_id,
             "state": state,
             "workflow_id": workflow_id,
             "checks": detail.get("checks", []),
         }
-    if state == "APPROVED":
-        return {
+    elif state == "APPROVED":
+        result = {
             "operation_id": operation_id,
             "state": state,
             "workflow_id": workflow_id,
@@ -428,8 +537,8 @@ def _shape_prepare_result(
             "created_at": created_at,
             "idempotent_replay": idempotent_replay,
         }
-    if state == "PENDING_APPROVAL":
-        result: dict[str, Any] = {
+    elif state == "PENDING_APPROVAL":
+        result = {
             "operation_id": operation_id,
             "state": state,
             "workflow_id": workflow_id,
@@ -445,16 +554,19 @@ def _shape_prepare_result(
         }
         if deps.caller_is_local and approval_token is not None and deps.approval_base_url:
             result["approval_url"] = f"{deps.approval_base_url}/approve/{approval_token}"
-        return result
-    # Reachable only via an idempotent replay of an operation that has since moved on
-    # (e.g. EXPIRED, CANCELED) — not one of the four documented "fresh call" shapes,
-    # so it is reported minimally and honestly rather than forced into one of them.
-    return {
-        "operation_id": operation_id,
-        "state": state,
-        "workflow_id": workflow_id,
-        "idempotent_replay": idempotent_replay,
-    }
+    else:
+        # Reachable only via an idempotent replay of an operation that has since moved
+        # on (e.g. EXPIRED, CANCELED) — not one of the four documented "fresh call"
+        # shapes, so it is reported minimally and honestly rather than forced into one.
+        result = {
+            "operation_id": operation_id,
+            "state": state,
+            "workflow_id": workflow_id,
+            "idempotent_replay": idempotent_replay,
+        }
+    if deps.enable_v2:
+        result["environment"] = environment
+    return result
 
 
 def _make_prepare_operation(deps: ToolDeps) -> Tool:
@@ -463,16 +575,22 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
         arguments: dict[str, Any],
         idempotency_key: str | None = None,
         reason: str | None = None,
+        environment: str | None = None,
     ) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
         with session_scope(deps.session_factory) as session:
             try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
+                preflight_port, _, _ = _adapters_for(deps, resolved_environment_id)
                 operation, idempotent_replay, approval_token = service.prepare_operation(
                     session,
-                    principal_id=_resolve_principal_id(deps),
-                    environment=deps.environment,
+                    principal_id=principal_id,
+                    environment=environment if deps.enable_v2 else deps.environment,
                     workflow_id=workflow_id,
                     arguments=arguments,
-                    preflight=deps.preflight,
+                    preflight=preflight_port,
                     server_max_argument_bytes=deps.server_max_argument_bytes,
                     idempotency_key=idempotency_key,
                     reason=reason,
@@ -491,6 +609,11 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
             created_at=_iso(operation.created_at),
             approval_expires_at=_iso(operation.approval_expires_at),
             execution_deadline=_iso(operation.execution_deadline),
+            # In v2, `Operation.environment` is the resolved environment's own id (this
+            # module's `prepare_operation` docstring / core.service's own comment) — the
+            # same value an idempotent replay would have recorded originally, so this
+            # stays correct across a replay too, not just a fresh call.
+            environment=operation.environment if deps.enable_v2 else None,
             deps=deps,
         )
 
@@ -548,7 +671,7 @@ def _make_get_operation(deps: ToolDeps) -> Tool:
                 "decision": approval_row.decision,
                 "decided_at": _iso(approval_row.decided_at),
             }
-        return {
+        result: dict[str, Any] = {
             "operation_id": operation.id,
             "workflow_id": operation.workflow_id,
             "state": operation.state,
@@ -560,6 +683,9 @@ def _make_get_operation(deps: ToolDeps) -> Tool:
             "handle_used": operation.handle_burned_at is not None,
             "arguments": operation.arguments,
         }
+        if deps.enable_v2:
+            result["environment"] = operation.environment
+        return result
 
     return _build_tool(
         name="get_operation",
@@ -590,14 +716,34 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
         # SUCCEEDED/FAILED/UNKNOWN (steps 7-14) is a *separate* call, to a *separate*
         # use case (core.service.dispatch_operation) that manages its own transaction
         # pair around the network call — never inside the transaction above.
+        principal_id = _resolve_principal_id(deps)
+        # Resolved once, up front: this operation's own environment was fixed at
+        # `prepare_operation` time (`operation.environment` — a real environment id in
+        # v2, ``"default"`` in v1) and never changes, so the preflight/dispatch this
+        # call uses is that same environment's own instance, not whatever `environment`
+        # happened to resolve to on this particular call (there is no such argument
+        # here at all — the operation ID alone already pins it).
+        with session_scope(deps.session_factory) as session:
+            try:
+                pinned_operation = service.get_operation(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        pinned_environment_id = pinned_operation.environment if deps.enable_v2 else None
+        preflight_port, _, dispatch_port = _adapters_for(deps, pinned_environment_id)
+
         with session_scope(deps.session_factory) as session:
             try:
                 service.execute_operation(
                     session,
                     operation_id=operation_id,
                     handle=handle,
-                    principal_id=_resolve_principal_id(deps),
-                    preflight=deps.preflight,
+                    principal_id=principal_id,
+                    preflight=preflight_port,
                     enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
@@ -607,8 +753,8 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             operation = service.dispatch_operation(
                 deps.session_factory,
                 operation_id=operation_id,
-                principal_id=_resolve_principal_id(deps),
-                dispatch=deps.dispatch,
+                principal_id=principal_id,
+                dispatch=dispatch_port,
                 known_secrets=deps.known_secrets,
             )
         except OperatorError as exc:
@@ -625,7 +771,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             else:
                 correlation = {"available": False, "reason": "NO_EXECUTION_CORRELATION"}
             indeterminate = DispatchIndeterminateError()
-            return {
+            unknown_result: dict[str, Any] = {
                 "operation_id": operation.id,
                 "state": operation.state,
                 "code": indeterminate.code,
@@ -633,13 +779,16 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
                 "started_at": _iso(operation.updated_at),
                 "correlation": correlation,
             }
+            if deps.enable_v2:
+                unknown_result["environment"] = operation.environment
+            return unknown_result
 
         with session_scope(deps.session_factory) as session:
             try:
                 result = service.get_execution_result(
                     session,
                     operation_id=operation_id,
-                    principal_id=_resolve_principal_id(deps),
+                    principal_id=principal_id,
                     enable_v2=deps.enable_v2,
                 )
             except OperatorError as exc:
@@ -651,7 +800,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             duration_ms = int((result.finished_at - result.started_at).total_seconds() * 1000)
 
         if operation.state == "FAILED":
-            return {
+            failed_result: dict[str, Any] = {
                 "operation_id": operation.id,
                 "state": operation.state,
                 "started_at": _iso(result.started_at),
@@ -659,7 +808,10 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
                 "duration_ms": duration_ms,
                 "error": {**(result.error or {}), "truncated": truncated},
             }
-        return {
+            if deps.enable_v2:
+                failed_result["environment"] = operation.environment
+            return failed_result
+        succeeded_result: dict[str, Any] = {
             "operation_id": operation.id,
             "state": operation.state,
             "started_at": _iso(result.started_at),
@@ -667,6 +819,9 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             "duration_ms": duration_ms,
             "result": {**result.redacted_payload, "truncated": truncated},
         }
+        if deps.enable_v2:
+            succeeded_result["environment"] = operation.environment
+        return succeeded_result
 
     return _build_tool(
         name="execute_operation",
@@ -708,11 +863,14 @@ def _make_cancel_operation(deps: ToolDeps) -> Tool:
                 )
             except OperatorError as exc:
                 return _error_result(exc)
-        return {
+        result: dict[str, Any] = {
             "operation_id": operation.id,
             "state": operation.state,
             "canceled_at": _iso(operation.updated_at),
         }
+        if deps.enable_v2:
+            result["environment"] = operation.environment
+        return result
 
     return _build_tool(
         name="cancel_operation",
@@ -739,6 +897,7 @@ class ListOperationsArgs(_ToolArgs):
     since: str | None = None
     limit: int = Field(default=20, ge=1, le=100)
     cursor: str | None = None
+    environment: str | None = None
 
 
 def _make_list_operations(deps: ToolDeps) -> Tool:
@@ -748,6 +907,7 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
         since: str | None = None,
         limit: int = 20,
         cursor: str | None = None,
+        environment: str | None = None,
     ) -> dict[str, Any]:
         since_dt: datetime | None = None
         if since is not None:
@@ -765,7 +925,10 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
                 operations = service.list_operations(
                     session,
                     principal_id=_resolve_principal_id(deps),
-                    environment=deps.environment,
+                    # v1: the legacy exact-match filter, unchanged. v2: a real
+                    # environment argument, standard-resolved the same way every
+                    # other v2 tool resolves one (MCP_TOOLS.md section 5.9).
+                    environment=environment if deps.enable_v2 else deps.environment,
                     workflow_id=workflow_id,
                     states=state,
                     since=since_dt,
@@ -782,6 +945,7 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
                 "state": op.state,
                 "created_at": _iso(op.created_at),
                 "state_changed_at": _iso(op.updated_at),
+                **({"environment": op.environment} if deps.enable_v2 else {}),
             }
             for op in operations
         ]
@@ -829,13 +993,16 @@ def _make_get_execution_result(deps: ToolDeps) -> Tool:
                 return _error_result(exc)
             truncated = bool(_latest_event_detail(session, operation_id).get("truncated", False))
         if result.status == "error":
-            return {
+            error_result: dict[str, Any] = {
                 "operation_id": operation.id,
                 "state": operation.state,
                 "error": result.error,
                 "truncated": truncated,
             }
-        return {
+            if deps.enable_v2:
+                error_result["environment"] = operation.environment
+            return error_result
+        ok_result: dict[str, Any] = {
             "operation_id": operation.id,
             "state": operation.state,
             "status": result.status,
@@ -844,6 +1011,9 @@ def _make_get_execution_result(deps: ToolDeps) -> Tool:
             "result": result.redacted_payload,
             "truncated": truncated,
         }
+        if deps.enable_v2:
+            ok_result["environment"] = operation.environment
+        return ok_result
 
     return _build_tool(
         name="get_execution_result",
@@ -898,13 +1068,16 @@ def _make_get_execution_log(deps: ToolDeps) -> Tool:
         if workflow.output.include_node_trace and result.node_trace:
             nodes = result.node_trace.get("nodes", [])
             failed_node = result.node_trace.get("failed_node")
-        return {
+        log_result: dict[str, Any] = {
             "operation_id": operation.id,
             "state": operation.state,
             "nodes": nodes,
             "failed_node": failed_node,
             "truncated": truncated,
         }
+        if deps.enable_v2:
+            log_result["environment"] = operation.environment
+        return log_result
 
     return _build_tool(
         name="get_execution_log",
@@ -972,13 +1145,58 @@ def _make_whoami(deps: ToolDeps) -> Tool:
     )
 
 
+# ======================================================================================
+# list_environments (v2 — stage 04, MCP_TOOLS.md section 5.9)
+# ======================================================================================
+
+
+class ListEnvironmentsArgs(_ToolArgs):
+    pass
+
+
+def _make_list_environments(deps: ToolDeps) -> Tool:
+    async def handler() -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        with session_scope(deps.session_factory) as session:
+            try:
+                environments = service.list_environments(session, principal_id=principal_id)
+            except OperatorError as exc:
+                return _error_result(exc)
+        return {
+            "environments": [
+                {
+                    "environment_id": env.environment_id,
+                    "organization_id": env.organization_id,
+                    "name": env.name,
+                    "is_production": env.is_production,
+                    "archived": env.archived,
+                    "approval_policy_summary": env.approval_policy_summary,
+                }
+                for env in environments
+            ]
+        }
+
+    return _build_tool(
+        name="list_environments",
+        description=(
+            "Every environment visible to this caller, with a safe approval-policy "
+            "summary. No instance URL, workflow ID, or secret reference is ever "
+            "returned. The tool to call before naming an environment anywhere else."
+        ),
+        args_model=ListEnvironmentsArgs,
+        handler=handler,
+        annotations=_READ_ONLY,
+    )
+
+
 def build_tools(deps: ToolDeps) -> list[Tool]:
     """Every v1 tool, bound to ``deps`` — the list ``mcp/server.py`` hands to
     ``MCPServer(tools=...)``. Exactly BUILD_PLAN section 7.1's twelve; a contract test
     (``tests/contract/test_mcp_tool_inventory.py``) asserts this list's names against
-    that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2) is appended
-    as a thirteenth tool only when ``deps.enable_v2`` is set — v1's exact twelve-tool
-    surface (AC-23) is otherwise untouched."""
+    that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2) and
+    ``list_environments`` (stage 04) are appended, a thirteenth and fourteenth tool,
+    only when ``deps.enable_v2`` is set — v1's exact twelve-tool surface (AC-23) is
+    otherwise untouched."""
     tools = [
         _make_list_workflows(deps),
         _make_describe_workflow(deps),
@@ -995,4 +1213,5 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
     ]
     if deps.enable_v2:
         tools.append(_make_whoami(deps))
+        tools.append(_make_list_environments(deps))
     return tools

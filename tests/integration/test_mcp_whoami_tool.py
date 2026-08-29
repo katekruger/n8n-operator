@@ -107,7 +107,8 @@ async def test_whoami_is_the_thirteenth_tool_in_v2_mode(
     server = make_server(session_factory, principal_id=principal_id, enable_v2=True)
     names = {t.name for t in await server.list_tools()}
     assert "whoami" in names
-    assert len(names) == 13
+    assert "list_environments" in names
+    assert len(names) == 14
 
 
 @pytest.mark.integration

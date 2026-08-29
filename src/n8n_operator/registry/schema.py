@@ -315,7 +315,117 @@ class WorkflowDetail(BaseModel):
         )
 
 
+# --------------------------------------------------------------------------------------
+# Environment overlays (stage 04, ADR-016). One overlay document per environment,
+# authored the same way the base registry is (a YAML file, loaded through the same
+# read -> parse -> validate -> hash shape as `load_registry`), applied against the
+# *current* active base snapshot via `n8n-operator environment set-overlay`.
+#
+# An overlay may only adjust *how a workflow is reached and how strongly it is
+# gated* — never what it promises to do or accept (BUILD_PLAN section 8.3, ADR-016
+# section 1, rules R13/R14). There is deliberately no `input_schema`/`side_effects`/
+# `risk`/`title`/`description`/`tags` field on `WorkflowOverlayEntry` at all — R13 is
+# therefore enforced structurally by this model's own `extra="forbid"` shape for any
+# field name, not only for those six specifically; `registry/loader.py`'s R13
+# rule-check exists for the cross-entry checks a single model's shape can't express
+# (e.g. an overlay naming a `workflow_id` absent from the base registry).
+# --------------------------------------------------------------------------------------
+
+
+class WorkflowOverlayEntry(BaseModel):
+    """One workflow's environment-specific override (BUILD_PLAN section 8.3, ADR-016
+    section 1). Every field is optional; an unset field means "inherit the base entry
+    unchanged" — an environment with no overlay for a given workflow, or an overlay
+    that only touches `trigger_path`, leaves everything else exactly as the base
+    registry declares it.
+
+    ``approval_override`` may only ever be ``"required"`` (never ``"none"``) — the
+    Literal type itself makes "weaken toward `none`" a schema-validation failure, not
+    a semantic rule this module has to check (rule R14's approval half is therefore
+    structurally guaranteed here; only the `limits_override` numeric-direction half
+    needs an explicit rule-check in `registry/loader.py`).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workflow_id: str
+    n8n_workflow_id: str | None = None
+    definition_hash: str | None = None
+    trigger_path: str | None = None
+    trigger_secret_ref: str | None = None
+    approval_override: Literal["required"] | None = None
+    limits_override: dict[str, int] | None = None
+
+
+class EnvironmentOverlayMetadata(BaseModel):
+    """``metadata`` block: which environment this overlay document targets, for logs
+    and audit — the environment ID itself is supplied separately, by the CLI
+    invocation (``--env``), never trusted from inside the file (the same "identity is
+    never self-asserted" discipline applied to the file's own content)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    description: str | None = None
+
+
+class EnvironmentOverlayDocument(BaseModel):
+    """The whole overlay file — one per environment, structurally parallel to
+    :class:`RegistryDocument`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", populate_by_name=True)
+
+    api_version: str = Field(alias="apiVersion")
+    metadata: EnvironmentOverlayMetadata
+    overlays: list[WorkflowOverlayEntry] = Field(default_factory=list)
+
+
+def resolve_overlay(
+    base_entry: WorkflowEntry, overlay: WorkflowOverlayEntry | None
+) -> WorkflowEntry:
+    """The environment-resolved entry: ``base_entry`` (already resolved via
+    :func:`resolve_workflow_entry`) with ``overlay``'s fields applied on top,
+    field-by-field, wherever the overlay sets one. ``overlay=None`` returns
+    ``base_entry`` itself unchanged — "no overlay" and "an overlay that touches
+    nothing" are the same outcome by construction.
+
+    Applied straightforwardly (the overlay's value replaces the base's, never merged
+    or re-validated here) — the "strengthen-only" direction is enforced once, at
+    overlay *load* time (``registry/loader.py``'s R14 rule-check, against the base
+    entry active at that moment), not re-checked on every resolution. A later edit to
+    the *base* registry that would make an already-loaded overlay's value no longer a
+    strict strengthening relative to the *new* base is a known, accepted edge case —
+    see THREAT_MODEL.md's stage 04 delta.
+    """
+    if overlay is None:
+        return base_entry
+
+    resolved_trigger = base_entry.trigger
+    trigger_updates: dict[str, Any] = {}
+    if overlay.trigger_path is not None:
+        trigger_updates["path"] = overlay.trigger_path
+    if overlay.trigger_secret_ref is not None:
+        trigger_updates["secret_ref"] = overlay.trigger_secret_ref
+    if trigger_updates:
+        resolved_trigger = resolved_trigger.model_copy(update=trigger_updates)
+
+    resolved_limits = base_entry.limits
+    if overlay.limits_override:
+        resolved_limits = resolved_limits.model_copy(update=dict(overlay.limits_override))
+
+    updates: dict[str, Any] = {"trigger": resolved_trigger, "limits": resolved_limits}
+    if overlay.n8n_workflow_id is not None:
+        updates["n8n_workflow_id"] = overlay.n8n_workflow_id
+    if overlay.definition_hash is not None:
+        updates["definition_hash"] = overlay.definition_hash
+    if overlay.approval_override is not None:
+        updates["approval"] = overlay.approval_override
+    return base_entry.model_copy(update=updates)
+
+
 __all__ = [
+    "EnvironmentOverlayDocument",
+    "EnvironmentOverlayMetadata",
     "Limits",
     "Output",
     "RegistryDefaults",
@@ -326,6 +436,8 @@ __all__ = [
     "WorkflowDetailLimits",
     "WorkflowDetailOutput",
     "WorkflowEntry",
+    "WorkflowOverlayEntry",
     "WorkflowSummary",
+    "resolve_overlay",
     "resolve_workflow_entry",
 ]

@@ -40,6 +40,7 @@ from n8n_operator.mcp.resources import register_resources
 from n8n_operator.mcp.tools import ToolDeps, build_tools
 from n8n_operator.storage.models import OrganizationMembership
 from n8n_operator.storage.repository import (
+    EnvironmentRepository,
     OrganizationMembershipRepository,
     OrganizationRepository,
     PrincipalRepository,
@@ -55,11 +56,15 @@ _ALL_TOOLS = sorted({tool for tools in ROLE_CAPABILITIES.values() for tool in to
 
 
 def _membership(
-    *, roles: list[str], workflow_scope: str = "*", environment_scope: list[str] | None = None
+    *,
+    roles: list[str],
+    workflow_scope: str = "*",
+    environment_scope: list[str] | None = None,
+    organization_id: str = "o1",
 ) -> OrganizationMembership:
     return OrganizationMembership(
         principal_id="p1",
-        organization_id="o1",
+        organization_id=organization_id,
         roles=roles,
         workflow_scope=workflow_scope,
         environment_scope=environment_scope if environment_scope is not None else ["*"],
@@ -137,6 +142,26 @@ def test_narrowing_environment_scope_from_wildcard_never_increases_access(
     )
     if narrow_decision.allowed:
         assert wide_decision.allowed
+
+
+@given(role=st.sampled_from(_ALL_ROLES), tool_name=st.sampled_from(_ALL_TOOLS))
+def test_a_wildcard_environment_scope_never_authorizes_another_organizations_environment(
+    role: Role, tool_name: str
+) -> None:
+    """Stage 04's own closing of RR-13's "reachable but org-blind" gap: a membership's
+    ``environment_scope: ["*"]`` means "every environment in *this membership's own*
+    organization" (ADR-016 section 2), never "every environment ID anywhere" — a
+    membership in org A must never authorize an environment that in fact belongs to
+    org B, no matter how wide its own grant is."""
+    membership = _membership(roles=[role], environment_scope=["*"], organization_id="org-a")
+    decision = evaluate(
+        memberships=[membership],
+        tool_name=tool_name,
+        workflow_id=None,
+        environment_id="env-owned-by-org-b",
+        environment_organization_id="org-b",
+    )
+    assert not decision.allowed
 
 
 def test_an_empty_membership_list_is_never_more_permissive_than_any_membership() -> None:
@@ -233,6 +258,12 @@ async def test_unauthorized_and_nonexistent_are_bitwise_identical_across_four_to
     with session_scope(session_factory) as session:
         service.reload_registry(session, registry_path, server_max_argument_bytes=262_144)
         org = OrganizationRepository(session).create(name="Acme")
+        EnvironmentRepository(session).create(
+            organization_id=org.id,
+            name="default",
+            n8n_base_url_ref="env:N8N_TEST_BASE_URL",
+            n8n_api_key_ref="env:N8N_TEST_API_KEY",
+        )
         authorized = PrincipalRepository(session).create(kind="user", display_name="Alice")
         unauthorized = PrincipalRepository(session).create(kind="user", display_name="Bob")
         OrganizationMembershipRepository(session).create(

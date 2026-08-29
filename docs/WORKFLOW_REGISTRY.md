@@ -385,6 +385,69 @@ Bump `version` whenever the registered contract changes: the schema, the hash, t
 class, the limits. It is the operator-facing changelog for an entry, and it appears in
 `list_workflows` and `describe_workflow` so a model can notice it changed.
 
+### 9.5 Multi-environment overlays
+
+A workflow's contract — its `input_schema`, `side_effects`, `risk`, `title`,
+`description`, `tags` — is the same everywhere it runs. What legitimately differs
+between a `staging` n8n instance and a `production` one is *where a call actually
+lands* and *how strict governance is about letting it land there*. An **overlay** is a
+separate, per-environment file that adjusts exactly those things, on top of the one
+base registry every environment shares (ADR-016).
+
+**What an overlay may touch, and nothing else:**
+
+- `n8n_workflow_id`, `definition_hash` — this environment's own instance may host the
+  workflow under a different internal ID or a different (equally valid) build.
+- `trigger.path`, `trigger.secret_ref` — a different webhook path or credential per
+  instance.
+- `approval_override: required` — require a human's approval here even when the base
+  registry allows `approval: none`. There is no way to write the opposite: the schema
+  simply has no `approval_override: none`.
+- `limits_override` — tighten (never loosen) `execution_ttl_seconds`,
+  `timeout_seconds`, `max_concurrent`, `rate_limit_per_minute`, `max_argument_bytes`
+  (lower only), or `approval_ttl_seconds` (raise only — more deliberation time is the
+  safer direction for that one field). A base value of `null` (no ceiling configured)
+  can be set to any concrete value by an overlay; there is nothing to weaken.
+
+Nothing else is possible: `input_schema`/`side_effects`/`risk`/`title`/`description`/
+`tags` have no field on the overlay schema to even name, and setting an unknown key or
+naming a `workflow_id` the base registry doesn't have is a load-time failure (rule
+R13), the same all-or-nothing discipline `registry validate` already applies to the
+base file. Attempting to weaken anything — raising a lower-only limit, lowering
+`approval_ttl_seconds` — is rule R14 and also fails to load.
+
+**Example.** `examples/environments/` ships three annotated files:
+
+- `development.yaml` — an empty `overlays: []`. Development is the environment
+  closest to the base registry's own policy, so most workflows need no override at
+  all — that is the normal case, not a gap to fill in.
+- `staging.yaml` — adds a `rate_limit_per_minute` the base registry never set, so a
+  real, but lower-volume, load pattern can be exercised before production.
+- `production.yaml` — requires approval for a workflow the base registry auto-approves
+  (`reports.pipeline_summary`), and halves staging's own rate ceiling — a GTM engineer
+  who validated a call in staging prepares the production equivalent under a real
+  human approval gate and a tighter limit, deliberately harder to run by accident
+  (ARCHITECTURE.md section 11.1).
+
+**Validating and loading:**
+
+```bash
+n8n-operator environment validate-overlay <environment-id> --path ./staging.yaml
+n8n-operator environment reload-overlay <environment-id> --path ./staging.yaml
+```
+
+`reload-overlay` replaces the full set of overlays that environment has: a workflow
+overlaid before but no longer named in the file is no longer overridden, not silently
+left with a stale prior override. Resolution of the merged (base + overlay) contract
+happens live, at the moment each operation is prepared or executed — the same
+snapshot-plus-live-check discipline the base registry's own drift detection already
+uses — so a later overlay edit is picked up by the next call, never retroactively
+rewriting what an already-prepared operation was actually governed by.
+
+`n8n-operator environment registry-diff <environment-id> --path ./workflows.yaml`
+shows, per workflow, exactly what this environment's resolved contract changes versus
+the base — the fields an overlay may ever touch, and nothing else.
+
 ---
 
 ## 10. Authoring checklist

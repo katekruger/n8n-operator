@@ -141,6 +141,47 @@ class WorkflowDisabledError(DomainError):
     default_message = "This workflow is registered but disabled (enabled: false)."
 
 
+class EnvironmentNotFoundError(DomainError):
+    """Stage 04 (ADR-016). Identical whether ``environment`` names a nonexistent ID or
+    one the caller is not authorized to see — no enumeration oracle across the
+    organization boundary (ADR-015 section 3), the same discipline
+    ``WorkflowNotFoundError`` already applies to workflow IDs."""
+
+    code = "ENVIRONMENT_NOT_FOUND"
+    retryable = False
+    remediation = "Call list_environments."
+    default_message = (
+        "No such environment visible to this caller. This is returned identically "
+        "whether the ID does not exist or the caller is not authorized to see it."
+    )
+
+
+class EnvironmentRequiredError(DomainError):
+    """Stage 04 (ADR-016 section 3). Raised the instant a caller's resolved
+    organization has more than one non-archived environment and ``environment`` was
+    omitted — never a silent default, even when only one environment is
+    ``is_production``."""
+
+    code = "ENVIRONMENT_REQUIRED"
+    retryable = False
+    remediation = "Call list_environments; name one explicitly."
+    default_message = (
+        "More than one environment is visible; `environment` must be named explicitly."
+    )
+
+
+class EnvironmentArchivedError(DomainError):
+    """Stage 04 (ADR-016 section 4). Raised only by a state-changing call
+    (``prepare_operation``, ``execute_operation``) against an archived environment —
+    every read tool still resolves an archived environment normally, since historical
+    operations must stay readable."""
+
+    code = "ENVIRONMENT_ARCHIVED"
+    retryable = False
+    remediation = "Ask the operator; use a live environment for new work."
+    default_message = "This environment is archived; no new work may target it."
+
+
 class InvalidArgumentsError(DomainError):
     code = "INVALID_ARGUMENTS"
     retryable = False
@@ -437,6 +478,9 @@ TAXONOMY: dict[str, type[OperatorError]] = {
     for cls in (
         WorkflowNotFoundError,
         WorkflowDisabledError,
+        EnvironmentNotFoundError,
+        EnvironmentRequiredError,
+        EnvironmentArchivedError,
         InvalidArgumentsError,
         IdempotencyConflictError,
         ArgumentsTooLargeError,
@@ -461,9 +505,11 @@ TAXONOMY: dict[str, type[OperatorError]] = {
         InternalError,
     )
 }
-"""Exactly the 24 codes in MCP_TOOLS.md section 4 — verified by a contract test that
-parses that table and asserts this dict's keys match it exactly, and that each class's
-``remediation`` matches the table's "Model's correct next move" column verbatim."""
+"""24 original v1 codes plus the 3 environment codes stage 04 adds (the first
+``*(v2)*``-marked MCP_TOOLS.md rows to gain an implementation) — verified by a
+contract test that parses that table and asserts this dict's keys are a subset of it,
+and that each implemented class's ``remediation`` matches the table's "Model's correct
+next move" column verbatim."""
 
 __all__ = [
     "TAXONOMY",
@@ -479,6 +525,9 @@ __all__ = [
     "DefinitionDriftError",
     "DispatchIndeterminateError",
     "DomainError",
+    "EnvironmentArchivedError",
+    "EnvironmentNotFoundError",
+    "EnvironmentRequiredError",
     "HandleAlreadyUsedError",
     "HandleInvalidError",
     "IdempotencyConflictError",

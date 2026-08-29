@@ -191,8 +191,25 @@ def workflow_scope_to_sql_like(pattern: str) -> str:
 
 
 def _environment_scope_satisfied(
-    membership: OrganizationMembership, environment_id: str | None
+    membership: OrganizationMembership,
+    environment_id: str | None,
+    environment_organization_id: str | None,
 ) -> bool:
+    """``membership.environment_scope`` never means "any environment ID anywhere" —
+    even ``["*"]`` means "every environment *in this membership's own organization*"
+    (ADR-016 section 2: an environment belongs to exactly one organization). A
+    membership in an organization that does not own ``environment_id`` at all can
+    never satisfy this conjunct, regardless of its own ``environment_scope`` value —
+    checked first, before the scope pattern itself, so a caller with a wildcard grant
+    in an unrelated organization is refused the same way a caller with no grant at all
+    would be, not silently authorized by an org boundary neither field encodes on its
+    own (Stage 04, closing RR-13's own "reachable but org-blind" gap)."""
+    if (
+        environment_id is not None
+        and environment_organization_id is not None
+        and membership.organization_id != environment_organization_id
+    ):
+        return False
     scope = membership.environment_scope
     if environment_id is None:
         # No v1 tool call carries an environment yet — only an unscoped ("all
@@ -208,6 +225,7 @@ def evaluate(
     tool_name: str,
     workflow_id: str | None,
     environment_id: str | None = None,
+    environment_organization_id: str | None = None,
     requester_principal_id: str | None = None,
     decider_principal_id: str | None = None,
 ) -> AuthorizationDecision:
@@ -217,6 +235,17 @@ def evaluate(
     decision — no database access here, so a disabled principal or a removed
     membership never reaches this function at all (checked live, upstream, exactly as
     Stage 02 already does for identity — never cached, never re-derived here).
+
+    ``environment_organization_id`` — the organization ``environment_id`` actually
+    belongs to (resolved by the caller, e.g. ``core.identity.resolve_environment`` or
+    an ``EnvironmentRepository`` lookup) — is what makes a membership's own
+    ``environment_scope`` mean anything at all: without it, a membership in an
+    unrelated organization whose grant happens to be ``["*"]`` would satisfy *any*
+    ``environment_id`` from *any* organization (see ``_environment_scope_satisfied``).
+    Every real call site that has a resolved ``environment_id`` also has this value
+    available; omitting it (``None``) is only correct when ``environment_id`` is also
+    ``None``, or in a synthetic property test that isn't modeling the organization
+    boundary at all.
 
     ``requester_principal_id``/``decider_principal_id``, when both given (the
     approve/reject path only), implement the self-decision rule: a principal may never
@@ -250,7 +279,9 @@ def evaluate(
             continue
         saw_workflow_scope = True
 
-        if not _environment_scope_satisfied(membership, environment_id):
+        if not _environment_scope_satisfied(
+            membership, environment_id, environment_organization_id
+        ):
             continue
 
         return _ALLOWED

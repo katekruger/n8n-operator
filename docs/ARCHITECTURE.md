@@ -153,6 +153,14 @@ makes boundary B5 testable as a property rather than a review checklist.
 ```
 client → mcp/tools.prepare_operation
        → core.service.prepare_operation
+           0. resolve `environment` (v2 only)                       ─ ADR-016 §3
+              ├ omitted + exactly one non-archived environment visible → implicit
+              ├ omitted + zero or two-or-more visible → ENVIRONMENT_REQUIRED
+              │  (production is never an implicit default)
+              └ named + not visible (nonexistent or unauthorized)   → ENVIRONMENT_NOT_FOUND
+              archived + this is a *new* prepare                    → ENVIRONMENT_ARCHIVED
+              role/workflow/environment-scope check, this environment's own org  ─ ADR-015 · T-54
+              apply this environment's overlay (base entry ⇒ merged entry)        ─ ADR-016 §1
            1. resolve workflow_id in the active registry snapshot   ─ ADR-002
               └ miss → WORKFLOW_NOT_FOUND (no operation created)
            2. canonicalize arguments; size check vs effective limit  ─ ADR-011 · I10 · B12

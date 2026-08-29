@@ -1,0 +1,33 @@
+# n8n Operator — example environment overlay: development
+#
+# An environment overlay adjusts only how a workflow reaches n8n and how strict its
+# governance is *in this one environment* — never its contract. Only these fields may
+# ever appear under an overlay entry: `n8n_workflow_id`, `definition_hash`,
+# `trigger.path`/`trigger.secret_ref`, `approval_override`, `limits_override`
+# (ADR-016 rule R13). `input_schema`, `side_effects`, `risk`, `title`, `description`,
+# and `tags` have no field on this model to even name — a workflow's contract is the
+# same everywhere it runs.
+#
+# `approval_override`/`limits_override` may only *strengthen* the base registry's own
+# policy, never weaken it (rule R14): `approval_override: required` against a base of
+# `none` is allowed; there is no way to express the reverse, by construction (the
+# schema has no `approval_override: none`).
+#
+# Validate before loading:
+#     n8n-operator environment validate-overlay <environment-id> \
+#         --path examples/environments/development.yaml
+#
+# This file has an empty `overlays` list on purpose: development is the environment
+# closest to the base registry's own default policy, so there is nothing here that
+# needs to be stricter than what the base registry already says. A workflow absent
+# from this file simply inherits its base contract unchanged — that is the normal,
+# expected case for most workflows in most environments, not a gap to fill in.
+
+apiVersion: n8n-operator/v1
+
+metadata:
+  name: development
+  description: >
+    No overrides — every workflow behaves exactly as the base registry describes it.
+
+overlays: []
