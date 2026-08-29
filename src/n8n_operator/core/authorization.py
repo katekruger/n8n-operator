@@ -49,6 +49,7 @@ from n8n_operator.storage.models import OrganizationMembership
 
 __all__ = [
     "APPROVE_REJECT_CAPABILITY",
+    "RECONCILE_CAPABILITY",
     "ROLE_CAPABILITIES",
     "VALID_ROLES",
     "AuthorizationDecision",
@@ -98,6 +99,12 @@ _READ_ONLY_TOOLS = frozenset(
 # a second, parallel check function. Internal-only name, never a tool a client can call.
 APPROVE_REJECT_CAPABILITY = "approve_reject_operation"
 
+# Stage 06 (ADR-009/ADR-012): recording reconciliation evidence for an `UNKNOWN`
+# operation is a human-confirmed, CLI-only act — no MCP tool reaches it, exactly like
+# APPROVE_REJECT_CAPABILITY above, and for the same reason (boundary B4's spirit
+# extended: an agent must never be the one asserting "I confirmed this externally").
+RECONCILE_CAPABILITY = "reconcile_operation"
+
 ROLE_CAPABILITIES: dict[Role, frozenset[str]] = {
     "viewer": frozenset(_READ_ONLY_TOOLS),
     "operator": frozenset(
@@ -114,6 +121,7 @@ ROLE_CAPABILITIES: dict[Role, frozenset[str]] = {
             "request_approval",
             "retry_operation",
             APPROVE_REJECT_CAPABILITY,
+            RECONCILE_CAPABILITY,
         }
     ),
 }

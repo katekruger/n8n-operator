@@ -39,6 +39,7 @@ __all__ = [
     "DispatchOutcome",
     "Environment",
     "EnvironmentSummary",
+    "ExecutionLookup",
     "ExecutionResult",
     "HealthCheckResult",
     "NotificationEvent",
@@ -47,6 +48,7 @@ __all__ = [
     "PreflightCheck",
     "PreflightResult",
     "Principal",
+    "ReconciliationRecord",
     "RequestApprovalResult",
     "WorkflowContract",
 ]
@@ -224,6 +226,7 @@ class ApprovalDecisionContext(BaseModel):
     quorum_count: int = 1
     decisions: list[ApprovalDecisionEntry] = []
     outstanding_approvers: list[str] = []
+    parent_operation_id: str | None = None
 
 
 class RequestApprovalResult(BaseModel):
@@ -392,3 +395,37 @@ class DeliveryReceipt(BaseModel):
     attempts: int
     status: Literal["delivered", "pending", "failed"]
     detail: str | None = None
+
+
+class ExecutionLookup(BaseModel):
+    """What ``core.service.ReconciliationPort.get_execution`` returns — the exact,
+    narrow shape ``reconcile_operation`` needs to verify exact-ID reconciliation
+    evidence (ADR-009), converted from ``n8n.types.ExecutionSummary`` by the
+    composition root (stage 06's own instance of the ``_PreflightAdapter``/
+    ``_HealthAdapter``/``_DispatchAdapter`` pattern — ``core/`` never imports an
+    ``n8n/`` type directly). Never the full n8n execution detail — no ``runData``,
+    no per-node anything; just enough to confirm *which* n8n workflow actually ran and
+    what its outcome was."""
+
+    model_config = ConfigDict(frozen=True)
+
+    execution_id: str
+    n8n_workflow_id: str
+    status: str
+
+
+class ReconciliationRecord(BaseModel):
+    """One recorded reconciliation annotation (stage 06, ADR-009/ADR-012) — an
+    ``audit_log`` entry, never a state transition; ``UNKNOWN`` keeps no outgoing edge
+    (invariant I7). Echoed back by ``reconcile_operation`` and listed by
+    ``list_reconciliation_events``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation_id: str
+    execution_id: str
+    n8n_workflow_id: str
+    n8n_execution_status: str
+    note: str
+    actor: str
+    recorded_at: datetime

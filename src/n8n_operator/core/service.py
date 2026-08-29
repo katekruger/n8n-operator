@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.audit import writer as audit_writer
@@ -53,11 +54,13 @@ from n8n_operator.core.models import (
     DeliveryReceipt,
     DispatchOutcome,
     EnvironmentSummary,
+    ExecutionLookup,
     ExecutionResult,
     HealthCheckResult,
     NotificationEvent,
     Operation,
     PreflightResult,
+    ReconciliationRecord,
     RequestApprovalResult,
     WorkflowContract,
 )
@@ -83,10 +86,13 @@ from n8n_operator.errors import (
     OperationCanceledError,
     OperationExpiredError,
     OperationNotFoundError,
+    OperatorError,
     OptimisticLockError,
     RateLimitedError,
+    ReconciliationNotApplicableError,
     RegistryUnavailableError,
     ResultNotAvailableError,
+    RetryNotApplicableError,
     WorkflowDisabledError,
     WorkflowInactiveError,
     WorkflowMissingOnInstanceError,
@@ -124,10 +130,12 @@ from n8n_operator.storage.session import session_scope
 _logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MAX_RETRY_CHAIN_DEPTH",
     "DispatchPort",
     "HealthPort",
     "NotificationSink",
     "PreflightPort",
+    "ReconciliationPort",
     "approve_operation",
     "cancel_operation",
     "describe_workflow",
@@ -142,15 +150,18 @@ __all__ = [
     "get_instance_health",
     "get_operation",
     "list_operations",
+    "list_reconciliation_events",
     "list_workflows",
     "preflight_workflow",
     "prepare_operation",
+    "reconcile_operation",
     "record_execution_outcome",
     "reject_operation",
     "reload_registry",
     "request_approval",
     "resolve_approval_token",
     "retry_failed_notifications",
+    "retry_operation",
     "validate_input",
     "validate_registry",
     "verify_audit_chain",
@@ -201,6 +212,20 @@ class DispatchPort(Protocol):
     ) -> DispatchOutcome: ...
 
     def fetch_node_trace(self, execution_id: str) -> dict[str, Any] | None: ...
+
+
+class ReconciliationPort(Protocol):
+    """What ``reconcile_operation`` needs from an n8n execution lookup (stage 06,
+    ADR-009). Same seam as :class:`PreflightPort`/:class:`HealthPort`/
+    :class:`DispatchPort` — the composition root (the ``operations reconcile record``
+    CLI command, this stage's own composition root, mirroring
+    ``cli/commands/health.py``'s ``_CliHealthAdapter``) injects a real
+    ``n8n.client.N8nClient``-backed adapter; tests inject a fake. Deliberately the
+    narrowest possible read: exact-ID lookup only, never a search or a listing — this
+    port cannot itself become a heuristic-matching mechanism (ADR-009's own rejected
+    alternative)."""
+
+    def get_execution(self, execution_id: str) -> ExecutionLookup: ...
 
 
 class NotificationSink(Protocol):
@@ -1078,6 +1103,15 @@ def get_instance_health(health: HealthPort) -> HealthCheckResult:
 # ----------------------------------------------------------------------------------
 
 
+MAX_RETRY_CHAIN_DEPTH = 10
+"""Stage 06 (ADR-012 section 1): the deepest a retry-of-a-retry-of-a-retry chain may
+grow. A cycle is structurally impossible (a child's ``parent_operation_id`` always
+names an operation that already existed when the child was created, and is never
+mutated afterward — the lineage graph is a DAG by construction), but nothing else
+bounds how many times a chain can be extended; unbounded growth is the concern this
+constant exists to cap, not a cycle (relevant to threat L-04, retry storms)."""
+
+
 def prepare_operation(
     session: Session,
     *,
@@ -1110,6 +1144,11 @@ def prepare_operation(
     interpret the request at all (``WORKFLOW_NOT_FOUND``, ``WORKFLOW_DISABLED``,
     ``IDEMPOTENCY_CONFLICT``) or a refusal to record it (``ARGUMENTS_TOO_LARGE``)
     raises — and in both cases the returned token is necessarily ``None``.
+
+    Stage 06: everything from workflow/environment resolution onward is shared with
+    :func:`retry_operation` via :func:`_prepare_or_retry` — this function's own job is
+    only to resolve *its own* ``workflow_id``/``environment`` arguments (a retry
+    resolves the parent's instead) before delegating.
     """
     snapshot = _require_active_snapshot(session)
     document = RegistryDocument.model_validate(snapshot.document)
@@ -1136,6 +1175,46 @@ def prepare_operation(
         else (environment if environment is not None else "default")
     )
 
+    return _prepare_or_retry(
+        session,
+        principal_id=principal_id,
+        workflow_id=workflow_id,
+        arguments=arguments,
+        environment_value=environment_value,
+        resolved_environment_id=resolved_environment_id,
+        entry=entry,
+        snapshot=snapshot,
+        preflight=preflight,
+        server_max_argument_bytes=server_max_argument_bytes,
+        idempotency_key=idempotency_key,
+        reason=reason,
+        enable_v2=enable_v2,
+    )
+
+
+def _prepare_or_retry(
+    session: Session,
+    *,
+    principal_id: str,
+    workflow_id: str,
+    arguments: dict[str, Any],
+    environment_value: str,
+    resolved_environment_id: str | None,
+    entry: WorkflowEntry,
+    snapshot: RegistrySnapshot,
+    preflight: PreflightPort,
+    server_max_argument_bytes: int,
+    idempotency_key: str | None,
+    reason: str | None,
+    enable_v2: bool,
+    parent_operation_id: str | None = None,
+) -> tuple[Operation, bool, str | None]:
+    """The shared body of :func:`prepare_operation` and :func:`retry_operation` —
+    argument-size/rate-limit checks, idempotency, creation, validation, preflight, and
+    approval-or-auto-approve — parameterized only by whether this new operation has a
+    parent. See :func:`prepare_operation`'s own docstring for the full return-shape
+    and result-vs-exception contract; nothing about that contract differs by caller.
+    """
     canonical_bytes = canonicalize_arguments(arguments)
     fingerprint = fingerprint_arguments(canonical_bytes)
     effective_limit = entry.limits.max_argument_bytes or server_max_argument_bytes
@@ -1175,12 +1254,24 @@ def prepare_operation(
         session.commit()
         raise
 
-    if idempotency_key is not None:
+    # A retry's idempotency key is scoped additionally to its parent (MCP_TOOLS.md
+    # section 5.5) by folding the parent's ID into the *stored* key value itself —
+    # never into the unique constraint's own columns (see `storage/models.py`'s
+    # `Operation` docstring for why widening the constraint with a nullable column
+    # would have been wrong). Internal only: never echoed back to any caller, since
+    # `idempotency_key` is not itself part of any read result today.
+    namespaced_idempotency_key = (
+        f"retry:{parent_operation_id}:{idempotency_key}"
+        if idempotency_key is not None and parent_operation_id is not None
+        else idempotency_key
+    )
+
+    if namespaced_idempotency_key is not None:
         existing = op_repo.find_by_idempotency(
             principal_id=principal_id,
             environment=environment_value,
             workflow_id=workflow_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=namespaced_idempotency_key,
         )
         resolution = resolve_idempotency(
             existing_fingerprint=existing.argument_fingerprint if existing else None,
@@ -1198,28 +1289,53 @@ def prepare_operation(
         resolved_organization_id = resolved_environment_row.organization_id
 
     handle = mint_operation_handle()
-    operation = op_repo.create(
-        id=handle,
-        principal_id=principal_id,
-        environment=environment_value,
-        environment_id=resolved_environment_id,
-        organization_id=resolved_organization_id,
-        snapshot_id=snapshot.id,
-        workflow_id=workflow_id,
-        definition_hash=entry.definition_hash,
-        state="PREPARING",
-        # Raw, not redacted: phase 7's dispatch needs the real values (redacting the
-        # email before sending it to n8n would break the workflow), and the
-        # fingerprint re-verified at execute time (`execute_operation`) is computed
-        # over these same raw arguments, matching the one taken at prepare time
-        # (invariant I5). Redaction happens at the *read* boundary instead — wherever
-        # arguments are echoed to a caller (`get_operation`, `get_approval_decision_
-        # context`) — never at rest.
-        arguments=arguments,
-        argument_fingerprint=fingerprint,
-        argument_bytes=len(canonical_bytes),
-        idempotency_key=idempotency_key,
-    )
+    try:
+        operation = op_repo.create(
+            id=handle,
+            principal_id=principal_id,
+            environment=environment_value,
+            environment_id=resolved_environment_id,
+            organization_id=resolved_organization_id,
+            snapshot_id=snapshot.id,
+            workflow_id=workflow_id,
+            definition_hash=entry.definition_hash,
+            state="PREPARING",
+            # Raw, not redacted: phase 7's dispatch needs the real values (redacting
+            # the email before sending it to n8n would break the workflow), and the
+            # fingerprint re-verified at execute time (`execute_operation`) is
+            # computed over these same raw arguments, matching the one taken at
+            # prepare time (invariant I5). Redaction happens at the *read* boundary
+            # instead — wherever arguments are echoed to a caller (`get_operation`,
+            # `get_approval_decision_context`) — never at rest.
+            arguments=arguments,
+            argument_fingerprint=fingerprint,
+            argument_bytes=len(canonical_bytes),
+            idempotency_key=namespaced_idempotency_key,
+            parent_operation_id=parent_operation_id,
+        )
+    except IntegrityError:
+        # AC-50's concurrent-retry race: two callers with the same idempotency key
+        # (and, for a retry, the same parent — already folded into
+        # `namespaced_idempotency_key` above) both passed the SELECT above because
+        # neither had committed yet. Nothing else has been written in this
+        # transaction — the checks above are all reads — so a plain rollback is safe;
+        # a fresh lookup now sees whichever caller's INSERT actually won and returns
+        # it as a replay, exactly like the pre-existing SELECT-hit path above does.
+        # Only reachable with a real key: a `None` key never round-trips through the
+        # unique constraint at all (NULL is never equal to NULL there either).
+        if namespaced_idempotency_key is None:
+            raise
+        session.rollback()
+        existing = op_repo.find_by_idempotency(
+            principal_id=principal_id,
+            environment=environment_value,
+            workflow_id=workflow_id,
+            idempotency_key=namespaced_idempotency_key,
+        )
+        assert existing is not None  # the constraint that just fired names this exact row
+        existing = _apply_lazy_expiry(session, existing)
+        return _to_domain(existing), True, None
+
     _record_creation(
         session, operation, actor=principal_id, detail={"reason": reason} if reason else {}
     )
@@ -1311,6 +1427,213 @@ def prepare_operation(
             approval_token = minted.token
 
     return _to_domain(operation), False, approval_token
+
+
+def retry_operation(
+    session: Session,
+    *,
+    operation_id: str,
+    principal_id: str,
+    preflight: PreflightPort,
+    server_max_argument_bytes: int,
+    idempotency_key: str | None = None,
+    reason: str | None = None,
+    enable_v2: bool = False,
+) -> tuple[Operation, bool, str | None]:
+    """Governed retry (MCP_TOOLS.md section 5.5, ADR-005/ADR-012, invariant I11): a
+    brand-new operation, linked by ``parent_operation_id``, with its ``workflow_id``
+    and ``arguments`` taken from the parent (never from this call — there is no such
+    argument) but validation, preflight, and approval all recalculated from scratch
+    against whatever is current *now*. The parent is only ever read here — never
+    transitioned, never re-approved, never handed a new handle; its own row is
+    unreachable by anything this function does after step 1 below.
+
+    Returns the same ``(operation, idempotent_replay, approval_token)`` shape
+    :func:`prepare_operation` does. ``SUCCEEDED`` is never returned directly — a retry
+    that reaches ``APPROVED`` still needs its own ``execute_operation`` call, exactly
+    like any other operation.
+    """
+    parent = _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="retry_operation", enable_v2=enable_v2
+    )
+    parent = _apply_lazy_expiry(session, parent)
+    if parent.state not in {"FAILED", "UNKNOWN", "BLOCKED", "EXPIRED", "REJECTED"}:
+        raise RetryNotApplicableError(details={"parent_state": parent.state})
+
+    depth = 0
+    ancestor_id = parent.parent_operation_id
+    op_repo = OperationRepository(session)
+    while ancestor_id is not None:
+        depth += 1
+        if depth >= MAX_RETRY_CHAIN_DEPTH:
+            raise RetryNotApplicableError(
+                details={"reason": "chain_depth_exceeded", "limit": MAX_RETRY_CHAIN_DEPTH}
+            )
+        ancestor = op_repo.get(ancestor_id)
+        assert ancestor is not None  # parent_operation_id never names a deleted row
+        ancestor_id = ancestor.parent_operation_id
+
+    snapshot = _require_active_snapshot(session)
+    document = RegistryDocument.model_validate(snapshot.document)
+    entry = _require_enabled_entry(document, parent.workflow_id)
+    assert entry.approval is not None
+
+    resolved_environment_id, entry = _apply_environment(
+        session,
+        principal_id=principal_id,
+        environment=parent.environment_id,
+        workflow_id=parent.workflow_id,
+        base_entry=entry,
+        tool_name="retry_operation",
+        enable_v2=enable_v2,
+        forbid_archived=True,
+    )
+    environment_value = (
+        resolved_environment_id if resolved_environment_id is not None else parent.environment
+    )
+
+    return _prepare_or_retry(
+        session,
+        principal_id=principal_id,
+        workflow_id=parent.workflow_id,
+        arguments=parent.arguments,
+        environment_value=environment_value,
+        resolved_environment_id=resolved_environment_id,
+        entry=entry,
+        snapshot=snapshot,
+        preflight=preflight,
+        server_max_argument_bytes=server_max_argument_bytes,
+        idempotency_key=idempotency_key,
+        reason=reason,
+        enable_v2=enable_v2,
+        parent_operation_id=parent.id,
+    )
+
+
+_RECONCILIATION_ACTION = "operation.reconciliation_recorded"
+
+
+def reconcile_operation(
+    session: Session,
+    *,
+    operation_id: str,
+    principal_id: str,
+    execution_id: str,
+    note: str,
+    reconciliation: ReconciliationPort,
+    enable_v2: bool = False,
+) -> ReconciliationRecord:
+    """Record exact-ID reconciliation evidence for an ``UNKNOWN`` operation (stage 06,
+    ADR-009/ADR-012) — an ``audit_log`` annotation only, never a state transition;
+    ``operations.state`` is untouched by this function, before and after (invariant
+    I7 — ``UNKNOWN`` has no outgoing edge in ``state_machine.TRANSITIONS`` at all, and
+    this function never calls it). CLI-only: no MCP tool reaches this (boundary B4's
+    spirit — a human confirms external evidence, never an agent).
+
+    Unlike most gated use cases, this one does **not** use
+    :func:`_get_owned_operation_row`'s owner-sees-their-own-work shortcut: recording
+    reconciliation evidence is gated on :data:`authorization.RECONCILE_CAPABILITY`
+    (``admin`` only) regardless of who originally requested the operation — the
+    requester having prepared it is not, by itself, license to assert what n8n did
+    with it. v1 (``enable_v2=False``) keeps the ownership-only rule every other v1
+    path already has, since v1 has no role concept to gate by at all.
+    """
+    row = _get_operation_row(session, operation_id)
+    if enable_v2:
+        environment_organization_id: str | None = None
+        if row.environment_id is not None:
+            environment_row = EnvironmentRepository(session).get(row.environment_id)
+            assert environment_row is not None
+            environment_organization_id = environment_row.organization_id
+        decision = _authorize(
+            session,
+            principal_id=principal_id,
+            tool_name=authorization.RECONCILE_CAPABILITY,
+            workflow_id=row.workflow_id,
+            environment_id=row.environment_id,
+            environment_organization_id=environment_organization_id,
+            enable_v2=enable_v2,
+        )
+        if not decision.allowed:
+            raise OperationNotFoundError()
+    elif row.principal_id != principal_id:
+        raise OperationNotFoundError()
+
+    if row.state != "UNKNOWN":
+        raise ReconciliationNotApplicableError(details={"state": row.state})
+
+    entry = _entry_for_operation(session, row.snapshot_id, row.workflow_id)
+    try:
+        execution = reconciliation.get_execution(execution_id)
+    except OperatorError as exc:
+        # Never inferred from silence or elapsed time — a lookup failure (not found,
+        # instance unreachable, malformed record) is a refusal to record anything,
+        # exactly as stale n8n history or a missing correlation ID must be.
+        raise ReconciliationNotApplicableError(
+            details={"execution_id": execution_id, "lookup_error": exc.code}
+        ) from exc
+    if execution.n8n_workflow_id != entry.n8n_workflow_id:
+        raise ReconciliationNotApplicableError(
+            details={
+                "reason": "execution_belongs_to_a_different_workflow",
+                "execution_workflow_id": execution.n8n_workflow_id,
+                "expected_n8n_workflow_id": entry.n8n_workflow_id,
+            }
+        )
+
+    occurred_at = datetime.now(UTC)
+    audit_writer.write(
+        AuditLogRepository(session),
+        actor=principal_id,
+        action=_RECONCILIATION_ACTION,
+        subject_type="operation",
+        subject_id=operation_id,
+        outcome="allowed",
+        detail={
+            "execution_id": execution_id,
+            "n8n_workflow_id": execution.n8n_workflow_id,
+            "n8n_execution_status": execution.status,
+            "note": note,
+        },
+        occurred_at=occurred_at,
+    )
+    return ReconciliationRecord(
+        operation_id=operation_id,
+        execution_id=execution_id,
+        n8n_workflow_id=execution.n8n_workflow_id,
+        n8n_execution_status=execution.status,
+        note=note,
+        actor=principal_id,
+        recorded_at=occurred_at,
+    )
+
+
+def list_reconciliation_events(
+    session: Session, *, operation_id: str, principal_id: str, enable_v2: bool = False
+) -> list[ReconciliationRecord]:
+    """Every reconciliation annotation recorded for one operation, oldest first — a
+    read, gated the same way any other operation read is (whoever can already see the
+    operation may see its reconciliation history; the ``admin``-only gate is on
+    *recording* evidence, in :func:`reconcile_operation`, not on reading it)."""
+    _get_owned_operation_row(
+        session, operation_id, principal_id, tool_name="get_operation", enable_v2=enable_v2
+    )
+    entries = AuditLogRepository(session).list_for_subject(
+        subject_type="operation", subject_id=operation_id
+    )
+    return [
+        ReconciliationRecord(
+            operation_id=operation_id,
+            execution_id=entry.detail["execution_id"],
+            n8n_workflow_id=entry.detail["n8n_workflow_id"],
+            n8n_execution_status=entry.detail["n8n_execution_status"],
+            note=entry.detail["note"],
+            actor=entry.actor,
+            recorded_at=entry.occurred_at,
+        )
+        for entry in entries
+        if entry.action == _RECONCILIATION_ACTION
+    ]
 
 
 def _v2_quorum_snapshot(row: OperationRow) -> dict[str, Any] | None:
@@ -1567,6 +1890,7 @@ def _approval_decision_context(
         quorum_count=quorum_count,
         decisions=decisions,
         outstanding_approvers=outstanding_approvers,
+        parent_operation_id=row.parent_operation_id,
     )
 
 

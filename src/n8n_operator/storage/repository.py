@@ -247,6 +247,7 @@ class OperationRepository:
         execution_deadline: datetime | None = None,
         organization_id: str | None = None,
         environment_id: str | None = None,
+        parent_operation_id: str | None = None,
     ) -> Operation:
         """Insert a new operation row at ``state_version=1``.
 
@@ -254,6 +255,10 @@ class OperationRepository:
         recorded atomically alongside creation should do so explicitly in the same
         session (this mirrors :meth:`apply_transition`, which never creates the row it
         transitions, only ever updates one that already exists).
+
+        ``parent_operation_id`` (stage 06, ADR-012 section 1) is set only by
+        ``core.service.retry_operation`` — ``None`` for every ordinary
+        ``prepare_operation`` call, exactly as it always has been.
         """
         operation = Operation(
             id=id,
@@ -272,6 +277,7 @@ class OperationRepository:
             execution_deadline=execution_deadline,
             organization_id=organization_id,
             environment_id=environment_id,
+            parent_operation_id=parent_operation_id,
         )
         self._session.add(operation)
         self._session.flush()
@@ -306,6 +312,11 @@ class OperationRepository:
         Only ever called with a non-``None`` key: two rows sharing a namespace with no
         key set are never duplicates of each other (see the module docstring on
         ``storage/models.py``), so there is nothing meaningful to "find" by a null key.
+
+        A retry's own idempotency key is scoped to its parent by ``core.service.
+        _prepare_or_retry`` folding the parent's ID into the ``idempotency_key`` value
+        itself before it ever reaches this method (see ``storage/models.py``'s
+        ``Operation`` docstring for why — not by an extra parameter here).
         """
         stmt: Select[tuple[Operation]] = select(Operation).where(
             Operation.principal_id == principal_id,
@@ -849,6 +860,22 @@ class AuditLogRepository:
         """The most recent ``entry_hash``, or the genesis hash if the chain is empty."""
         last = self.get_last()
         return last.entry_hash if last is not None else GENESIS_HASH
+
+    def list_for_subject(self, *, subject_type: str, subject_id: str) -> list[AuditLogEntry]:
+        """Every audit entry for one subject, oldest first — stage 06's
+        ``operations reconcile list`` read path (uses ``ix_audit_log_subject``,
+        migration 0006). Not filtered by ``action``; a caller wanting only
+        reconciliation annotations (as opposed to every transition/denial recorded
+        for the same subject) filters the result, the same "this repository has no
+        opinion on meaning, only storage" discipline every other method here keeps."""
+        stmt: Select[tuple[AuditLogEntry]] = (
+            select(AuditLogEntry)
+            .where(
+                AuditLogEntry.subject_type == subject_type, AuditLogEntry.subject_id == subject_id
+            )
+            .order_by(AuditLogEntry.seq)
+        )
+        return list(self._session.scalars(stmt))
 
     def list_range(self, *, start_seq: int = 1, limit: int = 100) -> list[AuditLogEntry]:
         stmt: Select[tuple[AuditLogEntry]] = (

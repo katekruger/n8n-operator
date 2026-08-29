@@ -43,8 +43,10 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from n8n_operator.config import (
+    load_settings,
     resolve_database_url,
     resolve_notification_sink_config,
+    resolve_secret_reference,
     resolve_v2_identity_flags,
 )
 from n8n_operator.core import service
@@ -52,17 +54,23 @@ from n8n_operator.core.identity import resolve_cli_principal_id
 from n8n_operator.core.models import (
     ApprovalDecisionContext,
     DeliveryOutcome,
+    ExecutionLookup,
     NotificationEvent,
     Operation,
+    ReconciliationRecord,
 )
 from n8n_operator.errors import (
     ApproverNotInPolicyError,
     InvalidArgumentsError,
     InvalidStateTransitionError,
     OperationNotFoundError,
+    ReconciliationNotApplicableError,
 )
+from n8n_operator.logging_setup import register_secret
+from n8n_operator.n8n.client import N8nClient
 from n8n_operator.notifications.local import LocalNotificationSink
 from n8n_operator.notifications.webhook import WebhookNotificationSink
+from n8n_operator.storage.repository import EnvironmentRepository
 from n8n_operator.storage.session import (
     create_engine_for_url,
     create_session_factory,
@@ -149,6 +157,8 @@ def _render_context(context: ApprovalDecisionContext) -> None:
     else:
         typer.echo(f"definition_hash:     {context.registered_definition_hash} (unchanged)")
     typer.echo(f"created_at:          {context.created_at.isoformat()}")
+    if context.parent_operation_id is not None:
+        typer.echo(f"retry of:            {context.parent_operation_id}")
     if context.approval_expires_at is not None:
         typer.echo(f"approval_expires_at: {context.approval_expires_at.isoformat()}")
     if context.execution_deadline is not None:
@@ -180,6 +190,7 @@ def _summary_dict(operation: Operation) -> dict[str, Any]:
         "state": operation.state,
         "created_at": operation.created_at.isoformat(),
         "updated_at": operation.updated_at.isoformat(),
+        "parent_operation_id": operation.parent_operation_id,
     }
 
 
@@ -205,6 +216,7 @@ def _detail_dict(operation: Operation) -> dict[str, Any]:
         ),
         "n8n_execution_id": operation.n8n_execution_id,
         "handle_used": operation.handle_burned_at is not None,
+        "parent_operation_id": operation.parent_operation_id,
     }
 
 
@@ -256,9 +268,14 @@ def list_operations(
     table.add_column("workflow_id")
     table.add_column("state")
     table.add_column("created_at")
+    table.add_column("parent_operation_id")
     for operation in operations:
         table.add_row(
-            operation.id, operation.workflow_id, operation.state, operation.created_at.isoformat()
+            operation.id,
+            operation.workflow_id,
+            operation.state,
+            operation.created_at.isoformat(),
+            operation.parent_operation_id or "",
         )
     # A fixed, generous width rather than terminal auto-detection: operation IDs are
     # 26-character ULIDs, and a narrow or non-TTY width (the common case for a piped
@@ -306,6 +323,8 @@ def show(
     if operation.n8n_execution_id is not None:
         typer.echo(f"n8n_execution_id:    {operation.n8n_execution_id}")
     typer.echo(f"handle_used:         {operation.handle_burned_at is not None}")
+    if operation.parent_operation_id is not None:
+        typer.echo(f"parent_operation_id: {operation.parent_operation_id}")
 
 
 @app.command("cancel")
@@ -583,6 +602,161 @@ def expire() -> None:
             )
             raise typer.Exit(code=1) from None
     typer.echo(f"Expired {count} operation(s).")
+
+
+# ----------------------------------------------------------------------------------
+# reconcile — the one place in this file that needs a real n8n connection (stage 06,
+# ADR-009/ADR-012). Every other command above deliberately doesn't (this module's own
+# docstring) — reconciliation is the one exception, since confirming what n8n actually
+# did with an `UNKNOWN` operation is the entire point.
+# ----------------------------------------------------------------------------------
+
+reconcile_app = typer.Typer(
+    help="Record and list exact-ID reconciliation evidence for UNKNOWN operations.",
+    no_args_is_help=True,
+)
+app.add_typer(reconcile_app, name="reconcile")
+
+
+class _CliReconciliationAdapter:
+    """Converts ``n8n.client.N8nClient.get_execution``'s ``n8n.types.ExecutionSummary``
+    into ``core.models.ExecutionLookup`` — the same real-type-behind-a-port conversion
+    ``cli/commands/health.py``'s ``_CliHealthAdapter`` performs, duplicated here in
+    miniature rather than imported (this command is its own composition root)."""
+
+    def __init__(self, client: N8nClient) -> None:
+        self._client = client
+
+    def get_execution(self, execution_id: str) -> ExecutionLookup:
+        raw = self._client.get_execution(execution_id)
+        return ExecutionLookup(
+            execution_id=raw.id, n8n_workflow_id=raw.workflow_id, status=raw.status
+        )
+
+
+def _n8n_client_for_operation(
+    session: Session, operation: Operation, *, enable_v2: bool
+) -> N8nClient:
+    """The n8n instance an operation's own execution actually ran against: that one
+    environment's own credentials in v2 (``operation.environment`` is the resolved
+    environment's own ID, exactly as ``core.service._prepare_or_retry`` stores it —
+    never the free-text v1 field in that mode), or the single process-wide instance in
+    v1 (``load_settings()``, the same full configuration ``serve.py``'s ``stdio``/
+    ``http`` already require)."""
+    if enable_v2:
+        environment = EnvironmentRepository(session).get(operation.environment)
+        if environment is not None:
+            base_url = resolve_secret_reference(environment.n8n_base_url_ref)
+            api_key = resolve_secret_reference(environment.n8n_api_key_ref)
+            register_secret(api_key)
+            return N8nClient(base_url=base_url, api_key=api_key, connect_timeout_seconds=60.0)
+    settings = load_settings()
+    register_secret(settings.n8n_api_key.get_secret_value())
+    return N8nClient(
+        base_url=str(settings.n8n_base_url),
+        api_key=settings.n8n_api_key.get_secret_value(),
+        connect_timeout_seconds=float(settings.request_timeout_seconds),
+    )
+
+
+def _print_reconciliation_record(record: ReconciliationRecord) -> None:
+    typer.echo(f"operation_id:         {record.operation_id}")
+    typer.echo(f"execution_id:         {record.execution_id}")
+    typer.echo(f"n8n_workflow_id:      {record.n8n_workflow_id}")
+    typer.echo(f"n8n_execution_status: {record.n8n_execution_status}")
+    typer.echo(f"note:                 {record.note}")
+    typer.echo(f"actor:                {record.actor}")
+    typer.echo(f"recorded_at:          {record.recorded_at.isoformat()}")
+
+
+@reconcile_app.command("record")
+def reconcile_record(
+    operation_id: str = typer.Argument(..., help="The UNKNOWN operation to reconcile."),
+    execution_id: str = typer.Option(..., "--execution-id", help="The n8n execution ID."),
+    note: str = typer.Option(
+        ..., "--note", help='What you are asserting (e.g. "confirmed via n8n UI: succeeded").'
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Record exact-ID reconciliation evidence. Never changes the operation's own
+    state — UNKNOWN stays UNKNOWN forever (invariant I7); this only appends one
+    audit-log annotation. Requires an exact n8n execution ID and an explicit human
+    note — never inferred from elapsed time."""
+    with _connected() as session_factory:
+        with session_scope(session_factory) as session:
+            principal_id, enable_v2 = _resolve_principal(session)
+            try:
+                operation = service.get_operation(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
+                )
+            except OperationNotFoundError:
+                _operation_not_found_or_exit(operation_id)
+                return
+            client = _n8n_client_for_operation(session, operation, enable_v2=enable_v2)
+
+        typer.echo(f"operation_id:  {operation_id}")
+        typer.echo(f"current state: {operation.state}")
+        typer.echo(f"execution_id:  {execution_id}")
+        typer.echo(f"note:          {note}")
+        if not yes and not typer.confirm(
+            "Record this as verified reconciliation evidence? This never changes the "
+            "operation's own state."
+        ):
+            typer.echo("Not recorded.")
+            raise typer.Exit(code=1)
+
+        try:
+            with session_scope(session_factory) as session:
+                record = service.reconcile_operation(
+                    session,
+                    operation_id=operation_id,
+                    principal_id=principal_id,
+                    execution_id=execution_id,
+                    note=note,
+                    reconciliation=_CliReconciliationAdapter(client),
+                    enable_v2=enable_v2,
+                )
+        except OperationNotFoundError:
+            typer.secho(
+                "You are not authorized to reconcile this operation (or it does not exist).",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+        except ReconciliationNotApplicableError as exc:
+            typer.secho(exc.message, fg=typer.colors.RED, err=True)
+            typer.secho(f"details: {exc.details}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+
+    typer.secho("Recorded.", fg=typer.colors.GREEN)
+    _print_reconciliation_record(record)
+
+
+@reconcile_app.command("list")
+def reconcile_list(
+    operation_id: str = typer.Argument(..., help="The operation to list evidence for."),
+) -> None:
+    """List every reconciliation annotation recorded for one operation, oldest
+    first."""
+    with _connected() as session_factory, session_scope(session_factory) as session:
+        principal_id, enable_v2 = _resolve_principal(session)
+        try:
+            records = service.list_reconciliation_events(
+                session, operation_id=operation_id, principal_id=principal_id, enable_v2=enable_v2
+            )
+        except OperationNotFoundError:
+            _operation_not_found_or_exit(operation_id)
+            return
+
+    if not records:
+        typer.echo("No reconciliation evidence recorded.")
+        return
+    for record in records:
+        _print_reconciliation_record(record)
+        typer.echo("")
 
 
 __all__ = ["app"]

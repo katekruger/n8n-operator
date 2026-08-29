@@ -238,7 +238,17 @@ class Operation(Base):
 
     The idempotency-namespace unique constraint below is the storage-level enforcement of
     invariant I8 (ADR-011): it is a plain constraint, not a partial index, and relies on
-    ordinary SQL ``NULL``-uniqueness semantics — see the module docstring.
+    ordinary SQL ``NULL``-uniqueness semantics — see the module docstring. It was
+    deliberately **not** widened to include ``parent_operation_id`` in stage 06: standard
+    SQL exempts a row from a composite unique constraint entirely as soon as any one of
+    its columns is ``NULL`` (the same rule this class's own docstring already relies on
+    for ``idempotency_key`` itself), so adding a *nullable* ``parent_operation_id`` would
+    have silently stopped enforcing uniqueness for every ordinary (non-retry,
+    ``parent_operation_id IS NULL``) row — the vast majority of them. Instead,
+    ``core.service._prepare_or_retry`` folds the parent into the *value* it stores in
+    ``idempotency_key`` for a retry (``f"retry:{parent_operation_id}:{key}"``, internal
+    only, never echoed to a caller) — the existing 4-column constraint, unchanged since
+    ADR-011, keeps working for both cases without a schema change.
     """
 
     __tablename__ = "operations"
@@ -397,6 +407,10 @@ class AuditLogEntry(Base):
     __table_args__ = (
         _enum_check("outcome", ("allowed", "denied", "error"), name="ck_audit_log_outcome"),
         Index("ix_audit_log_occurred_at", "occurred_at"),
+        # Stage 06, migration 0006: the read path a reconciliation-evidence query
+        # (`operations reconcile list`) needs — there was nothing to query by subject
+        # before this stage had any reason to look one up.
+        Index("ix_audit_log_subject", "subject_type", "subject_id"),
     )
 
     seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

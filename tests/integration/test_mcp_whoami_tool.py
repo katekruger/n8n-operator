@@ -110,7 +110,8 @@ async def test_whoami_is_the_thirteenth_tool_in_v2_mode(
     assert "list_environments" in names
     assert "request_approval" in names
     assert "get_approval_status" in names
-    assert len(names) == 16
+    assert "retry_operation" in names
+    assert len(names) == 17
 
 
 @pytest.mark.integration

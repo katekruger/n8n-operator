@@ -635,6 +635,36 @@ async def test_audit_operation_resource_returns_the_event_chain(
     assert transitions == ["T01", "T04"]  # PREPARING, then PENDING_APPROVAL
 
 
+async def test_audit_operation_resource_carries_parent_operation_id(
+    loaded: sessionmaker[Session],
+) -> None:
+    """Stage 06: absent (``None``) for an ordinary operation, set for a retry — the
+    audit resource surfaces lineage the same way ``get_operation``/``list_operations``
+    do (MCP_TOOLS.md, ADR-012 section 1)."""
+    server = make_server(loaded)
+    prepared = await call(
+        server, "prepare_operation", workflow_id="wf.approval", arguments={"email": "a@b.com"}
+    )
+    parent_id = prepared["operation_id"]
+
+    parent_payload = await read_resource_json(server, f"audit://operations/{parent_id}")
+    assert parent_payload["parent_operation_id"] is None
+
+    with session_scope(loaded) as session:
+        service.reject_operation(session, operation_id=parent_id, decided_by="local")
+        child, _, _ = service.retry_operation(
+            session,
+            operation_id=parent_id,
+            principal_id="local",
+            preflight=FakePreflight(),
+            server_max_argument_bytes=262_144,
+        )
+        child_id = child.id
+
+    child_payload = await read_resource_json(server, f"audit://operations/{child_id}")
+    assert child_payload["parent_operation_id"] == parent_id
+
+
 async def test_audit_operation_resource_unknown_id_raises_resource_not_found(
     loaded: sessionmaker[Session],
 ) -> None:

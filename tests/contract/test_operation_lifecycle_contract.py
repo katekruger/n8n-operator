@@ -87,9 +87,15 @@ def test_argument_size_check_is_called_from_core_not_from_an_adapter() -> None:
     """Boundary B12: the check lives in ``core/`` and is applied identically for every
     adapter. Since no adapter exists yet (phases 5, 6), this asserts the check is wired
     into ``core.service.prepare_operation`` — the one place every future adapter must
-    route through (ADR-001) — rather than left uncalled."""
-    source = inspect.getsource(service.prepare_operation)
-    assert "check_argument_size" in source
+    route through (ADR-001) — rather than left uncalled. Stage 06: ``prepare_operation``
+    delegates to ``_prepare_or_retry`` (shared with ``retry_operation``, which re-runs
+    every one of these checks too, ADR-012 section 1) — the check must appear in
+    whichever of the two actually calls it, not necessarily ``prepare_operation``'s own
+    source."""
+    combined_source = inspect.getsource(service.prepare_operation) + inspect.getsource(
+        service._prepare_or_retry
+    )
+    assert "check_argument_size" in combined_source
 
 
 @pytest.mark.contract

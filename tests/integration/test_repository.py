@@ -257,6 +257,33 @@ def test_two_operations_same_namespace_both_null_key_do_not_collide(
         assert repo.get("op_null2") is not None
 
 
+# --------------------------------------------------------------------------------------
+# Stage 06: reconciliation is structurally an annotation, never a transition — the
+# `operation_events.transition` CHECK constraint (T01-T15 only) makes this true at the
+# schema level, not merely by application-code discipline.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_operation_events_transition_check_constraint_rejects_a_non_transition_value(
+    session_factory: sessionmaker[Session], seed: dict[str, Any]
+) -> None:
+    """A hand-crafted attempt to record something that looks like a reconciliation
+    "transition" (as opposed to the real mechanism, an ``audit_log`` annotation —
+    ``core.service.reconcile_operation``) fails at the database layer itself."""
+    with session_scope(session_factory) as session:
+        _make_operation(session, seed, id="op_reconcile_attempt")
+
+    with pytest.raises(IntegrityError), session_scope(session_factory) as session:
+        OperationEventRepository(session).append(
+            operation_id="op_reconcile_attempt",
+            from_state="UNKNOWN",
+            to_state="UNKNOWN",
+            transition="RECONCILE",
+            actor="local",
+        )
+
+
 @pytest.mark.integration
 def test_different_workflow_same_key_does_not_collide(
     session_factory: sessionmaker[Session], seed: dict[str, Any]
@@ -821,7 +848,14 @@ def test_no_update_or_delete_method_exists_on_audit_log_repository() -> None:
     """Boundary B11: append-only. There is no method here that could update or delete a
     row — checked directly against the class's own public interface."""
     public_methods = {name for name in dir(AuditLogRepository) if not name.startswith("_")}
-    assert public_methods == {"append", "get_last", "get_last_hash", "list_range", "list_all"}
+    assert public_methods == {
+        "append",
+        "get_last",
+        "get_last_hash",
+        "list_range",
+        "list_all",
+        "list_for_subject",
+    }
 
 
 @pytest.mark.integration
