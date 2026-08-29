@@ -38,6 +38,7 @@ human sits on a channel the caller cannot reach.
 | A8 | Execution results | May contain customer PII from downstream systems. | High |
 | A9 | Operation arguments | May contain PII supplied by the caller. | Medium |
 | A10 | Downstream systems (Zone D) | Where irreversible effects land. | Critical |
+| A11 | *(v2, stage 02)* OIDC bearer tokens and service-principal credentials | Each is an identity assertion; a service-principal credential is a durable, rotatable secret in its own right (never a literal value Operator stores — `credential_ref` indirection, ADR-006/ADR-013). | Critical |
 
 ---
 
@@ -89,7 +90,14 @@ Severity is pre-mitigation. `v1` status values: **mitigated**, **partial**, **ac
 | T-11 | Denial of service | Caller floods `prepare_operation` or `execute_operation`. | Medium | Per-workflow `max_concurrent` and `rate_limit_per_minute`; `RATE_LIMITED` and `CONCURRENCY_LIMIT_REACHED`. | partial |
 | T-12 | Denial of service | Caller exhausts disk by preparing operations with huge argument payloads. | Medium | Core-enforced cap on the canonical argument size, applied identically for every adapter and **before** persistence; transport caps remain as defense in depth; results capped by `output.max_bytes`. B12, invariant I10, [ADR-011](adr/ADR-011-argument-limits-and-idempotency.md). | mitigated |
 | T-13 | Repudiation | Caller denies having requested an action. | High | Every transition writes an `operation_events` row and a hash-chained `audit_log` row in the same transaction (I6). B11. | mitigated |
-| T-14 | Spoofing | Caller claims to be a different principal. | High | v1 has exactly one local principal; there is nothing to spoof. Becomes real in v2 with OIDC. | accepted (v1 by design) |
+| T-14 | Spoofing | Caller claims to be a different principal. | High | v1 has exactly one local principal; there is nothing to spoof. **Stage 02:** real in v2 OIDC mode — resolved server-side from a validated bearer token's `(iss, sub)` (identity anchor, never `sub` alone), never from a tool argument; no tool accepts a field asserting "act as principal X" (B14, [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md)). | mitigated (v2 OIDC mode); accepted (v1, and v2 `identity_mode=dev`, by design) |
+| T-42 | Spoofing | A forged or algorithm-confused JWT (unsigned `alg: none`, or an RS256 public key replayed as an HS256 secret) is accepted as a valid identity assertion. | Critical | `ALLOWED_ALGORITHMS` is a fixed allowlist (RS/ES/PS 256/384/512 only); `none` and every `HS*` algorithm are rejected before signature verification runs, regardless of what the token's own header claims (`identity/oidc.py`). Every validation failure — wrong issuer, wrong audience, forbidden algorithm, unsigned, expired, not-yet-valid, unknown `kid` after one rate-limited re-fetch — returns the identical `None`/`INVALID_TOKEN` outcome; no distinguishing error tells a prober which check it failed (ADR-014's anti-oracle discipline, extended from B1/T-10's "no enumeration oracle" pattern to identity). `tests/unit/test_identity_oidc.py`. | mitigated |
+| T-43 | Denial of service | A forged or rotating `kid` value is used to force an unbounded stream of JWKS re-fetches against the IdP. | Medium | Exactly one re-fetch per unknown `kid`; a `kid` still not found after that re-fetch is rate-limited (not re-fetched again) until a cooldown elapses, distinct from a `kid` a re-fetch *does* find (rotation is picked up immediately, never penalized). `tests/unit/test_identity_oidc.py::test_unknown_kid_refetch_is_rate_limited`, `::test_jwks_rotation_is_picked_up_after_the_old_key_stops_working`. | mitigated |
+| T-44 | Elevation | A principal is disabled (or its organization membership removed) mid-session, but a long-lived bearer token or a cached authorization decision keeps working. | High | Stateless bearer auth — no server-side session table to go stale — and `disabled_at`/membership state is re-checked against the live database on *every* call, never cached; the identical, still-cryptographically-valid token is rejected the instant the row changes (ADR-014 section 4). `tests/integration/test_operator_token_verifier.py::test_a_disabled_principal_is_rejected_even_with_a_valid_token`, `::test_a_removed_membership_leaves_whoami_empty_but_the_principal_still_authenticates`. | mitigated |
+| T-45 | Elevation | JIT provisioning of a first-seen `(iss, sub)` grants more than "this subject can now authenticate" — e.g. an implicit membership or role. | Critical | `resolve_user_principal` creates a bare `principals` row and nothing else; granting any role in any organization is always a separate, explicit admin act (`identity add-membership`). A freshly JIT-provisioned user calling `whoami` gets `"organizations": []` — authenticated, authorized for nothing (ADR-013 section 2). `tests/integration/test_mcp_whoami_tool.py::test_whoami_for_a_principal_with_no_active_organization_returns_an_empty_list`. | mitigated |
+| T-46 | Elevation | A valid token for principal A is used to see or influence principal B's organizations, roles, or environments — "token substitution across organizations". | Critical | `whoami` (and every future org-scoped v2 read) is built entirely from a database query keyed on the already-resolved `principal_id`; no tool argument or JWT claim is ever consulted to decide which organization a caller sees (B15, ADR-013). Two distinct principals, each a member of a different single-organization, each see only their own. `tests/integration/test_mcp_whoami_tool.py::test_whoami_reflects_only_database_membership_never_a_claim_the_caller_asserts`. | mitigated |
+| T-47 | Information disclosure | A service principal's resolved `credential_ref` value (or another identity-adjacent secret) leaks into a structured log line or a CLI's own output. | High | Never printed by any CLI command (`create-service-principal`, `rotate-service-credential`); registered with the existing log-scrubbing mechanism (`logging_setup.register_secret`) the instant it is resolved, in both the CLI validation path and the server's per-request service-credential match path — not only on a successful match, so scrubbing does not depend on which request happened to use it (extends B7/T-23 to a value that is resolved live, per request, rather than once at startup). `tests/integration/test_cli_identity.py::test_create_service_principal_registers_the_resolved_secret_for_log_scrubbing`, `tests/integration/test_operator_token_verifier.py::test_resolving_a_service_credential_registers_it_for_log_scrubbing`. `whoami`'s own result additionally never carries a provider token or raw claim — `tests/integration/test_mcp_whoami_tool.py::test_whoami_never_leaks_a_provider_token_or_raw_claim`. | mitigated |
+| T-48 | Elevation | `identity_mode=dev`'s fixed, unauthenticated development principal is reachable from a non-loopback (network-exposed) deployment, letting anyone who can reach the port act as a privileged, un-gated identity. | Critical | A `config.py` startup validator (`_validate_v2_identity_mode`) refuses to start with `identity_mode=dev` on a non-loopback HTTP bind; the dev principal's own `display_name` is set to `"local development (identity_mode=dev — never for production)"` so it is unmistakable in any audit trail or `whoami` result even in the loopback case it's meant for. stdio always uses this fixed principal regardless of configured mode (ADR-014 section 5) — but stdio has no network listener to expose in the first place, so that case carries no equivalent risk. | mitigated |
 
 ### 5.2 TB2 — Human to approval app
 
@@ -182,6 +190,11 @@ with no intent at all, doing the wrong thing confidently.
 | ADR-010 approval delivery and lazy expiry | T-38, L-08 |
 | ADR-011 argument limits and namespaces | T-12 |
 | ADR-012 retry recalculation and anchoring | L-04, T-35 |
+| B14 identity through validated bearer token only *(v2, stage 02)* | T-14, T-42, T-45 |
+| B15 organization isolation *(v2, stage 02 — `whoami` only; per-tool enforcement is stage 03/04)* | T-46 |
+| ADR-014 OIDC trust and session model *(v2, stage 02)* | T-14, T-42, T-43, T-44, T-48 |
+| ADR-013 organization/tenant/principal model *(v2, stage 02)* | T-45, T-46 |
+| ADR-006 secret indirection, extended to service-principal credentials *(v2, stage 02)* | T-47 |
 
 Every boundary control traces to at least one threat, and every Critical or High threat
 traces to at least one control or an explicit acceptance in section 8.
@@ -200,6 +213,26 @@ Stated plainly so no one mistakes silence for coverage:
    CRM's decision. Operator governs invocation, not downstream policy.
 4. **Encryption at rest.** The v1 database relies on filesystem permissions (T-36).
 5. **Multi-tenant isolation.** v1 is single-user; there is no tenancy to isolate (T-14).
+   **Stage 02 update:** v2 introduces real organizations, memberships, and OIDC identity
+   resolution (T-14 mitigated, T-45/T-46 mitigated for the surface that exists today —
+   `whoami`). What stage 02 explicitly does **not** add: no v1 or v2 tool yet accepts an
+   `environment`/organization-scoping argument, so there is no per-tool authorization
+   *enforcement* to bypass yet, and no role-capability evaluation exists at all (RBAC
+   arrives stage 03, ADR-015). An authenticated v2 caller today can still reach every v1
+   tool exactly as any v1 caller could — identity is resolved and recorded, but does not
+   yet gate anything. Treat this as an explicit, temporary, load-bearing scoping decision
+   for stage 02, not a silent gap: it closes in stage 03 (authorization intersection) and
+   stage 04 (environment-scoped organization resolution for the other twelve tools).
+   Also unresolved by identity alone: **deleted identity-provider account.** Operator has
+   no IdP-side revocation signal — an account deleted at the IdP is indistinguishable,
+   from Operator's side, from any other subject that simply stops presenting new tokens.
+   A token issued before deletion remains cryptographically valid until its own natural
+   `exp`. The actionable mitigation is the same one T-44 already covers: an admin
+   proactively runs `identity disable-principal` the moment an IdP-side removal is known,
+   which takes effect immediately (live re-check, no caching) regardless of the token's
+   remaining lifetime. No separate test exists for "deleted account" as such, because
+   there is no distinguishable signal for a test to assert on — the code path is
+   identical to, and already covered by, T-44's disabled-principal tests.
 6. **Approval-fatigue as a systemic risk (T-20).** Mitigated by page design and honest
    risk labeling, but a human who always clicks approve is not a solvable software problem.
 7. **Availability.** Operator is not designed for high availability; an outage means
@@ -238,6 +271,8 @@ Stated plainly so no one mistakes silence for coverage:
 | RR-8 | Early canonicalization is deliberately over-inclusive, so cosmetic n8n edits produce false `DEFINITION_DRIFT` until the harness justifies exclusions. Friction on a security control invites routing around it (T-39, [ADR-008](adr/ADR-008-conservative-definition-canonicalization.md)). | Low–Medium | Engineering | Phase-4 harness narrows the allowlist on evidence; v2 `diff_workflow_definition` makes re-review a diff. |
 | RR-9 | In a stdio-only deployment with no sweeper and no scheduled `operations expire`, `EXPIRED` audit events are written at next touch rather than at the deadline, and may never be written for an operation nobody touches again. Audit-timeline fidelity only; no expired operation is executable (invariant I9). | Low | Operator | Run `operations expire` on a timer, or the approval app. |
 | RR-10 | An operation crash-stranded in `EXECUTING` (process killed between the handle burn and dispatch completing) has no automatic or CLI-driven resolution in v1 — it stays `EXECUTING` indefinitely, correctly inert but not resolved, and (since `max_concurrent` counts `EXECUTING` operations) permanently occupies one concurrency slot for that workflow until an operator manually confirms the outcome against n8n and updates the row directly (T-37). Narrower in practice than it sounds: the window is one process between two adjacent statements, not an extended period. | Low | Operator | v2: a supported reconciliation command instead of a direct database edit. |
+| RR-11 | Stage 02 resolves and records real identity (`(iss, sub)` → `principal_id`) but enforces no authorization on it yet — every v1 tool remains reachable by any authenticated v2 caller regardless of organization membership or role, since no tool takes an `environment`/organization argument to check against (T-14 residual half; see section 8 item 5). | Medium | Engineering | Stage 03: role-capability matrix evaluator and workflow×environment×role intersection enforcement (ADR-015). Closes in the very next stage, not deferred indefinitely. |
+| RR-12 | A deleted identity-provider account has no distinguishing signal Operator can detect on its own; a token issued before deletion remains valid until its natural expiry unless an admin proactively disables the mapped principal. | Low | Operator | No code change planned — this is the same live-recheck mechanism T-44 already provides; the residual risk is the admin's IdP-deletion → `identity disable-principal` operational habit, not a software gap. |
 
 ---
 
@@ -255,6 +290,13 @@ Re-run this analysis when any of the following changes:
   reduction in drift-detection coverage and must be reviewed as one);
 - an approval channel is added, or the rule deciding caller locality changes;
 - an `AuditAnchor` implementation is added.
+- a v1 or v2 tool gains an `environment`/organization-scoping argument (stage 03/04 —
+  this is the moment RR-11 needs re-review, since authorization enforcement then exists
+  to fail);
+- the OIDC algorithm allowlist, clock-skew tolerance, or JWKS re-fetch/rate-limit
+  policy changes (ADR-014);
+- a new identity provider becomes a supported reference configuration
+  ([OIDC_SETUP.md](OIDC_SETUP.md)).
 
 Phase 9 of the build plan requires a full review of this document against the shipped
 v1 code before release, including re-confirmation of every accepted risk.

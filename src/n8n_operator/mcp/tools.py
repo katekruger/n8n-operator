@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver.tools.base import Tool
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata
 from mcp_types import ToolAnnotations
@@ -59,9 +60,14 @@ from pydantic import ConfigDict, Field
 from sqlalchemy.orm import sessionmaker
 
 from n8n_operator.core import service
+from n8n_operator.core.identity import build_whoami
 from n8n_operator.core.service import DispatchPort, HealthPort, PreflightPort
 from n8n_operator.errors import DispatchIndeterminateError, InvalidArgumentsError, OperatorError
-from n8n_operator.storage.repository import ApprovalRepository, OperationEventRepository
+from n8n_operator.storage.repository import (
+    ApprovalRepository,
+    OperationEventRepository,
+    PrincipalRepository,
+)
 from n8n_operator.storage.session import session_scope
 
 __all__ = ["ToolDeps", "build_tools"]
@@ -87,6 +93,30 @@ class ToolDeps:
     caller_is_local: bool = True
     approval_base_url: str | None = None
     known_secrets: tuple[str, ...] = ()
+    # Gates whoami's registration as a 13th tool (BUILD_PLAN section 7.2, stage 02).
+    # False (v1, the default) registers exactly the twelve tools AC-23 requires —
+    # nothing here changes v1's tool surface unless an operator opts in.
+    enable_v2: bool = False
+
+
+def _resolve_principal_id(deps: ToolDeps) -> str:
+    """The caller attributed to this request.
+
+    In v2 OIDC mode, ``mcp.server.auth``'s own contextvar (populated per-request by
+    ``AuthContextMiddleware``, driven by the composition root's token verifier —
+    ``mcp/server.py``) carries the already-resolved ``principal_id`` in
+    ``AccessToken.claims`` — set once, in ``verify_token``, after JIT provisioning and
+    the disabled-principal check have already run (ADR-014 section 4). Every other case
+    (stdio, v1, v2 dev mode — none of which configure a token verifier at all) falls
+    back to ``deps.principal_id``, the one fixed principal that mode attributes every
+    call to (ADR-014 section 5).
+    """
+    access_token = get_access_token()
+    if access_token is not None and access_token.claims:
+        principal_id = access_token.claims.get("principal_id")
+        if isinstance(principal_id, str) and principal_id:
+            return principal_id
+    return deps.principal_id
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -420,7 +450,7 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
             try:
                 operation, idempotent_replay, approval_token = service.prepare_operation(
                     session,
-                    principal_id=deps.principal_id,
+                    principal_id=_resolve_principal_id(deps),
                     environment=deps.environment,
                     workflow_id=workflow_id,
                     arguments=arguments,
@@ -477,7 +507,7 @@ def _make_get_operation(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -544,7 +574,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
                     session,
                     operation_id=operation_id,
                     handle=handle,
-                    principal_id=deps.principal_id,
+                    principal_id=_resolve_principal_id(deps),
                     preflight=deps.preflight,
                 )
             except OperatorError as exc:
@@ -554,7 +584,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             operation = service.dispatch_operation(
                 deps.session_factory,
                 operation_id=operation_id,
-                principal_id=deps.principal_id,
+                principal_id=_resolve_principal_id(deps),
                 dispatch=deps.dispatch,
                 known_secrets=deps.known_secrets,
             )
@@ -584,7 +614,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -646,7 +676,7 @@ def _make_cancel_operation(deps: ToolDeps) -> Tool:
                 operation = service.cancel_operation(
                     session,
                     operation_id=operation_id,
-                    principal_id=deps.principal_id,
+                    principal_id=_resolve_principal_id(deps),
                     reason=reason,
                 )
             except OperatorError as exc:
@@ -707,7 +737,7 @@ def _make_list_operations(deps: ToolDeps) -> Tool:
             try:
                 operations = service.list_operations(
                     session,
-                    principal_id=deps.principal_id,
+                    principal_id=_resolve_principal_id(deps),
                     environment=deps.environment,
                     workflow_id=workflow_id,
                     states=state,
@@ -756,10 +786,10 @@ def _make_get_execution_result(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -805,10 +835,10 @@ def _make_get_execution_log(deps: ToolDeps) -> Tool:
         with session_scope(deps.session_factory) as session:
             try:
                 operation = service.get_operation(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
                 result = service.get_execution_result(
-                    session, operation_id=operation_id, principal_id=deps.principal_id
+                    session, operation_id=operation_id, principal_id=_resolve_principal_id(deps)
                 )
                 workflow = service.describe_workflow(session, workflow_id=operation.workflow_id)
             except OperatorError as exc:
@@ -842,12 +872,68 @@ def _make_get_execution_log(deps: ToolDeps) -> Tool:
     )
 
 
+# ======================================================================================
+# whoami (v2 — stage 02, MCP_TOOLS.md section 5.1)
+# ======================================================================================
+
+
+class WhoAmIArgs(_ToolArgs):
+    pass
+
+
+def _make_whoami(deps: ToolDeps) -> Tool:
+    async def handler() -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        with session_scope(deps.session_factory) as session:
+            principal = PrincipalRepository(session).get(principal_id)
+            if principal is None:  # pragma: no cover - defensive; an authenticated
+                # caller's principal_id always names a real row (JIT-provisioned or
+                # dev/service-configured) by the time a handler runs
+                return _error_result(OperatorError(details={"principal_id": principal_id}))
+            who = build_whoami(session, principal)
+        return {
+            "principal_id": who.principal_id,
+            "kind": who.kind,
+            "display_name": who.display_name,
+            "organizations": [
+                {
+                    "organization_id": org.organization_id,
+                    "name": org.name,
+                    "roles": org.roles,
+                    "environments": [
+                        {
+                            "environment_id": env.environment_id,
+                            "name": env.name,
+                            "is_production": env.is_production,
+                        }
+                        for env in org.environments
+                    ],
+                }
+                for org in who.organizations
+            ],
+        }
+
+    return _build_tool(
+        name="whoami",
+        description=(
+            "Resolved identity: who the caller is, and every organization, role set, "
+            "and environment they can see. The one tool a caller needs before naming "
+            "anything else."
+        ),
+        args_model=WhoAmIArgs,
+        handler=handler,
+        annotations=_READ_ONLY,
+    )
+
+
 def build_tools(deps: ToolDeps) -> list[Tool]:
     """Every v1 tool, bound to ``deps`` — the list ``mcp/server.py`` hands to
     ``MCPServer(tools=...)``. Exactly BUILD_PLAN section 7.1's twelve; a contract test
     (``tests/contract/test_mcp_tool_inventory.py``) asserts this list's names against
-    that inventory in both directions."""
-    return [
+    that inventory in both directions. ``whoami`` (BUILD_PLAN section 7.2) is appended
+    as a thirteenth tool only when ``deps.enable_v2`` is set — v1's exact twelve-tool
+    surface (AC-23) is otherwise untouched."""
+    tools = [
         _make_list_workflows(deps),
         _make_describe_workflow(deps),
         _make_get_instance_health(deps),
@@ -861,3 +947,6 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
         _make_get_execution_result(deps),
         _make_get_execution_log(deps),
     ]
+    if deps.enable_v2:
+        tools.append(_make_whoami(deps))
+    return tools

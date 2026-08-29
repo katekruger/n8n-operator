@@ -7,13 +7,15 @@ until its row's Tests column names real, passing tests, not planned ones.
 
 **Status legend:** `contract` — specified in this stage, no runtime behavior yet.
 `planned` — test file does not exist yet; named here so the implementing stage knows
-exactly what to write. `done` — implemented and passing.
+exactly what to write. `partial` — some of the AC's scope is implemented and passing
+now; the remainder is named, real, future work in a specific later stage, not a gap
+carried silently. `done` — implemented and passing.
 
 ## Tools
 
 | Tool | Acceptance criteria | Tests | Documentation | Stage | Status |
 |---|---|---|---|---|---|
-| `whoami` | AC-34, AC-35, AC-36, AC-45, AC-46 | `tests/unit/test_whoami.py`, `tests/integration/test_oidc_auth.py` (planned) | [MCP_TOOLS.md](MCP_TOOLS.md) §5.1, [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md), [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) | 02 | contract |
+| `whoami` | AC-34, AC-35, AC-45, AC-46 (AC-36 partial — see below) | `tests/integration/test_mcp_whoami_tool.py`, `tests/contract/test_mcp_tool_inventory.py::test_whoami_is_registered_only_when_v2_is_enabled` | [MCP_TOOLS.md](MCP_TOOLS.md) §5.1, [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md), [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) | 02 | done |
 | `list_environments` | AC-37, AC-47 | `tests/unit/test_environments.py` (planned) | [MCP_TOOLS.md](MCP_TOOLS.md) §5.2, [ADR-016](adr/ADR-016-environment-registry-overlays.md) | 04 | contract |
 | `request_approval` | AC-40, AC-41, AC-49 | `tests/unit/test_quorum_approval.py`, `tests/property/test_approval_snapshot.py` (planned) | [MCP_TOOLS.md](MCP_TOOLS.md) §5.3, [ADR-017](adr/ADR-017-team-approval-quorum-semantics.md), [ADR-018](adr/ADR-018-notification-and-alert-hook-delivery.md) | 05 | contract |
 | `get_approval_status` | AC-40, AC-49 | `tests/unit/test_quorum_approval.py` (planned) | [MCP_TOOLS.md](MCP_TOOLS.md) §5.4, [ADR-017](adr/ADR-017-team-approval-quorum-semantics.md) | 05 | contract |
@@ -27,10 +29,10 @@ exactly what to write. `done` — implemented and passing.
 
 | Outcome | Acceptance criteria | Tests | Documentation | Stage | Status |
 |---|---|---|---|---|---|
-| Organization membership and isolation model | AC-34 | `tests/unit/test_organizations.py` (planned) | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md), BUILD_PLAN §8.3 | 02 | contract |
-| Human vs. service principal semantics | AC-35 | `tests/unit/test_principal_kinds.py` (planned) | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) §2 | 02 | contract |
-| Multi-org OIDC subject / active-organization selection | AC-36 | `tests/integration/test_oidc_auth.py` (planned) | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) §3 | 02 | contract |
-| OIDC trust: key rotation, clock skew, disabled/removed re-check | AC-45, AC-46 | `tests/integration/test_oidc_auth.py`, `tests/property/test_disabled_principal.py` (planned) | [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) | 02 | contract |
+| Organization membership and isolation model | AC-34 | `tests/integration/test_identity_repositories.py`, `tests/integration/test_cli_identity.py` | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md), BUILD_PLAN §8.3 | 02 | done |
+| Human vs. service principal semantics | AC-35 | `tests/integration/test_identity_repositories.py`, `tests/integration/test_operator_token_verifier.py::test_service_principal_authenticates_by_credential_never_by_jwt` | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) §2 | 02 | done |
+| Multi-org OIDC subject / active-organization selection | AC-36 | Schema/resolution-path half (one `(iss, sub)` holding active memberships in two organizations, each visible independently through `whoami`): `tests/integration/test_identity_repositories.py::test_a_principal_can_hold_active_memberships_in_two_organizations`, `tests/integration/test_mcp_whoami_tool.py::test_whoami_reflects_only_database_membership_never_a_claim_the_caller_asserts`. The implicit-environment-resolution half this AC also names (`ENVIRONMENT_REQUIRED` when no single environment disambiguates) has no `environment` tool argument to resolve against until stage 04 — deliberately out of scope here; tracked as a stage 04 dependency, not a stage 02 gap. | [ADR-013](adr/ADR-013-organization-tenant-and-principal-model.md) §3 | 02 (schema), 04 (resolution) | partial |
+| OIDC trust: key rotation, clock skew, disabled/removed re-check | AC-45, AC-46 | `tests/unit/test_identity_oidc.py`, `tests/integration/test_operator_token_verifier.py`, `tests/integration/test_mcp_oidc_transport.py` | [ADR-014](adr/ADR-014-oidc-trust-and-session-model.md) | 02 | done |
 | RBAC role-capability matrix, workflow×environment intersection | AC-38, AC-39, AC-44 | `tests/property/test_rbac_matrix.py` (planned) | [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md) | 03 | contract |
 | No-enumeration-oracle extension (no `FORBIDDEN`, denial == absence) | AC-34, AC-44 | `tests/property/test_no_enumeration.py` (planned) | invariant I14 (BUILD_PLAN §5.5), [ADR-015](adr/ADR-015-rbac-authorization-evaluation.md) | 03 | contract |
 | Default environment resolution, production never implicit | AC-37 | `tests/unit/test_environments.py` (planned) | [ADR-016](adr/ADR-016-environment-registry-overlays.md) §3, rule R13 | 04 | contract |

@@ -1,0 +1,49 @@
+name: n8n-operator-keycloak-test
+
+# A disposable Keycloak instance for the pinned, loopback-only Keycloak integration
+# harness (tests/integration/keycloak/, marked `keycloak`) — the "one fully tested
+# reference configuration" for a real OIDC identity provider, mirroring
+# docker/postgres-test/docker-compose.yml's shape and guarantees. Never targets
+# production: an ephemeral realm imported from a checked-in fixture file, loopback-only
+# port binding, no shared network with anything else on the host, and nothing here
+# reads or writes the operator's own database or registry.
+#
+# The realm (n8n-operator-test), its client (n8n-operator, with a hardcoded throwaway
+# secret and an audience protocol mapper so `aud` is populated correctly), and its test
+# user (alice) are declared entirely in ./realm-export.json and imported declaratively
+# on startup via `--import-realm` — no imperative admin-API setup script. See that file
+# for the fixture credentials (all clearly non-production, dev-only values).
+#
+# Pinned to the same Keycloak version CI's service container uses
+# (.github/workflows/ci.yml `keycloak` job), started in dev mode (`start-dev`), which is
+# not a supported production mode but is exactly right for a disposable test fixture.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: n8n-operator-keycloak-test
+    command: start-dev --import-realm
+    ports:
+      # Loopback only — never expose this test instance beyond the local machine.
+      - "127.0.0.1:8081:8080"
+    environment:
+      # Bootstrap admin console credentials (dev mode only, loopback only) — not used
+      # by the test harness itself, which authenticates as the `alice` realm user via
+      # the Resource Owner Password Credentials grant, not the admin API.
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+    volumes:
+      - ./realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      # Keycloak's dev-mode image ships without curl/wget; a bare /bin/bash TCP probe
+      # against the HTTP management port is the same trick used by Keycloak's own
+      # published compose examples.
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/n8n-operator-test/.well-known/openid-configuration HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '200' <&3",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s

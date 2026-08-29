@@ -2,19 +2,23 @@
 
 stdio is the default: the parent process is the security boundary and no network
 listener exists. Streamable HTTP binds ``127.0.0.1`` by default; a non-loopback bind
-requires a bearer token **and** an Origin allowlist, or startup fails (boundary B9,
-AC-20). The Origin check is DNS-rebinding defense (threat T-34).
+requires an Origin allowlist and, unless v2 OIDC identity is configured, a bearer
+token, or startup fails (boundary B9, AC-20). The Origin check is DNS-rebinding
+defense (threat T-34).
 
 ``config.Settings`` already refuses to *construct* on a non-loopback ``http_bind``
-without both a bearer token and a non-empty Origin allowlist (its own
+without a non-empty Origin allowlist and (absent OIDC) a bearer token (its own
 ``_validate_http_bind_guard``) — that is the authoritative "refuses to start"
 enforcement B9 asks for. :class:`_TransportSecurityMiddleware` here is the second half:
-*actual per-request* rejection of a missing/invalid bearer token or a missing/
-disallowed ``Origin`` header, which the installed MCP SDK's own
+*actual per-request* rejection of a missing/disallowed ``Origin`` header and, when
+applicable, a missing/invalid static bearer token — which the installed MCP SDK's own
 ``TransportSecuritySettings`` does not fully provide (it treats an *absent* Origin
 header as same-origin and lets it through — the wrong default for a listener that must
 reject exactly that). It is applied only on a non-loopback bind; a loopback bind is
-unreachable from anywhere but a local process to begin with.
+unreachable from anywhere but a local process to begin with. When v2 OIDC identity is
+active, the static bearer-token half is skipped here — the SDK's own auth middleware
+(wired in by ``mcp/server.py``'s ``token_verifier``) enforces a real per-request JWT
+instead (ADR-014 section 1).
 
 :class:`_CorrelationIdMiddleware` (phase 8) is the Streamable HTTP counterpart to the
 CLI root callback's one-per-invocation correlation ID (``cli/main.py``): applied
@@ -50,20 +54,28 @@ def _is_loopback_bind(bind: str) -> bool:
 
 class _TransportSecurityMiddleware:
     """Rejects a non-loopback Streamable HTTP request with a missing/disallowed
-    ``Origin`` or a missing/invalid bearer ``Authorization`` header, before it reaches
-    the MCP session machinery (boundary B9, AC-20).
+    ``Origin`` or (unless ``bearer_token`` is ``None``) a missing/invalid bearer
+    ``Authorization`` header, before it reaches the MCP session machinery
+    (boundary B9, AC-20).
 
     Constructed only when the bind is non-loopback, at which point ``config.Settings``
-    already guarantees ``bearer_token`` is set and ``allowed_origins`` is non-empty —
-    this class does not re-derive that guarantee, it enforces it per request.
+    already guarantees ``allowed_origins`` is non-empty — this class does not re-derive
+    that guarantee, it enforces it per request. The Origin check always applies
+    (DNS-rebinding defense, threat T-34, independent of how identity is proven); the
+    static bearer-token check is skipped when ``bearer_token`` is ``None`` — v2 OIDC
+    identity mode (``mcp/server.py``'s ``token_verifier``) *replaces* it with a real
+    per-request bearer JWT enforced by the MCP SDK's own auth middleware instead
+    (ADR-014 section 1), rather than layering a second, meaningless static check on
+    top of it.
     """
 
     def __init__(
-        self, app: ASGIApp, *, bearer_token: str, allowed_origins: tuple[str, ...]
+        self, app: ASGIApp, *, bearer_token: str | None, allowed_origins: tuple[str, ...]
     ) -> None:
         self._app = app
-        self._bearer_token = bearer_token
-        self._expected_authorization = f"Bearer {bearer_token}".encode()
+        self._expected_authorization = (
+            f"Bearer {bearer_token}".encode() if bearer_token is not None else None
+        )
         self._allowed_origins = frozenset(allowed_origins)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -79,12 +91,13 @@ class _TransportSecurityMiddleware:
             )
             return
 
-        authorization = headers.get("authorization", "").encode()
-        if not hmac.compare_digest(authorization, self._expected_authorization):
-            await JSONResponse({"error": "missing or invalid bearer token"}, status_code=401)(
-                scope, receive, send
-            )
-            return
+        if self._expected_authorization is not None:
+            authorization = headers.get("authorization", "").encode()
+            if not hmac.compare_digest(authorization, self._expected_authorization):
+                await JSONResponse({"error": "missing or invalid bearer token"}, status_code=401)(
+                    scope, receive, send
+                )
+                return
 
         await self._app(scope, receive, send)
 
@@ -113,17 +126,21 @@ class _CorrelationIdMiddleware:
 def serve_stdio(settings: Settings, session_factory: sessionmaker[Session]) -> None:
     """Run the MCP server over stdio (the default transport). Blocks until the client
     disconnects. Always local — the parent process launched this one (boundary B9)."""
-    server = build_server(settings, session_factory, caller_is_local=True)
+    server = build_server(settings, session_factory, caller_is_local=True, is_stdio=True)
     server.run(transport="stdio")
 
 
 def serve_http(settings: Settings, session_factory: sessionmaker[Session]) -> None:
     """Run the MCP server over Streamable HTTP, bound to ``settings.http_bind``.
 
-    A loopback bind needs nothing further — ``config.Settings`` already required a
-    bearer token and an Origin allowlist for any *other* bind, and this function wraps
-    the SDK's own Starlette app with :class:`_TransportSecurityMiddleware` to enforce
-    them on every request whenever the bind is non-loopback.
+    A loopback bind needs nothing further — ``config.Settings`` already required an
+    Origin allowlist (and, unless v2 OIDC identity is configured, a bearer token) for
+    any *other* bind, and this function wraps the SDK's own Starlette app with
+    :class:`_TransportSecurityMiddleware` to enforce them on every request whenever the
+    bind is non-loopback. Bearer-token enforcement itself is skipped here specifically
+    when OIDC is active — ``build_server`` has already wired the SDK's own
+    ``token_verifier``-driven auth middleware into the app it returned, which enforces
+    a real per-request JWT instead (ADR-014 section 1).
     """
     host, port = settings.http_bind_host_port()
     caller_is_local = _is_loopback_bind(settings.http_bind)
@@ -137,12 +154,17 @@ def serve_http(settings: Settings, session_factory: sessionmaker[Session]) -> No
     )
     app = _CorrelationIdMiddleware(app)
     if not caller_is_local:
-        # `_validate_http_bind_guard` (config.py) already guarantees both are set.
-        bearer_token = settings.http_bearer_token
-        assert bearer_token is not None
+        oidc_active = settings.enable_v2 and settings.identity_mode == "oidc"
+        bearer_token = None
+        if not oidc_active:
+            # `_validate_http_bind_guard` (config.py) guarantees this is set whenever
+            # OIDC is not configured.
+            configured_token = settings.http_bearer_token
+            assert configured_token is not None
+            bearer_token = configured_token.get_secret_value()
         app = _TransportSecurityMiddleware(
             app,
-            bearer_token=bearer_token.get_secret_value(),
+            bearer_token=bearer_token,
             allowed_origins=settings.allowed_origins(),
         )
 

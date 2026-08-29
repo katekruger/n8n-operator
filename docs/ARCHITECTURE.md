@@ -87,7 +87,7 @@ Three commitments shape every structural decision:
 |---|---|---|---|
 | **Adapter** | `mcp/`, `cli/`, `approval/` | Parse and validate transport-level input, call one `core.service` use case, shape the result for the transport. | Decide policy, touch the database, call n8n, or write audit records. |
 | **Core** | `core/` | Orchestrate use cases, apply the state machine, mint and burn handles, compute fingerprints, redact output, and commit transitions with their audit records. | Import any adapter, `fastapi`, `typer`, or the MCP SDK. |
-| **Capability** | `registry/`, `storage/`, `audit/`, `n8n/` | Own one external concern each: the allowlist, persistence, the audit chain, the n8n API. | Depend on each other or on `core/`. |
+| **Capability** | `registry/`, `storage/`, `audit/`, `n8n/`, `identity/` *(v2, stage 02)* | Own one external concern each: the allowlist, persistence, the audit chain, the n8n API, OIDC token validation. | Depend on each other or on `core/`. |
 
 The dependency graph is a DAG pointing inward. A contract test walks the import graph
 and fails the build on a violation (BUILD_PLAN section 10.3).
@@ -127,6 +127,15 @@ regardless of transport, so the surface is provably identical across hosts (AC-2
 
 The `Origin` allowlist is DNS-rebinding defense: without it, a page in the operator's
 browser could reach a loopback-bound MCP server and drive it.
+
+*(v2, stage 02)* When `identity_mode="oidc"`, `server.py`'s composition root wires a
+`_OperatorTokenVerifier` — bridging `identity/oidc.py`'s pure JWT/JWKS validation and
+`core/identity.py`'s database-backed JIT-provisioning/disabled-principal check — into
+the installed MCP SDK's own `TokenVerifier`/`AuthContextMiddleware`/
+`RequireAuthMiddleware` framework, rather than a parallel, hand-rolled mechanism. This
+is what makes a non-loopback HTTP bind's identity requirement (section 3.1's guard,
+extended by ADR-014) a real per-request authentication check, not just a static
+bearer token. See [OIDC_SETUP.md](OIDC_SETUP.md).
 
 ### 3.2 Response shaping
 

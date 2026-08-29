@@ -54,7 +54,10 @@ class Environment(StrEnum):
 
 
 class Principal(BaseModel):
-    """Who acted (BUILD_PLAN section 8.1). v1 holds exactly one row, ``kind="local"``."""
+    """Who acted (BUILD_PLAN section 8.1). v1 holds exactly one row, ``kind="local"``.
+
+    ``external_issuer``, ``disabled_at``, and ``credential_ref`` are v2 (ADR-013,
+    ADR-014; stage 02)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -62,6 +65,9 @@ class Principal(BaseModel):
     kind: Literal["local", "user", "service"]
     display_name: str
     external_subject: str | None = None
+    external_issuer: str | None = None
+    disabled_at: datetime | None = None
+    credential_ref: str | None = None
     created_at: datetime
 
 

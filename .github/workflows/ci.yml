@@ -115,10 +115,82 @@ jobs:
           name: coverage-data-postgres
           path: coverage-postgres.dat
 
+  keycloak:
+    name: keycloak integration harness
+    runs-on: ubuntu-latest
+    # No `services:` block here (unlike the `postgres` job above): GitHub Actions
+    # service containers accept image/env/ports/volumes/options but not a command
+    # override, and the vanilla Keycloak image needs `start-dev --import-realm` as
+    # its command — it does nothing useful started bare. A service container also
+    # starts before `actions/checkout`, so it could not bind-mount
+    # docker/keycloak-test/realm-export.json from the runner's checkout anyway. This
+    # job instead runs the exact same image/command/bind-mount as
+    # docker/keycloak-test/docker-compose.yml directly via `docker run`, once the repo
+    # is checked out — the same realm import mechanism locally and in CI, not a second
+    # (admin-REST-API-driven) provisioning path to keep in sync.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Start Keycloak
+        # Same image, port, and realm-export.json bind-mount as
+        # docker/keycloak-test/docker-compose.yml — loopback only, disposable, no
+        # named volume (nothing here needs to persist past this job).
+        run: |
+          docker run -d --name n8n-operator-keycloak-ci \
+            -p 127.0.0.1:8081:8080 \
+            -e KEYCLOAK_ADMIN=admin \
+            -e KEYCLOAK_ADMIN_PASSWORD=admin \
+            -v "$PWD/docker/keycloak-test/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro" \
+            quay.io/keycloak/keycloak:26.0 \
+            start-dev --import-realm
+
+      - name: Wait for the n8n-operator-test realm to come up
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:8081/realms/n8n-operator-test/.well-known/openid-configuration" > /dev/null; then
+              echo "Keycloak realm is up."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Keycloak did not become healthy in time" >&2
+          docker logs n8n-operator-keycloak-ci || true
+          exit 1
+
+      - name: Keycloak integration tests
+        env:
+          N8N_OPERATOR_TEST_KEYCLOAK_URL: http://127.0.0.1:8081
+          COVERAGE_FILE: coverage-keycloak.dat
+        run: >-
+          uv run pytest -m keycloak
+          --cov=src/n8n_operator
+          --cov-report=term-missing
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-data-keycloak
+          path: coverage-keycloak.dat
+
+      - name: Stop Keycloak
+        if: always()
+        run: docker rm -f n8n-operator-keycloak-ci || true
+
   coverage:
     name: combined coverage gate
     runs-on: ubuntu-latest
-    needs: [check, postgres]
+    needs: [check, postgres, keycloak]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -143,12 +215,18 @@ jobs:
         with:
           name: coverage-data-postgres
 
+      - name: Download keycloak job's coverage data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-data-keycloak
+
       - name: Combine and gate
-        # The one place --cov-fail-under is enforced: the two jobs above together
-        # exercise every line this codebase's non-live test suite can reach (SQLite
-        # and PostgreSQL both), so this is the first point a true total exists.
+        # The one place --cov-fail-under is enforced: the three jobs above together
+        # exercise every line this codebase's non-live test suite can reach (SQLite,
+        # PostgreSQL, and a real OIDC provider all included), so this is the first
+        # point a true total exists.
         run: |
-          uv run coverage combine coverage-check.dat coverage-postgres.dat
+          uv run coverage combine coverage-check.dat coverage-postgres.dat coverage-keycloak.dat
           uv run coverage report --fail-under=90
           uv run coverage xml
 

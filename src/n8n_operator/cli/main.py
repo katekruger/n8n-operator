@@ -2,7 +2,8 @@
 
 Command groups: ``db`` (phase 1), ``registry`` (phase 2), ``serve stdio``/``serve http``
 (phase 5), ``operations`` and ``serve approval`` (phase 6), ``audit`` and ``health``
-(phase 8). ``app`` is the object ``pyproject.toml``'s ``[project.scripts]`` entry point
+(phase 8), ``identity`` (phase 10, v2 stage 02). ``app`` is the object
+``pyproject.toml``'s ``[project.scripts]`` entry point
 and ``__main__.py`` both invoke — there is exactly one Typer application, regardless of
 entry point.
 
@@ -31,6 +32,7 @@ import typer
 from n8n_operator.cli.commands import audit as audit_commands
 from n8n_operator.cli.commands import db as db_commands
 from n8n_operator.cli.commands import health as health_commands
+from n8n_operator.cli.commands import identity as identity_commands
 from n8n_operator.cli.commands import operations as operations_commands
 from n8n_operator.cli.commands import registry as registry_commands
 from n8n_operator.cli.commands import serve as serve_commands
@@ -62,6 +64,7 @@ app.add_typer(registry_commands.app, name="registry")
 app.add_typer(serve_commands.app, name="serve")
 app.add_typer(operations_commands.app, name="operations")
 app.add_typer(audit_commands.app, name="audit")
+app.add_typer(identity_commands.app, name="identity")
 app.command("health")(health_commands.health)
 
 __all__ = ["app"]

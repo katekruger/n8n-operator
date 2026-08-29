@@ -35,9 +35,12 @@ from n8n_operator.storage.models import (
     GENESIS_HASH,
     Approval,
     AuditLogEntry,
+    Environment,
     ExecutionResult,
     Operation,
     OperationEvent,
+    Organization,
+    OrganizationMembership,
     Principal,
     RegistrySnapshot,
     WorkflowBinding,
@@ -47,7 +50,16 @@ from n8n_operator.storage.models import (
 
 
 class PrincipalRepository:
-    """The ``principals`` table. v1 holds exactly one row, ``kind='local'``."""
+    """The ``principals`` table. v1 holds exactly one row, ``kind='local'``.
+
+    Stage 02 (ADR-013, ADR-014) adds ``kind='user'``/``kind='service'`` rows:
+    ``get_by_external_identity`` is the JIT-provisioning lookup keyed on ``(iss, sub)``
+    (never ``sub`` alone), ``disable``/``enable`` set/clear ``disabled_at`` (checked
+    live on every request, never cached — ADR-014 section 4), and
+    ``set_credential_ref`` repoints a service principal's ``env:``/``keyring:``
+    credential reference (ADR-013 section 3) — "rotation" from this table's
+    perspective, since the secret value itself lives outside the database.
+    """
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -58,12 +70,16 @@ class PrincipalRepository:
         kind: str,
         display_name: str,
         external_subject: str | None = None,
+        external_issuer: str | None = None,
+        credential_ref: str | None = None,
         id: str | None = None,  # noqa: A002 - matches the column name deliberately
     ) -> Principal:
         principal = Principal(
             id=id or new_ulid(),
             kind=kind,
             display_name=display_name,
+            external_issuer=external_issuer,
+            credential_ref=credential_ref,
             external_subject=external_subject,
         )
         self._session.add(principal)
@@ -72,6 +88,44 @@ class PrincipalRepository:
 
     def get(self, principal_id: str) -> Principal | None:
         return self._session.get(Principal, principal_id)
+
+    def get_by_external_identity(self, *, issuer: str, subject: str) -> Principal | None:
+        """The JIT-provisioning lookup: does a principal already exist for this
+        ``(iss, sub)`` pair. Never matches on ``subject`` alone (ADR-014)."""
+        stmt: Select[tuple[Principal]] = select(Principal).where(
+            Principal.external_issuer == issuer, Principal.external_subject == subject
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def disable(self, principal_id: str, *, disabled_at: datetime | None = None) -> Principal:
+        principal = self._session.get(Principal, principal_id)
+        if principal is None:
+            raise LookupError(f"no such principal: {principal_id}")
+        principal.disabled_at = disabled_at or utc_now()
+        self._session.flush()
+        return principal
+
+    def enable(self, principal_id: str) -> Principal:
+        principal = self._session.get(Principal, principal_id)
+        if principal is None:
+            raise LookupError(f"no such principal: {principal_id}")
+        principal.disabled_at = None
+        self._session.flush()
+        return principal
+
+    def set_credential_ref(self, principal_id: str, credential_ref: str | None) -> Principal:
+        principal = self._session.get(Principal, principal_id)
+        if principal is None:
+            raise LookupError(f"no such principal: {principal_id}")
+        principal.credential_ref = credential_ref
+        self._session.flush()
+        return principal
+
+    def list_service_principals(self, *, include_disabled: bool = True) -> list[Principal]:
+        stmt: Select[tuple[Principal]] = select(Principal).where(Principal.kind == "service")
+        if not include_disabled:
+            stmt = stmt.where(Principal.disabled_at.is_(None))
+        return list(self._session.scalars(stmt.order_by(Principal.created_at)))
 
 
 class RegistrySnapshotRepository:
@@ -671,12 +725,145 @@ class AuditLogRepository:
         return entries
 
 
+class OrganizationRepository:
+    """The ``organizations`` table — the v2 tenant boundary (ADR-013 section 1).
+
+    No cross-organization query exists in the *MCP tool* surface (ADR-013's own
+    stated boundary), but this is the storage layer the local admin CLI (stage 02) and
+    ``whoami`` both need — an operator's own deployment inspecting its own database is
+    not the cross-tenant query ADR-013 forecloses.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(self, *, name: str, id: str | None = None) -> Organization:  # noqa: A002
+        organization = Organization(id=id or new_ulid(), name=name)
+        self._session.add(organization)
+        self._session.flush()
+        return organization
+
+    def get(self, organization_id: str) -> Organization | None:
+        return self._session.get(Organization, organization_id)
+
+    def list(self) -> list[Organization]:
+        stmt: Select[tuple[Organization]] = select(Organization).order_by(Organization.created_at)
+        return list(self._session.scalars(stmt))
+
+
+class OrganizationMembershipRepository:
+    """The ``organization_memberships`` table — the RBAC grant (ADR-013 section 2,
+    ADR-015). ``active_organization_id`` is kept in lock-step with ``removed_at`` by
+    this class alone (never set directly by a caller): equal to ``organization_id``
+    while active, ``NULL`` once :meth:`remove` is called — the portable NULL-uniqueness
+    technique ``uq_organization_memberships_active`` relies on (see
+    ``storage/models.py``'s ``OrganizationMembership`` docstring).
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(
+        self,
+        *,
+        principal_id: str,
+        organization_id: str,
+        roles: builtins.list[str],
+        workflow_scope: str = "*",
+        environment_scope: builtins.list[str] | None = None,
+        id: str | None = None,  # noqa: A002
+    ) -> OrganizationMembership:
+        if not roles:
+            raise ValueError("a membership must grant at least one role")
+        membership = OrganizationMembership(
+            id=id or new_ulid(),
+            principal_id=principal_id,
+            organization_id=organization_id,
+            active_organization_id=organization_id,
+            roles=list(roles),
+            workflow_scope=workflow_scope,
+            environment_scope=list(environment_scope) if environment_scope else ["*"],
+        )
+        self._session.add(membership)
+        self._session.flush()
+        return membership
+
+    def get_active(
+        self, *, principal_id: str, organization_id: str
+    ) -> OrganizationMembership | None:
+        stmt: Select[tuple[OrganizationMembership]] = select(OrganizationMembership).where(
+            OrganizationMembership.principal_id == principal_id,
+            OrganizationMembership.organization_id == organization_id,
+            OrganizationMembership.removed_at.is_(None),
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def list_active_for_principal(self, principal_id: str) -> builtins.list[OrganizationMembership]:
+        """Every organization this principal currently belongs to — ``whoami``'s own
+        read path. Queried fresh on every call; nothing here is cached (ADR-014
+        section 4's "re-read, never cache" discipline extended from disabled
+        principals to memberships)."""
+        stmt: Select[tuple[OrganizationMembership]] = (
+            select(OrganizationMembership)
+            .where(
+                OrganizationMembership.principal_id == principal_id,
+                OrganizationMembership.removed_at.is_(None),
+            )
+            .order_by(OrganizationMembership.created_at)
+        )
+        return list(self._session.scalars(stmt))
+
+    def list_for_organization(
+        self, organization_id: str, *, include_removed: bool = False
+    ) -> builtins.list[OrganizationMembership]:
+        stmt: Select[tuple[OrganizationMembership]] = select(OrganizationMembership).where(
+            OrganizationMembership.organization_id == organization_id
+        )
+        if not include_removed:
+            stmt = stmt.where(OrganizationMembership.removed_at.is_(None))
+        return list(self._session.scalars(stmt.order_by(OrganizationMembership.created_at)))
+
+    def remove(self, membership_id: str) -> OrganizationMembership:
+        membership = self._session.get(OrganizationMembership, membership_id)
+        if membership is None:
+            raise LookupError(f"no such membership: {membership_id}")
+        membership.removed_at = utc_now()
+        membership.active_organization_id = None
+        self._session.flush()
+        return membership
+
+
+class EnvironmentRepository:
+    """The ``environments`` table (ADR-016). Read-only here: stage 02 only needs
+    ``whoami`` to list an organization's environments; full CRUD (create, archive,
+    overlay validation) is stage 04's job. Every row this returns is real regardless —
+    there is no "stage 04 has not run yet" special case, only an empty table until an
+    admin (or stage 04's own tooling) creates the first one.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def list_for_organization(
+        self, organization_id: str, *, include_archived: bool = False
+    ) -> builtins.list[Environment]:
+        stmt: Select[tuple[Environment]] = select(Environment).where(
+            Environment.organization_id == organization_id
+        )
+        if not include_archived:
+            stmt = stmt.where(Environment.archived_at.is_(None))
+        return list(self._session.scalars(stmt.order_by(Environment.created_at)))
+
+
 __all__ = [
     "ApprovalRepository",
     "AuditLogRepository",
+    "EnvironmentRepository",
     "ExecutionResultRepository",
     "OperationEventRepository",
     "OperationRepository",
+    "OrganizationMembershipRepository",
+    "OrganizationRepository",
     "PrincipalRepository",
     "RegistrySnapshotRepository",
     "WorkflowBindingRepository",
