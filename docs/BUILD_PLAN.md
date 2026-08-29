@@ -221,6 +221,8 @@ n8n-operator/
 │   ├── POSTGRES_OPERATIONS.md      # backup/restore/rollback, capacity, dev setup (stage 01)
 │   ├── OIDC_SETUP.md               # provider-neutral OIDC setup + reference config (stage 02)
 │   ├── LEAST_PRIVILEGE.md          # worked role/scope profiles for three org shapes (stage 03)
+│   ├── integrations/
+│   │   └── agent-audit.md          # optional agent-audit bridge: transition mapping, status
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -334,6 +336,9 @@ n8n-operator/
 │       │   ├── tools.py            # tool definitions -> core.service calls
 │       │   ├── resources.py        # registry:// and audit:// resources
 │       │   └── transports.py       # stdio + Streamable HTTP
+│       ├── integrations/           # optional third-party observability bridges
+│       │   ├── __init__.py
+│       │   └── agent_audit.py      # agent-audit emission alongside audit_log
 │       └── cli/                    # Typer
 │           ├── __init__.py
 │           ├── main.py

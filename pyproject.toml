@@ -66,6 +66,25 @@ dev = [
   "types-pyyaml>=6.0,<7",
   "types-jsonschema>=4.26.0.20260518",
 ]
+# Optional dogfooding of https://github.com/katekruger/agent-audit
+# (src/n8n_operator/integrations/agent_audit.py). Deliberately a
+# dependency group, not a project.optional-dependencies extra: PyPI
+# rejects direct git references in published package metadata, and
+# agent-audit is not yet on PyPI (see docs/integrations/agent-audit.md).
+#
+# Pinned to fix/auto-deny-forbids-execution, NOT main: as of this
+# writing agent-audit's PRs (#1-#5, the spec/schema/emitter/hooks work
+# plus a fix this integration surfaced -- see AUTO_DENY in
+# integrations/agent_audit.py) are still open against main, which
+# currently has none of it. Repoint this at main (or a PyPI version,
+# switching to project.optional-dependencies) once those merge -- verify
+# it resolves before assuming this comment is stale.
+#
+# Requires access to that repo, which is currently PRIVATE — this group
+# will not resolve for anyone without access until agent-audit publishes.
+agent-audit = [
+  "agent-audit-record @ git+https://github.com/katekruger/agent-audit.git@fix/auto-deny-forbids-execution#subdirectory=py",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -137,6 +156,14 @@ ignore_missing_imports = true
 # Optional dependency (the 'keyring' extra, ADR-006); imported lazily inside a
 # try/except in config.py precisely so its absence is not a hard failure.
 module = ["keyring.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional dependency (the 'agent-audit' dependency group); imported lazily
+# inside a try/except in integrations/agent_audit.py precisely so its
+# absence is not a hard failure. Not yet on PyPI -- see that module's
+# docstring and docs/integrations/agent-audit.md.
+module = ["agent_audit_record.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

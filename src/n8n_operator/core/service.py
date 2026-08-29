@@ -84,6 +84,7 @@ from n8n_operator.errors import (
     WorkflowMissingOnInstanceError,
     WorkflowNotFoundError,
 )
+from n8n_operator.integrations import agent_audit
 from n8n_operator.registry.loader import LoadedOverlay, LoadedRegistry, load_overlay, load_registry
 from n8n_operator.registry.schema import (
     RegistryDocument,
@@ -298,6 +299,7 @@ def _apply_and_audit(
         outcome=_TRANSITION_OUTCOME[transition_id],
         detail=resolved_detail,
     )
+    agent_audit.emit_transition(transition_id, operation_id=operation_row.id, actor=actor)
     return updated
 
 
@@ -328,6 +330,12 @@ def _record_creation(
         subject_id=operation_row.id,
         outcome=_TRANSITION_OUTCOME["T01"],
         detail=resolved_detail,
+    )
+    agent_audit.emit_proposed(
+        operation_id=operation_row.id,
+        principal_id=operation_row.principal_id,
+        environment=operation_row.environment,
+        workflow_id=operation_row.workflow_id,
     )
 
 
@@ -1078,6 +1086,12 @@ def prepare_operation(
             subject_id=workflow_id,
             outcome="denied",
             detail={"code": exc.code, **exc.details},
+        )
+        agent_audit.emit_prepare_denied(
+            workflow_id=workflow_id,
+            principal_id=principal_id,
+            environment=environment_value,
+            reason=exc.code,
         )
         # ADR-011: "the attempt is still audited" even though no operation row is ever
         # written. The caller's own `session_scope` rolls back on any exception
