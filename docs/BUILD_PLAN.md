@@ -223,6 +223,12 @@ n8n-operator/
 │   ├── LEAST_PRIVILEGE.md          # worked role/scope profiles for three org shapes (stage 03)
 │   ├── METRICS_AND_ALERTS.md       # get_metrics/list_audit_events/alert-hook guide (stage 08)
 │   ├── AUDIT_ANCHORING.md          # key mgmt, publish/verify, protection scope (stage 09)
+│   ├── GTM_STARTER_KITS.md         # starter-kit tour + real journey walkthroughs (stage 10)
+│   ├── OPERATOR_GUIDE.md           # clean-machine path to a working staging env (stage 10)
+│   ├── APPROVER_GUIDE.md           # decision context, self-approval, quorum (stage 10)
+│   ├── TROUBLESHOOTING.md          # symptom-to-cause decision tree (stage 10)
+│   ├── WHAT_THIS_REFUSES_TO_DO.md  # every refusal, why, and the threat it closes (stage 10)
+│   ├── MCP_CLIENT_RECIPES.md       # literal tool-call JSON for the 20-tool surface (stage 10)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -246,7 +252,9 @@ n8n-operator/
 ├── examples/
 │   ├── registry/
 │   │   ├── workflows.example.yaml         # annotated sample registry
-│   │   └── synthetic_test_workflow.json   # importable n8n workflow for testing (phase 9)
+│   │   ├── synthetic_test_workflow.json   # importable n8n workflow for testing (phase 9)
+│   │   └── starter-kits/                  # sanitized GTM starter-kit registry (stage 10)
+│   │       └── gtm-starter-kits.yaml
 │   ├── environments/                      # annotated sample overlays (stage 04)
 │   │   ├── development.yaml               # no overrides — inherits the base registry
 │   │   ├── staging.yaml                   # a new rate ceiling the base doesn't set
@@ -2525,10 +2533,13 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 10 — GTM starter kits and onboarding
 
-- [ ] Example registries and onboarding walkthroughs for the three v2 user journeys in
+- [x] Example registries and onboarding walkthroughs for the three v2 user journeys in
       ARCHITECTURE.md: a startup GTM engineer on staging+production, a RevOps
       two-person-approval bulk CRM update, and a marketing-ops drift/failed-enrichment
-      investigation
+      investigation (`examples/registry/starter-kits/gtm-starter-kits.yaml`,
+      `docs/GTM_STARTER_KITS.md`, `docs/OPERATOR_GUIDE.md`, `docs/APPROVER_GUIDE.md`,
+      `docs/TROUBLESHOOTING.md`, `docs/WHAT_THIS_REFUSES_TO_DO.md`,
+      `docs/MCP_CLIENT_RECIPES.md`, `docs/LEAST_PRIVILEGE.md` rewritten in place)
 
 #### Stage 11 — v2 integration, release, and proof
 
