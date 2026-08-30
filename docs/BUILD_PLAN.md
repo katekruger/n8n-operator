@@ -221,6 +221,7 @@ n8n-operator/
 │   ├── POSTGRES_OPERATIONS.md      # backup/restore/rollback, capacity, dev setup (stage 01)
 │   ├── OIDC_SETUP.md               # provider-neutral OIDC setup + reference config (stage 02)
 │   ├── LEAST_PRIVILEGE.md          # worked role/scope profiles for three org shapes (stage 03)
+│   ├── METRICS_AND_ALERTS.md       # get_metrics/list_audit_events/alert-hook guide (stage 08)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -351,12 +352,13 @@ n8n-operator/
 │               ├── registry.py     # validate, list, show, hash, reload
 │               ├── serve.py        # serve stdio | serve http | serve approval
 │               ├── operations.py   # list, show, cancel, expire
-│               ├── audit.py        # verify, export
+│               ├── audit.py        # verify, export, list (stage 08)
 │               ├── health.py       # get_instance_health, from the command line
 │               ├── db.py           # init, migrate, status, migrate-to-postgres
 │               ├── identity.py     # orgs, memberships, service principals (stage 02)
 │               ├── environment.py  # environments, overlays (stage 04)
-│               └── notifications.py  # retry-failed (stage 05)
+│               ├── notifications.py  # retry-failed (stage 05), check-alerts (stage 08)
+│               └── metrics.py      # show (stage 08)
 └── tests/
     ├── conftest.py
     ├── fixtures/
@@ -2489,16 +2491,21 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 08 — Metrics, audit query, and alert hooks
 
-- [ ] `get_metrics` tool (MCP_TOOLS.md section 5.7): pre-aggregation authorization
+- [x] `get_metrics` tool (MCP_TOOLS.md section 5.7): pre-aggregation authorization
       filtering, enumerated windows, 50-entry cardinality cap with `"other"` bucket,
       10-sample percentile floor (ADR-019)
-- [ ] `list_audit_events` tool (MCP_TOOLS.md section 5.8): cursor pagination anchored
+- [x] `list_audit_events` tool (MCP_TOOLS.md section 5.8): cursor pagination anchored
       to `audit_log.seq`, authorization-filters-before-pagination, v1 write-time
       redaction unchanged (ADR-012 section 3)
-- [ ] Alert-hook triggers (drift detected, `EXECUTING` stuck past threshold, an
-      operation reaching `UNKNOWN`) delivered over the same `NotificationSink` (ADR-018)
-- [ ] `notification_deliveries` table (section 8.3)
-- [ ] AC-41 (alert-hook half), AC-42, AC-43 demonstrable
+- [x] Alert-hook triggers (drift detected — reactive, fired inline by
+      `prepare_operation`/`retry_operation`; `EXECUTING` stuck past threshold; an
+      operation reaching `UNKNOWN` — both via the periodic
+      `notifications check-alerts` sweep) delivered over the same `NotificationSink`
+      (ADR-018)
+- [x] `notification_deliveries` table (section 8.3) — already schema-present since
+      stage 01 (migration 0003); stage 08 adds no new migration, only the two sweep
+      call sites that use it
+- [x] AC-41 (alert-hook half), AC-42, AC-43 demonstrable
 
 #### Stage 09 — External audit anchoring
 

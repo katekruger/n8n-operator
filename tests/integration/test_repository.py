@@ -855,6 +855,7 @@ def test_no_update_or_delete_method_exists_on_audit_log_repository() -> None:
         "list_range",
         "list_all",
         "list_for_subject",
+        "list_page",
     }
 
 

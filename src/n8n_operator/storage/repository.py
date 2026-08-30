@@ -27,7 +27,7 @@ import builtins
 from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, Select, false, func, or_, select, update
+from sqlalchemy import CursorResult, Select, false, func, or_, select, true, update
 from sqlalchemy.orm import Session
 
 from n8n_operator.errors import OptimisticLockError
@@ -259,6 +259,39 @@ class WorkflowDefinitionSnapshotRepository:
         self._session.add(snapshot)
         self._session.flush()
         return snapshot
+
+
+def _operation_scope_clauses(
+    *,
+    workflow_id_like_patterns: builtins.list[str] | None,
+    environment: str | None,
+    since: datetime | None,
+) -> builtins.list[Any]:
+    """The where-clauses ``get_metrics`` (stage 08, ADR-019) shares with
+    ``OperationRepository.list``'s own scope-filtering shape: ``None`` patterns means
+    no restriction (v1, or a v2 caller not yet scope-resolved by the caller); an empty
+    (non-``None``) list matches nothing, by construction, exactly like ``list`` already
+    guarantees. Module-level (not a method) so :class:`ExecutionResultRepository` can
+    apply the identical scope to its own join without reaching into
+    ``OperationRepository``'s internals."""
+    clauses: builtins.list[Any] = []
+    if workflow_id_like_patterns is not None:
+        if not workflow_id_like_patterns:
+            clauses.append(false())
+        else:
+            clauses.append(
+                or_(
+                    *(
+                        Operation.workflow_id.like(pattern, escape="\\")
+                        for pattern in workflow_id_like_patterns
+                    )
+                )
+            )
+    if environment is not None:
+        clauses.append(Operation.environment == environment)
+    if since is not None:
+        clauses.append(Operation.created_at >= since)
+    return clauses
 
 
 class OperationRepository:
@@ -497,6 +530,88 @@ class OperationRepository:
             .where(Operation.workflow_id == workflow_id, Operation.state.in_(states))
         )
         return self._session.scalar(stmt) or 0
+
+    def count_by_outcome(
+        self,
+        *,
+        workflow_id_like_patterns: builtins.list[str] | None,
+        environment: str | None,
+        since: datetime | None,
+    ) -> dict[str, int]:
+        """``{state: count}`` for every state present, scoped and windowed
+        identically to :meth:`list` (``get_metrics``'s ``totals.by_outcome``, ADR-019
+        section 2 — filtered before aggregation, never after)."""
+        clauses = _operation_scope_clauses(
+            workflow_id_like_patterns=workflow_id_like_patterns,
+            environment=environment,
+            since=since,
+        )
+        stmt = select(Operation.state, func.count()).group_by(Operation.state)
+        if clauses:
+            stmt = stmt.where(*clauses)
+        return dict(cast("list[tuple[str, int]]", self._session.execute(stmt).all()))
+
+    def breakdown_by_workflow(
+        self,
+        *,
+        workflow_id_like_patterns: builtins.list[str] | None,
+        environment: str | None,
+        since: datetime | None,
+    ) -> builtins.list[tuple[str, int, dict[str, int]]]:
+        """``[(workflow_id, count, {state: count})]``, most-frequent workflow first —
+        ``get_metrics``'s ``group_by=workflow`` breakdown (ADR-019 section 3). Every
+        distinct workflow present in the window is returned; cardinality here is
+        bounded by the *registry's own* distinct workflow count (a caller can create
+        operations, never new workflow ids), so the 50-entry cap and ``"other"`` fold
+        are the caller's (``core.service.get_metrics``'s) job, not this query's."""
+        clauses = _operation_scope_clauses(
+            workflow_id_like_patterns=workflow_id_like_patterns,
+            environment=environment,
+            since=since,
+        )
+        by_state_stmt = select(Operation.workflow_id, Operation.state, func.count()).group_by(
+            Operation.workflow_id, Operation.state
+        )
+        if clauses:
+            by_state_stmt = by_state_stmt.where(*clauses)
+        totals: dict[str, dict[str, int]] = {}
+        for workflow_id, state, count in self._session.execute(by_state_stmt).all():
+            totals.setdefault(workflow_id, {})[state] = count
+        rows = [
+            (workflow_id, sum(by_outcome.values()), by_outcome)
+            for workflow_id, by_outcome in totals.items()
+        ]
+        rows.sort(key=lambda row: row[1], reverse=True)
+        return rows
+
+    def stuck_executing(
+        self, *, older_than: datetime, limit: int = 500
+    ) -> builtins.list[Operation]:
+        """Every ``EXECUTING`` operation last updated before ``older_than`` (stage 08's
+        alert-hook sweep, BUILD_PLAN section 8's "EXECUTING stuck past threshold").
+        Mirrors :meth:`list_overdue`'s own shape — a system-wide sweep, not
+        principal-scoped."""
+        stmt: Select[tuple[Operation]] = (
+            select(Operation)
+            .where(Operation.state == "EXECUTING", Operation.updated_at < older_than)
+            .order_by(Operation.updated_at.asc())
+            .limit(limit)
+        )
+        return list(self._session.scalars(stmt))
+
+    def list_unknown(self, *, limit: int = 500) -> builtins.list[Operation]:
+        """Every operation currently ``UNKNOWN`` (stage 08's alert-hook sweep).
+        Re-scanned on every sweep tick, like :meth:`list_overdue` — the alert-hook's
+        own permanent per-``(subject_id, event_type)`` delivery dedup
+        (``core.service._deliver_with_dedup``) is what keeps a re-scan from re-alerting,
+        not this query only returning "new" rows."""
+        stmt: Select[tuple[Operation]] = (
+            select(Operation)
+            .where(Operation.state == "UNKNOWN")
+            .order_by(Operation.updated_at.asc())
+            .limit(limit)
+        )
+        return list(self._session.scalars(stmt))
 
     def compare_and_set_state(
         self,
@@ -839,6 +954,40 @@ class ExecutionResultRepository:
     def get(self, operation_id: str) -> ExecutionResult | None:
         return self._session.get(ExecutionResult, operation_id)
 
+    def list_finished_durations_ms(
+        self,
+        *,
+        workflow_id_like_patterns: builtins.list[str] | None,
+        environment: str | None,
+        since: datetime | None,
+    ) -> builtins.list[float]:
+        """``(finished_at - started_at)`` in milliseconds for every finished execution
+        in scope and window (``get_metrics``'s ``latency_ms``, ADR-019 section 4).
+        Percentiles are computed in Python over this bounded, in-memory list — no
+        dialect-specific percentile SQL function exists across SQLite and PostgreSQL
+        (ADR-004), and the window bound (at most 30 days) keeps this list small enough
+        to sort in memory. Joins to ``operations`` for scope and ``since`` (the window
+        is defined by *when the operation was created*, matching every other
+        ``get_metrics`` dimension), so an execution the caller isn't authorized to see
+        is excluded before any duration is ever computed, not after."""
+        clauses = [
+            ExecutionResult.started_at.is_not(None),
+            ExecutionResult.finished_at.is_not(None),
+        ]
+        stmt = select(ExecutionResult.started_at, ExecutionResult.finished_at).join(
+            Operation, Operation.id == ExecutionResult.operation_id
+        )
+        op_scope = _operation_scope_clauses(
+            workflow_id_like_patterns=workflow_id_like_patterns,
+            environment=environment,
+            since=since,
+        )
+        stmt = stmt.where(*clauses, *op_scope)
+        durations: builtins.list[float] = []
+        for started_at, finished_at in self._session.execute(stmt).all():
+            durations.append((finished_at - started_at).total_seconds() * 1000)
+        return durations
+
 
 class AuditLogRepository:
     """The append-only, hash-chained ``audit_log`` table.
@@ -947,6 +1096,108 @@ class AuditLogRepository:
                 break
             start_seq = page[-1].seq + 1
         return entries
+
+    def list_page(
+        self,
+        *,
+        before_seq: int | None,
+        limit: int,
+        since: datetime | None,
+        workflow_id: str | None,
+        workflow_id_like_patterns: builtins.list[str] | None,
+        environment_id: str | None,
+        include_registry_snapshot_events: bool,
+    ) -> list[AuditLogEntry]:
+        """``list_audit_events``'s own read path (stage 08, ADR-012 section 3) — most
+        recent first, ``seq < before_seq`` as the page boundary (mirrors
+        ``OperationRepository.list``'s ``before_id <`` pattern, just descending on the
+        integer ``seq`` instead of a lexicographically-sortable ULID string).
+
+        Authorization filters the query, not the result (ADR-012 section 3): an entry
+        is included only if its ``subject_type``/``subject_id`` resolves to something
+        in scope —
+
+        * ``subject_type="workflow"``: ``subject_id`` matches a pattern directly.
+        * ``subject_type="operation"``: the referenced operation's own ``workflow_id``
+          matches a pattern (a correlated ``EXISTS`` against ``operations``, not a join,
+          so a matching operation never duplicates its audit rows).
+        * ``subject_type="environment"``: ``subject_id == environment_id`` — the caller
+          already only ever has a caller-visible ``environment_id`` to pass here
+          (``identity.resolve_environment`` applied its own visibility rule before this
+          point), so no further pattern check is needed for this branch.
+        * ``subject_type="registry_snapshot"``: included only when
+          ``include_registry_snapshot_events`` — a whole-registry-document event has no
+          single workflow/environment owner to scope against, so "no scope" here means
+          "admin only", never "visible to everyone" (the stage's own resolved design
+          decision).
+
+        ``workflow_id_like_patterns=None`` means no scope restriction at all (v1, which
+        has no RBAC concept — every subject type is visible); a non-``None`` empty list
+        makes the first two branches unsatisfiable by construction, exactly like
+        ``OperationRepository.list`` already guarantees for operations themselves. A
+        caller-supplied ``workflow_id`` filter further restricts to that one workflow's
+        own events (both direct ``subject_type="workflow"`` rows and, via the same
+        ``EXISTS``, that workflow's own operations), ANDed on top of the scope clause.
+        """
+        stmt: Select[tuple[AuditLogEntry]] = select(AuditLogEntry)
+
+        if workflow_id_like_patterns is not None:
+            if not workflow_id_like_patterns:
+                workflow_clause: Any = false()
+                operation_clause: Any = false()
+            else:
+                workflow_like = or_(
+                    *(
+                        AuditLogEntry.subject_id.like(pattern, escape="\\")
+                        for pattern in workflow_id_like_patterns
+                    )
+                )
+                operation_like = or_(
+                    *(
+                        Operation.workflow_id.like(pattern, escape="\\")
+                        for pattern in workflow_id_like_patterns
+                    )
+                )
+                workflow_clause = (AuditLogEntry.subject_type == "workflow") & workflow_like
+                operation_clause = (AuditLogEntry.subject_type == "operation") & (
+                    select(Operation.id)
+                    .where(Operation.id == AuditLogEntry.subject_id, operation_like)
+                    .exists()
+                )
+            environment_clause: Any = (AuditLogEntry.subject_type == "environment") & (
+                AuditLogEntry.subject_id == environment_id if environment_id else false()
+            )
+            registry_clause: Any = (AuditLogEntry.subject_type == "registry_snapshot") & (
+                true() if include_registry_snapshot_events else false()
+            )
+            stmt = stmt.where(
+                or_(workflow_clause, operation_clause, environment_clause, registry_clause)
+            )
+
+        if workflow_id is not None:
+            stmt = stmt.where(
+                or_(
+                    (AuditLogEntry.subject_type == "workflow")
+                    & (AuditLogEntry.subject_id == workflow_id),
+                    (AuditLogEntry.subject_type == "operation")
+                    & (
+                        select(Operation.id)
+                        .where(
+                            Operation.id == AuditLogEntry.subject_id,
+                            Operation.workflow_id == workflow_id,
+                        )
+                        .exists()
+                    ),
+                )
+            )
+
+        if since is not None:
+            stmt = stmt.where(AuditLogEntry.occurred_at >= since)
+        if before_seq is not None:
+            stmt = stmt.where(AuditLogEntry.seq < before_seq)
+
+        stmt = stmt.order_by(AuditLogEntry.seq.desc()).limit(limit)
+        return list(self._session.scalars(stmt))
 
 
 class OrganizationRepository:

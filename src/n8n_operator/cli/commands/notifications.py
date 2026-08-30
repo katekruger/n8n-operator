@@ -91,4 +91,47 @@ def retry_failed() -> None:
     typer.echo(f"Retried {count} notification(s).")
 
 
+@app.command("check-alerts")
+def check_alerts(
+    executing_stuck_threshold_seconds: int = typer.Option(
+        3600,
+        "--executing-stuck-threshold-seconds",
+        help="How long an EXECUTING operation must sit unchanged before it alerts.",
+    ),
+) -> None:
+    """Sweep for the two alert-hook conditions that need periodic detection (stage 08,
+    BUILD_PLAN section 8): an ``EXECUTING`` operation stuck past a threshold, and an
+    operation that has reached ``UNKNOWN``. A maintenance convenience for a cron/systemd
+    timer, like ``retry-failed`` — idempotent, safe to run on any schedule
+    (``core.service.check_and_deliver_alerts``'s own permanent per-event dedup means a
+    re-run never re-alerts on something already delivered).
+
+    Drift alerts are reactive, already fired inline by ``prepare_operation``/
+    ``retry_operation`` the moment they discover it — this command covers only the two
+    swept triggers, never drift.
+    """
+    try:
+        sink = _cli_notification_sink()
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                count = service.check_and_deliver_alerts(
+                    session,
+                    sink=sink,
+                    executing_stuck_threshold_seconds=executing_stuck_threshold_seconds,
+                )
+        except OperationalError:
+            typer.secho(
+                "Database is not initialized — run `n8n-operator db init` first.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+    typer.echo(f"Delivered {count} alert(s).")
+
+
 __all__ = ["app"]
