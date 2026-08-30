@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -189,6 +190,70 @@ def resolve_notification_sink_config() -> tuple[str, str | None, str | None]:
         )
     token = resolve_secret_reference(token_ref)
     return sink, url, token
+
+
+@dataclass(frozen=True)
+class AnchorConfig:
+    """Resolved configuration for one ``AuditAnchor`` implementation (stage 09,
+    ADR-012 section 2)."""
+
+    implementation: str
+    signing_key_path: Path
+    webhook_url: str | None = None
+    webhook_bearer_token: str | None = None
+
+
+def resolve_anchor_config(implementation: str | None = None) -> AnchorConfig:
+    """Resolved the same way :func:`resolve_notification_sink_config` is — reads
+    plain env vars, independent of the rest of :class:`Settings`, so
+    ``anchor publish``/``verify``/``status`` never require
+    ``N8N_OPERATOR_N8N_BASE_URL``/``N8N_OPERATOR_N8N_API_KEY`` to be configured
+    (this reads only the audit log, never n8n).
+
+    ``N8N_OPERATOR_ANCHOR_SIGNING_KEY_PATH`` is a filesystem **path**, not an
+    indirected secret value — the key *file itself* is the protected material
+    (ADR-012's own "never store a private signing key in the database"), a different
+    shape of secret than the short opaque values ``env:``/``keyring:`` indirection was
+    built for (ADR-006). ``N8N_OPERATOR_ANCHOR_WEBHOOK_BEARER_TOKEN``, by contrast, is
+    exactly that shape and goes through the same indirection as every other bearer
+    token in this codebase.
+
+    ``implementation``, if given, overrides ``N8N_OPERATOR_ANCHOR_IMPLEMENTATION`` —
+    the CLI's own ``--implementation`` flag takes precedence over the configured
+    default, mirroring how every other CLI flag in this codebase overrides its own
+    env-var default.
+    """
+    resolved_implementation = (
+        implementation
+        or os.environ.get("N8N_OPERATOR_ANCHOR_IMPLEMENTATION", "local_file").strip().lower()
+    )
+    if resolved_implementation not in {"local_file", "https_webhook"}:
+        raise ValueError(
+            "anchor implementation must be 'local_file' or 'https_webhook'; got "
+            f"{resolved_implementation!r}"
+        )
+    key_path_raw = os.environ.get(
+        "N8N_OPERATOR_ANCHOR_SIGNING_KEY_PATH", "~/.n8n-operator/anchor_signing_key"
+    )
+    signing_key_path = Path(key_path_raw).expanduser()
+    if resolved_implementation == "local_file":
+        return AnchorConfig(
+            implementation=resolved_implementation, signing_key_path=signing_key_path
+        )
+    url = os.environ.get("N8N_OPERATOR_ANCHOR_WEBHOOK_URL")
+    token_ref = os.environ.get("N8N_OPERATOR_ANCHOR_WEBHOOK_BEARER_TOKEN")
+    if not url or not token_ref:
+        raise ValueError(
+            "anchor implementation is 'https_webhook'; N8N_OPERATOR_ANCHOR_WEBHOOK_URL "
+            "and N8N_OPERATOR_ANCHOR_WEBHOOK_BEARER_TOKEN are both required"
+        )
+    token = resolve_secret_reference(token_ref)
+    return AnchorConfig(
+        implementation=resolved_implementation,
+        signing_key_path=signing_key_path,
+        webhook_url=url,
+        webhook_bearer_token=token,
+    )
 
 
 def redact_database_url(database_url: str) -> str:
@@ -567,10 +632,12 @@ __all__ = [
     "DEFAULT_HTTP_BIND",
     "DEFAULT_MAX_ARGUMENT_BYTES",
     "DEFAULT_REGISTRY_PATH",
+    "AnchorConfig",
     "Settings",
     "compose_database_url",
     "load_settings",
     "redact_database_url",
+    "resolve_anchor_config",
     "resolve_approval_bind",
     "resolve_database_password",
     "resolve_database_url",

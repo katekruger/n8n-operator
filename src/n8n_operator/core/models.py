@@ -29,12 +29,16 @@ from pydantic import BaseModel, ConfigDict
 from n8n_operator.registry.schema import WorkflowEntry as WorkflowContract
 
 __all__ = [
+    "AnchorReceipt",
+    "AnchorStatusSummary",
+    "AnchorVerification",
     "Approval",
     "ApprovalDecisionContext",
     "ApprovalDecisionEntry",
     "ApprovalStatus",
     "AuditEvent",
     "AuditEventPage",
+    "ChainAnchor",
     "DeliveryOutcome",
     "DeliveryReceipt",
     "DiffEntry",
@@ -568,3 +572,56 @@ class AuditEventPage(BaseModel):
 
     events: list[AuditEvent]
     next_cursor: str | None = None
+
+
+class ChainAnchor(BaseModel):
+    """The minimum that pins chain state (stage 09, ADR-012 section 2) — sequence
+    number, that entry's own hash, the count of entries covered, and the anchoring
+    timestamp. **No audit content, ever**: no actor, no subject, no detail — anchors
+    are published to systems Operator does not fully control, so an anchor that
+    leaked operational detail would turn an integrity control into a disclosure
+    channel. Enforced structurally: this type simply has no field to put one in."""
+
+    model_config = ConfigDict(frozen=True)
+
+    covers_through_seq: int
+    entry_hash: str
+    entry_count: int
+    anchored_at: datetime
+
+
+class AnchorReceipt(BaseModel):
+    """What ``AuditAnchor.publish`` returns — content-free, implementation-specific
+    ``detail`` (a file path and line number, or a URL and HTTP status and
+    response-body hash — never a full response body, never audit content)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    implementation: Literal["local_file", "https_webhook"]
+    detail: dict[str, Any]
+    signature: str
+    public_key: str
+
+
+class AnchorVerification(BaseModel):
+    """What ``AuditAnchor.verify`` returns for one anchor/receipt pair."""
+
+    model_config = ConfigDict(frozen=True)
+
+    ok: bool
+    reason: str | None = None
+    checked_through_seq: int | None = None
+
+
+class AnchorStatusSummary(BaseModel):
+    """One row of ``anchor status`` (stage 09) — the last anchor published for one
+    implementation, and whether the chain has grown since."""
+
+    model_config = ConfigDict(frozen=True)
+
+    implementation: Literal["local_file", "https_webhook"]
+    last_covers_through_seq: int | None = None
+    last_published_at: datetime | None = None
+    last_publish_failed: bool = False
+    chain_tip_seq: int
+    entries_since_last_anchor: int
