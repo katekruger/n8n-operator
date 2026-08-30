@@ -373,12 +373,14 @@ def scenario(postgres_test_db_url: str, tmp_path: Path) -> _ScenarioState:
         org_b = OrganizationRepository(session).create(name="Org B — Globex Marketing")
 
         env_staging = EnvironmentRepository(session).create(
-            organization_id=org_a.id, name="staging",
+            organization_id=org_a.id,
+            name="staging",
             n8n_base_url_ref="env:STAGE11_STAGING_BASE_URL",
             n8n_api_key_ref="env:STAGE11_STAGING_API_KEY",
         )
         env_production = EnvironmentRepository(session).create(
-            organization_id=org_a.id, name="production",
+            organization_id=org_a.id,
+            name="production",
             n8n_base_url_ref="env:STAGE11_PROD_BASE_URL",
             n8n_api_key_ref="env:STAGE11_PROD_API_KEY",
             is_production=True,
@@ -386,7 +388,8 @@ def scenario(postgres_test_db_url: str, tmp_path: Path) -> _ScenarioState:
         # A third environment, in Org B — proves environment scoping is keyed by org,
         # not just by environment row ID.
         env_secondary_prod = EnvironmentRepository(session).create(
-            organization_id=org_b.id, name="production",
+            organization_id=org_b.id,
+            name="production",
             n8n_base_url_ref="env:STAGE11_ORGB_PROD_BASE_URL",
             n8n_api_key_ref="env:STAGE11_ORGB_PROD_API_KEY",
             is_production=True,
@@ -398,28 +401,39 @@ def scenario(postgres_test_db_url: str, tmp_path: Path) -> _ScenarioState:
 
         memberships = OrganizationMembershipRepository(session)
         memberships.create(
-            principal_id=operator_a.id, organization_id=org_a.id,
-            roles=["operator"], workflow_scope="*",
+            principal_id=operator_a.id,
+            organization_id=org_a.id,
+            roles=["operator"],
+            workflow_scope="*",
             environment_scope=[env_staging.id, env_production.id],
         )
         memberships.create(
-            principal_id=approver_a.id, organization_id=org_a.id,
-            roles=["approver"], workflow_scope="*",
+            principal_id=approver_a.id,
+            organization_id=org_a.id,
+            roles=["approver"],
+            workflow_scope="*",
             environment_scope=[env_staging.id, env_production.id],
         )
         memberships.create(
-            principal_id=viewer_b.id, organization_id=org_b.id,
-            roles=["viewer"], workflow_scope="*",
+            principal_id=viewer_b.id,
+            organization_id=org_b.id,
+            roles=["viewer"],
+            workflow_scope="*",
             environment_scope=[env_secondary_prod.id],
         )
 
         state = _ScenarioState(
-            engine=engine, session_factory=factory,
-            org_a_id=org_a.id, org_b_id=org_b.id,
-            env_staging_id=env_staging.id, env_production_id=env_production.id,
+            engine=engine,
+            session_factory=factory,
+            org_a_id=org_a.id,
+            org_b_id=org_b.id,
+            env_staging_id=env_staging.id,
+            env_production_id=env_production.id,
             env_secondary_prod_id=env_secondary_prod.id,
-            org_a_operator_id=operator_a.id, org_a_approver_id=approver_a.id,
-            org_b_viewer_id=viewer_b.id, sink=sink,
+            org_a_operator_id=operator_a.id,
+            org_a_approver_id=approver_a.id,
+            org_b_viewer_id=viewer_b.id,
+            sink=sink,
         )
 
     yield state
@@ -542,44 +556,44 @@ via the repository, since dispatch mechanics aren't this scenario's focus):
 - [ ] **Step 2: Add a reconciliation test for an UNKNOWN operation**
 
 ```python
-    def test_reconcile_an_unknown_operation_records_evidence(
-        self, scenario: _ScenarioState
-    ) -> None:
-        from n8n_operator.core.models import ExecutionLookup
-        from n8n_operator.storage.repository import OperationRepository
+def test_reconcile_an_unknown_operation_records_evidence(self, scenario: _ScenarioState) -> None:
+    from n8n_operator.core.models import ExecutionLookup
+    from n8n_operator.storage.repository import OperationRepository
 
-        class FakeReconciliation:
-            def get_execution(self, execution_id: str) -> ExecutionLookup:
-                return ExecutionLookup(
-                    execution_id=execution_id, n8n_workflow_id="n8n-crm-1", status="success",
-                )
-
-        with session_scope(scenario.session_factory) as session:
-            snapshot = service.get_active_snapshot(session)
-            unknown = OperationRepository(session).create(
-                principal_id=scenario.org_a_operator_id,
-                environment=scenario.env_production_id,
-                snapshot_id=snapshot.id,
-                workflow_id="crm.sync_contact",
-                definition_hash="sha256:" + "a" * 64,
-                state="UNKNOWN",
-                arguments={"email": "unknown-outcome@example.com"},
-                argument_fingerprint="fp-unknown",
-                argument_bytes=10,
+    class FakeReconciliation:
+        def get_execution(self, execution_id: str) -> ExecutionLookup:
+            return ExecutionLookup(
+                execution_id=execution_id,
+                n8n_workflow_id="n8n-crm-1",
+                status="success",
             )
-            unknown_id = unknown.id
 
-        with session_scope(scenario.session_factory) as session:
-            record = service.reconcile_operation(
-                session,
-                operation_id=unknown_id,
-                principal_id=scenario.org_a_operator_id,
-                execution_id="n8n-exec-999",
-                note="Confirmed via n8n execution history: this run succeeded.",
-                reconciliation=FakeReconciliation(),
-                enable_v2=True,
-            )
-            assert record.execution_id == "n8n-exec-999"
+    with session_scope(scenario.session_factory) as session:
+        snapshot = service.get_active_snapshot(session)
+        unknown = OperationRepository(session).create(
+            principal_id=scenario.org_a_operator_id,
+            environment=scenario.env_production_id,
+            snapshot_id=snapshot.id,
+            workflow_id="crm.sync_contact",
+            definition_hash="sha256:" + "a" * 64,
+            state="UNKNOWN",
+            arguments={"email": "unknown-outcome@example.com"},
+            argument_fingerprint="fp-unknown",
+            argument_bytes=10,
+        )
+        unknown_id = unknown.id
+
+    with session_scope(scenario.session_factory) as session:
+        record = service.reconcile_operation(
+            session,
+            operation_id=unknown_id,
+            principal_id=scenario.org_a_operator_id,
+            execution_id="n8n-exec-999",
+            note="Confirmed via n8n execution history: this run succeeded.",
+            reconciliation=FakeReconciliation(),
+            enable_v2=True,
+        )
+        assert record.execution_id == "n8n-exec-999"
 ```
 `ExecutionLookup`'s real fields are `execution_id: str`, `n8n_workflow_id: str`,
 `status: str` (confirmed at `src/n8n_operator/core/models.py:411-424`) — the code above
@@ -612,32 +626,36 @@ already uses the verified shape.
 This is the assertion that actually proves org isolation, not just role scoping:
 
 ```python
-    def test_get_metrics_and_audit_events_never_cross_the_org_boundary(
-        self, scenario: _ScenarioState
-    ) -> None:
-        with session_scope(scenario.session_factory) as session:
-            org_a_metrics = service.get_metrics(
-                session, principal_id=scenario.org_a_operator_id,
-                environment=scenario.env_production_id, group_by="workflow",
-                enable_v2=True,
-            )
-            # Org A's operator has never touched Org B's environment at all — this
-            # call must resolve org membership correctly, never accidentally include
-            # Org B's crm.sync_contact/campaign_sync operations in Org A's totals.
-            assert org_a_metrics.totals.count >= 1
+def test_get_metrics_and_audit_events_never_cross_the_org_boundary(
+    self, scenario: _ScenarioState
+) -> None:
+    with session_scope(scenario.session_factory) as session:
+        org_a_metrics = service.get_metrics(
+            session,
+            principal_id=scenario.org_a_operator_id,
+            environment=scenario.env_production_id,
+            group_by="workflow",
+            enable_v2=True,
+        )
+        # Org A's operator has never touched Org B's environment at all — this
+        # call must resolve org membership correctly, never accidentally include
+        # Org B's crm.sync_contact/campaign_sync operations in Org A's totals.
+        assert org_a_metrics.totals.count >= 1
 
-            org_b_events = service.list_audit_events(
-                session, principal_id=scenario.org_b_viewer_id,
-                environment=scenario.env_secondary_prod_id, enable_v2=True,
-            )
-            # Org B's viewer has no memberships touching Org A's environments — Org
-            # A's own operation ID (created in Task 3a's approve test) must never
-            # appear as a subject_id in Org B's own audit query. AuditEvent carries
-            # no environment_id field directly (confirmed at
-            # src/n8n_operator/core/models.py:283-296), so isolation is proven by
-            # subject identity, not a field comparison.
-            org_b_subject_ids = {event.subject_id for event in org_b_events.events}
-            assert scenario.crm_operation_id not in org_b_subject_ids
+        org_b_events = service.list_audit_events(
+            session,
+            principal_id=scenario.org_b_viewer_id,
+            environment=scenario.env_secondary_prod_id,
+            enable_v2=True,
+        )
+        # Org B's viewer has no memberships touching Org A's environments — Org
+        # A's own operation ID (created in Task 3a's approve test) must never
+        # appear as a subject_id in Org B's own audit query. AuditEvent carries
+        # no environment_id field directly (confirmed at
+        # src/n8n_operator/core/models.py:283-296), so isolation is proven by
+        # subject identity, not a field comparison.
+        org_b_subject_ids = {event.subject_id for event in org_b_events.events}
+        assert scenario.crm_operation_id not in org_b_subject_ids
 ```
 `org_a_metrics.totals.count` is confirmed correct — `MetricsResult.totals` is a
 `MetricsTotals` with a `count: int` field (`src/n8n_operator/core/models.py:504-556`).
@@ -645,75 +663,84 @@ This is the assertion that actually proves org isolation, not just role scoping:
 - [ ] **Step 5: Add an alert-delivery test using the shared FakeSink**
 
 ```python
-    def test_check_and_deliver_alerts_fires_for_a_stuck_executing_operation(
-        self, scenario: _ScenarioState
-    ) -> None:
-        from n8n_operator.storage.repository import OperationRepository
+def test_check_and_deliver_alerts_fires_for_a_stuck_executing_operation(
+    self, scenario: _ScenarioState
+) -> None:
+    from n8n_operator.storage.repository import OperationRepository
 
-        with session_scope(scenario.session_factory) as session:
-            snapshot = service.get_active_snapshot(session)
-            OperationRepository(session).create(
-                principal_id=scenario.org_a_operator_id,
-                environment=scenario.env_production_id,
-                snapshot_id=snapshot.id,
-                workflow_id="crm.sync_contact",
-                definition_hash="sha256:" + "a" * 64,
-                state="EXECUTING",
-                arguments={"email": "stuck@example.com"},
-                argument_fingerprint="fp-stuck",
-                argument_bytes=10,
-            )
+    with session_scope(scenario.session_factory) as session:
+        snapshot = service.get_active_snapshot(session)
+        OperationRepository(session).create(
+            principal_id=scenario.org_a_operator_id,
+            environment=scenario.env_production_id,
+            snapshot_id=snapshot.id,
+            workflow_id="crm.sync_contact",
+            definition_hash="sha256:" + "a" * 64,
+            state="EXECUTING",
+            arguments={"email": "stuck@example.com"},
+            argument_fingerprint="fp-stuck",
+            argument_bytes=10,
+        )
 
-        with session_scope(scenario.session_factory) as session:
-            delivered = service.check_and_deliver_alerts(
-                session, sink=scenario.sink, executing_stuck_threshold_seconds=0,
-            )
-            assert delivered >= 1
-            assert any(e.event_type == "operation.stuck" for e in scenario.sink.events)
+    with session_scope(scenario.session_factory) as session:
+        delivered = service.check_and_deliver_alerts(
+            session,
+            sink=scenario.sink,
+            executing_stuck_threshold_seconds=0,
+        )
+        assert delivered >= 1
+        assert any(e.event_type == "operation.stuck" for e in scenario.sink.events)
 ```
 
 - [ ] **Step 6: Add a both-anchor-implementations test**
 
 ```python
-    def test_both_anchor_implementations_publish_and_verify_the_same_chain(
-        self, scenario: _ScenarioState, tmp_path: Path
-    ) -> None:
-        import httpx
+def test_both_anchor_implementations_publish_and_verify_the_same_chain(
+    self, scenario: _ScenarioState, tmp_path: Path
+) -> None:
+    import httpx
 
-        private_key = Ed25519PrivateKey.generate()
+    private_key = Ed25519PrivateKey.generate()
 
-        from n8n_operator.audit_anchor.local_file import LocalFileAnchor
-        from n8n_operator.audit_anchor.webhook import HttpsWebhookAnchor
+    from n8n_operator.audit_anchor.local_file import LocalFileAnchor
+    from n8n_operator.audit_anchor.webhook import HttpsWebhookAnchor
 
-        local_sink = LocalFileAnchor(
-            path=tmp_path / "anchors.jsonl", private_key=private_key,
+    local_sink = LocalFileAnchor(
+        path=tmp_path / "anchors.jsonl",
+        private_key=private_key,
+    )
+
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    webhook_sink = HttpsWebhookAnchor(
+        url="https://anchors.example.invalid/ingest",
+        bearer_token="stage11-test-token",
+        private_key=private_key,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with session_scope(scenario.session_factory) as session:
+        local_row = service.publish_anchor(
+            session,
+            sink=local_sink,
+            implementation="local_file",
+            enable_v2=True,
         )
+        assert local_row is not None
 
-        captured: list[httpx.Request] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            return httpx.Response(200, json={"ok": True})
-
-        webhook_sink = HttpsWebhookAnchor(
-            url="https://anchors.example.invalid/ingest",
-            bearer_token="stage11-test-token",
-            private_key=private_key,
-            client=httpx.Client(transport=httpx.MockTransport(handler)),
+    with session_scope(scenario.session_factory) as session:
+        webhook_row = service.publish_anchor(
+            session,
+            sink=webhook_sink,
+            implementation="https_webhook",
+            enable_v2=True,
         )
-
-        with session_scope(scenario.session_factory) as session:
-            local_row = service.publish_anchor(
-                session, sink=local_sink, implementation="local_file", enable_v2=True,
-            )
-            assert local_row is not None
-
-        with session_scope(scenario.session_factory) as session:
-            webhook_row = service.publish_anchor(
-                session, sink=webhook_sink, implementation="https_webhook", enable_v2=True,
-            )
-            assert webhook_row is not None
-        assert len(captured) == 1
+        assert webhook_row is not None
+    assert len(captured) == 1
 ```
 
 - [ ] **Step 7: Run the whole scenario file against real Postgres**
@@ -797,7 +824,11 @@ from n8n_operator.storage.repository import (
     PrincipalRepository,
     RegistrySnapshotRepository,
 )
-from n8n_operator.storage.session import create_engine_for_url, create_session_factory, session_scope
+from n8n_operator.storage.session import (
+    create_engine_for_url,
+    create_session_factory,
+    session_scope,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -827,20 +858,32 @@ def _seed_v2_fixture(sqlite_source_url: str, anchor_path: Path) -> dict[str, str
             )
             org = OrganizationRepository(session).create(name="Migration Rehearsal Org")
             env = EnvironmentRepository(session).create(
-                organization_id=org.id, name="production",
+                organization_id=org.id,
+                name="production",
                 n8n_base_url_ref="env:REHEARSAL_BASE_URL",
                 n8n_api_key_ref="env:REHEARSAL_API_KEY",
                 is_production=True,
             )
-            member = PrincipalRepository(session).create(kind="user", display_name="Rehearsal Operator")
-            OrganizationMembershipRepository(session).create(
-                principal_id=member.id, organization_id=org.id, roles=["operator"],
+            member = PrincipalRepository(session).create(
+                kind="user", display_name="Rehearsal Operator"
             )
-            ids = {"org_id": org.id, "env_id": env.id, "member_id": member.id, "principal_id": principal.id}
+            OrganizationMembershipRepository(session).create(
+                principal_id=member.id,
+                organization_id=org.id,
+                roles=["operator"],
+            )
+            ids = {
+                "org_id": org.id,
+                "env_id": env.id,
+                "member_id": member.id,
+                "principal_id": principal.id,
+            }
 
         with session_scope(factory) as session:
             sink = LocalFileAnchor(path=anchor_path, private_key=private_key)
-            row = service.publish_anchor(session, sink=sink, implementation="local_file", enable_v2=True)
+            row = service.publish_anchor(
+                session, sink=sink, implementation="local_file", enable_v2=True
+            )
             assert row is not None
     finally:
         engine.dispose()
@@ -851,7 +894,9 @@ def _seed_v2_fixture(sqlite_source_url: str, anchor_path: Path) -> dict[str, str
 
 ```python
 def test_v2_shaped_dataset_migrates_with_verified_counts_and_intact_anchor_chain(
-    sqlite_source_url: str, postgres_test_db_url: str, tmp_path: Path,
+    sqlite_source_url: str,
+    postgres_test_db_url: str,
+    tmp_path: Path,
 ) -> None:
     anchor_path = tmp_path / "anchors.jsonl"
     ids = _seed_v2_fixture(sqlite_source_url, anchor_path)
@@ -874,7 +919,9 @@ def test_v2_shaped_dataset_migrates_with_verified_counts_and_intact_anchor_chain
 
     after = _row_counts(postgres_test_db_url)
     for table_name, count in before.items():
-        assert after.get(table_name, 0) == count, f"{table_name}: {before[table_name]} -> {after.get(table_name)}"
+        assert after.get(table_name, 0) == count, (
+            f"{table_name}: {before[table_name]} -> {after.get(table_name)}"
+        )
 
     engine = create_engine_for_url(postgres_test_db_url)
     try:
@@ -905,7 +952,9 @@ every other repository's convention already seen in this codebase, but verify ag
 
 ```python
 def test_rollback_restores_the_pre_migration_sqlite_file_untouched(
-    sqlite_source_url: str, postgres_test_db_url: str, tmp_path: Path,
+    sqlite_source_url: str,
+    postgres_test_db_url: str,
+    tmp_path: Path,
 ) -> None:
     _seed_v2_fixture(sqlite_source_url, tmp_path / "anchors.jsonl")
 
@@ -1158,7 +1207,11 @@ from n8n_operator.storage.repository import (
     OrganizationRepository,
     PrincipalRepository,
 )
-from n8n_operator.storage.session import create_engine_for_url, create_session_factory, session_scope
+from n8n_operator.storage.session import (
+    create_engine_for_url,
+    create_session_factory,
+    session_scope,
+)
 
 REGISTRY_YAML = """apiVersion: n8n-operator/v1
 metadata:
@@ -1202,12 +1255,18 @@ class Profile:
 
 PROFILES = {
     "startup": Profile(
-        name="startup", concurrent_operators=5, total_operations=50,
-        environment_count=1, quorum_fraction=0.0,
+        name="startup",
+        concurrent_operators=5,
+        total_operations=50,
+        environment_count=1,
+        quorum_fraction=0.0,
     ),
     "seriesc": Profile(
-        name="seriesc", concurrent_operators=50, total_operations=5000,
-        environment_count=3, quorum_fraction=0.2,
+        name="seriesc",
+        concurrent_operators=50,
+        total_operations=5000,
+        environment_count=3,
+        quorum_fraction=0.2,
     ),
 }
 
@@ -1229,8 +1288,11 @@ class Results:
 
 ```python
 def _worker(
-    session_factory: Any, principal_id: str, environment_id: str,
-    op_count: int, results: Results,
+    session_factory: Any,
+    principal_id: str,
+    environment_id: str,
+    op_count: int,
+    results: Results,
 ) -> None:
     for i in range(op_count):
         start = time.monotonic()
@@ -1238,9 +1300,13 @@ def _worker(
         try:
             with session_scope(session_factory) as session:
                 service.prepare_operation(
-                    session, principal_id=principal_id, environment=environment_id,
-                    workflow_id="load.write_op", arguments={},
-                    preflight=FakePreflight(), server_max_argument_bytes=262_144,
+                    session,
+                    principal_id=principal_id,
+                    environment=environment_id,
+                    workflow_id="load.write_op",
+                    arguments={},
+                    preflight=FakePreflight(),
+                    server_max_argument_bytes=262_144,
                     idempotency_key=f"load-{principal_id}-{i}-{time.time_ns()}",
                     enable_v2=True,
                 )
@@ -1256,7 +1322,8 @@ def run_profile(profile: Profile, database_url: str) -> Results:
 
     command.upgrade(_alembic_config(database_url), "head")
     engine = create_engine_for_url(
-        database_url, pool_size=profile.concurrent_operators + 2,
+        database_url,
+        pool_size=profile.concurrent_operators + 2,
         max_overflow=profile.concurrent_operators,
     )
     factory = create_session_factory(engine)
@@ -1270,7 +1337,8 @@ def run_profile(profile: Profile, database_url: str) -> Results:
         env_ids = []
         for i in range(profile.environment_count):
             env = EnvironmentRepository(session).create(
-                organization_id=org.id, name=f"env-{i}",
+                organization_id=org.id,
+                name=f"env-{i}",
                 n8n_base_url_ref="env:LOAD_TEST_BASE_URL",
                 n8n_api_key_ref="env:LOAD_TEST_API_KEY",
             )
@@ -1279,10 +1347,13 @@ def run_profile(profile: Profile, database_url: str) -> Results:
         operator_ids = []
         for i in range(profile.concurrent_operators):
             principal = PrincipalRepository(session).create(
-                kind="user", display_name=f"load-operator-{i}",
+                kind="user",
+                display_name=f"load-operator-{i}",
             )
             OrganizationMembershipRepository(session).create(
-                principal_id=principal.id, organization_id=org.id, roles=["operator"],
+                principal_id=principal.id,
+                organization_id=org.id,
+                roles=["operator"],
             )
             operator_ids.append(principal.id)
 
@@ -1324,14 +1395,18 @@ def main() -> None:
     args = parser.parse_args()
 
     profile = PROFILES[args.profile]
-    print(f"Running profile '{profile.name}': {profile.concurrent_operators} concurrent "
-          f"operators, {profile.total_operations} total operations, "
-          f"{profile.environment_count} environment(s).")
+    print(
+        f"Running profile '{profile.name}': {profile.concurrent_operators} concurrent "
+        f"operators, {profile.total_operations} total operations, "
+        f"{profile.environment_count} environment(s)."
+    )
     results, wall_seconds = run_profile(profile, args.database_url)
 
     print(f"\nWall clock: {wall_seconds:.2f}s")
     print(f"Total operations attempted: {len(results.latencies_ms)}")
-    print(f"Errors: {len(results.errors)} ({len(results.errors) / max(1, len(results.latencies_ms)) * 100:.2f}%)")
+    print(
+        f"Errors: {len(results.errors)} ({len(results.errors) / max(1, len(results.latencies_ms)) * 100:.2f}%)"
+    )
     print(f"Throughput: {len(results.latencies_ms) / wall_seconds:.2f} ops/sec")
     print(f"Latency p50: {_percentile(results.latencies_ms, 0.50):.1f}ms")
     print(f"Latency p95: {_percentile(results.latencies_ms, 0.95):.1f}ms")

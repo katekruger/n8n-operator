@@ -229,6 +229,13 @@ n8n-operator/
 │   ├── TROUBLESHOOTING.md          # symptom-to-cause decision tree (stage 10)
 │   ├── WHAT_THIS_REFUSES_TO_DO.md  # every refusal, why, and the threat it closes (stage 10)
 │   ├── MCP_CLIENT_RECIPES.md       # literal tool-call JSON for the 20-tool surface (stage 10)
+│   ├── evidence/
+│   │   └── stage11-consistency-audit.md  # mechanized audit re-verification (stage 11)
+│   ├── superpowers/
+│   │   ├── plans/
+│   │   │   └── 2026-08-30-stage-11-v2-integration-release-and-proof.md
+│   │   └── specs/
+│   │       └── 2026-08-30-stage-11-v2-integration-release-and-proof-design.md
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
