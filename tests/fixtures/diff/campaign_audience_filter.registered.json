@@ -1,0 +1,64 @@
+{
+  "active": true,
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Audience Filter",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "wf_sanitized_id",
+  "name": "Sanitized Workflow",
+  "nodes": [
+    {
+      "id": "wh-2",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "campaign"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1
+    },
+    {
+      "id": "if-1",
+      "name": "Audience Filter",
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.body.segment }}",
+              "operator": {
+                "operation": "equals",
+                "type": "string"
+              },
+              "rightValue": "enterprise"
+            }
+          ]
+        }
+      },
+      "position": [
+        200,
+        0
+      ],
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

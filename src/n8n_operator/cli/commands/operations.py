@@ -154,6 +154,9 @@ def _render_context(context: ApprovalDecisionContext) -> None:
             f"  current:    {context.current_definition_hash or '(workflow no longer registered)'}",
             fg=typer.colors.RED,
         )
+        typer.echo(
+            f"  Run `n8n-operator registry diff-live {context.workflow_id}` to see what changed."
+        )
     else:
         typer.echo(f"definition_hash:     {context.registered_definition_hash} (unchanged)")
     typer.echo(f"created_at:          {context.created_at.isoformat()}")

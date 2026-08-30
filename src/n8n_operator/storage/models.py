@@ -227,6 +227,36 @@ class WorkflowBinding(Base):
     input_schema: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
+class WorkflowDefinitionSnapshot(Base):
+    """A workflow's canonical definition, captured at the moment its ``definition_hash``
+    was adopted (stage 07, ADR-008) — ``diff_workflow_definition``'s "registered" side.
+
+    ``canonical_definition`` is exactly ``n8n.canonicalization.canonical_form()``'s own
+    output for whatever raw definition ``registry hash --n8n-workflow-id`` fetched —
+    never the full raw n8n response (administrative row metadata canonicalization
+    already excludes structurally). One row per ``(workflow_id, definition_hash)`` pair;
+    re-capturing the same hash for the same workflow is a no-op, not a duplicate (the
+    unique constraint below is the storage-level guarantee).
+    """
+
+    __tablename__ = "workflow_definition_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_id",
+            "definition_hash",
+            name="uq_workflow_definition_snapshots_workflow_hash",
+        ),
+        Index("ix_workflow_definition_snapshots_workflow_id", "workflow_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_ulid)
+    workflow_id: Mapped[str] = mapped_column(String, nullable=False)
+    definition_hash: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_definition: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utc_now)
+    captured_by: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class Operation(Base):
     """The governance record — the unit BUILD_PLAN section 5 describes (section 8.1).
 

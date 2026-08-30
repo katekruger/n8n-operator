@@ -72,6 +72,11 @@ class _FakeDispatch:
         raise NotImplementedError
 
 
+class _FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError  # never invoked — this module tests shape, not behavior
+
+
 def _make_deps(*, caller_is_local: bool = True) -> ToolDeps:
     # No test in this module touches a database; `session_factory` is unused.
     unused_session_factory = cast("sessionmaker[Any]", None)
@@ -80,6 +85,7 @@ def _make_deps(*, caller_is_local: bool = True) -> ToolDeps:
         preflight=_FakePreflight(),
         health=_FakeHealth(),
         dispatch=_FakeDispatch(),
+        definition=_FakeDefinition(),
         server_max_argument_bytes=262_144,
         caller_is_local=caller_is_local,
         approval_base_url="http://127.0.0.1:8765",
@@ -248,9 +254,10 @@ async def test_v2_tools_including_retry_operation_are_identical_across_transport
 def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
     """Stage 02's completion gate: v1 mode (``enable_v2`` unset, the default) stays
     exactly the twelve tools AC-23 requires; ``whoami``, ``list_environments``
-    (stage 04), ``request_approval``, ``get_approval_status`` (stage 05), and
-    ``retry_operation`` (stage 06) are a thirteenth through seventeenth tool that
-    exist only when an operator opts in (BUILD_PLAN section 7.2)."""
+    (stage 04), ``request_approval``, ``get_approval_status`` (stage 05),
+    ``retry_operation`` (stage 06), and ``diff_workflow_definition`` (stage 07) are a
+    thirteenth through eighteenth tool that exist only when an operator opts in
+    (BUILD_PLAN section 7.2)."""
     v1_tools = build_tools(_make_deps())
     v2_tools = build_tools(ToolDeps(**{**_make_deps().__dict__, "enable_v2": True}))
 
@@ -264,5 +271,6 @@ def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
         "request_approval",
         "get_approval_status",
         "retry_operation",
+        "diff_workflow_definition",
     }
-    assert len(v2_tools) == 17
+    assert len(v2_tools) == 18

@@ -1,0 +1,54 @@
+{
+  "active": true,
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Charge Card \u2014 \u8bf7\u6b3e",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "wf_sanitized_id",
+  "name": "Sanitized Workflow",
+  "nodes": [
+    {
+      "id": "wh-6",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "orders"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1
+    },
+    {
+      "continueOnFail": true,
+      "id": "charge-1",
+      "name": "Charge Card \u2014 \u8bf7\u6b3e",
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "options": {},
+        "url": "https://payments.example.com/charge"
+      },
+      "position": [
+        200,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

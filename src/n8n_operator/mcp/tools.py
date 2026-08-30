@@ -62,7 +62,12 @@ from sqlalchemy.orm import sessionmaker
 
 from n8n_operator.core import identity, service
 from n8n_operator.core.identity import build_whoami
-from n8n_operator.core.service import DispatchPort, HealthPort, PreflightPort
+from n8n_operator.core.service import (
+    DispatchPort,
+    HealthPort,
+    PreflightPort,
+    WorkflowDefinitionPort,
+)
 from n8n_operator.errors import DispatchIndeterminateError, InvalidArgumentsError, OperatorError
 from n8n_operator.storage.repository import (
     ApprovalRepository,
@@ -88,6 +93,7 @@ class N8nAdapterBundle:
     preflight: PreflightPort
     health: HealthPort
     dispatch: DispatchPort
+    definition: WorkflowDefinitionPort
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,7 @@ class ToolDeps:
     preflight: PreflightPort
     health: HealthPort
     dispatch: DispatchPort
+    definition: WorkflowDefinitionPort
     server_max_argument_bytes: int
     principal_id: str = "local"
     environment: str = "default"
@@ -172,15 +179,16 @@ def _resolved_environment_id(
 
 def _adapters_for(
     deps: ToolDeps, resolved_environment_id: str | None
-) -> tuple[PreflightPort, HealthPort, DispatchPort]:
-    """Which preflight/health/dispatch a call should use: that environment's own
-    instance when one resolved and a factory is configured, else the single fixed
-    client every v1 (and v2-before-a-factory-is-configured) call already used — never
-    a behavior change for a deployment that hasn't set up ``n8n_client_factory``."""
+) -> tuple[PreflightPort, HealthPort, DispatchPort, WorkflowDefinitionPort]:
+    """Which preflight/health/dispatch/definition a call should use: that
+    environment's own instance when one resolved and a factory is configured, else the
+    single fixed client every v1 (and v2-before-a-factory-is-configured) call already
+    used — never a behavior change for a deployment that hasn't set up
+    ``n8n_client_factory``."""
     if resolved_environment_id is not None and deps.n8n_client_factory is not None:
         bundle = deps.n8n_client_factory(resolved_environment_id)
-        return bundle.preflight, bundle.health, bundle.dispatch
-    return deps.preflight, deps.health, deps.dispatch
+        return bundle.preflight, bundle.health, bundle.dispatch, bundle.definition
+    return deps.preflight, deps.health, deps.dispatch, deps.definition
 
 
 def _latest_event_detail(session: Any, operation_id: str) -> dict[str, Any]:
@@ -362,7 +370,7 @@ def _make_get_instance_health(deps: ToolDeps) -> Tool:
                     )
                 except OperatorError as exc:
                     return _error_result(exc)
-        _, health_port, _ = _adapters_for(deps, resolved_environment_id)
+        _, health_port, _, _ = _adapters_for(deps, resolved_environment_id)
         result = service.get_instance_health(health_port)
         shaped: dict[str, Any] = (
             {"reachable": False, "reason": result.reason, "checked_at": _iso(result.checked_at)}
@@ -457,7 +465,7 @@ def _make_preflight_workflow(deps: ToolDeps) -> Tool:
                 resolved_environment_id = _resolved_environment_id(
                     deps, session, principal_id=principal_id, environment=environment
                 )
-                preflight_port, _, _ = _adapters_for(deps, resolved_environment_id)
+                preflight_port, _, _, _ = _adapters_for(deps, resolved_environment_id)
                 result = service.preflight_workflow(
                     session,
                     workflow_id=workflow_id,
@@ -485,6 +493,65 @@ def _make_preflight_workflow(deps: ToolDeps) -> Tool:
             "Runs the same checks prepare_operation runs."
         ),
         args_model=PreflightWorkflowArgs,
+        handler=handler,
+        annotations=_READ_ONLY_LIVE,
+    )
+
+
+# ======================================================================================
+# diff_workflow_definition
+# ======================================================================================
+
+
+class DiffWorkflowDefinitionArgs(_ToolArgs):
+    workflow_id: str
+    environment: str | None = None
+
+
+def _make_diff_workflow_definition(deps: ToolDeps) -> Tool:
+    async def handler(workflow_id: str, environment: str | None = None) -> dict[str, Any]:
+        principal_id = _resolve_principal_id(deps)
+        with session_scope(deps.session_factory) as session:
+            try:
+                resolved_environment_id = _resolved_environment_id(
+                    deps, session, principal_id=principal_id, environment=environment
+                )
+                _, _, _, definition_port = _adapters_for(deps, resolved_environment_id)
+                result = service.diff_workflow_definition(
+                    session,
+                    workflow_id=workflow_id,
+                    definition=definition_port,
+                    principal_id=principal_id,
+                    enable_v2=deps.enable_v2,
+                    environment=environment,
+                    known_secrets=deps.known_secrets,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        shaped: dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "registered_hash": result.registered_hash,
+            "live_hash": result.live_hash,
+            "changed": result.changed,
+            "diff": [entry.model_dump(mode="json") for entry in result.diff],
+            "diff_available": result.diff_available,
+            "truncated": result.truncated,
+            "total_changes": result.total_changes,
+            "note": result.note,
+        }
+        if deps.enable_v2:
+            shaped["environment"] = resolved_environment_id
+        return shaped
+
+    return _build_tool(
+        name="diff_workflow_definition",
+        description=(
+            "A structural diff between the registered workflow definition and its "
+            "current live n8n definition — advisory only: the definition_hash "
+            "comparison (surfaced by preflight_workflow/prepare_operation) is what "
+            "actually gates execution, never this diff."
+        ),
+        args_model=DiffWorkflowDefinitionArgs,
         handler=handler,
         annotations=_READ_ONLY_LIVE,
     )
@@ -595,7 +662,7 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
                 resolved_environment_id = _resolved_environment_id(
                     deps, session, principal_id=principal_id, environment=environment
                 )
-                preflight_port, _, _ = _adapters_for(deps, resolved_environment_id)
+                preflight_port, _, _, _ = _adapters_for(deps, resolved_environment_id)
                 operation, idempotent_replay, approval_token = service.prepare_operation(
                     session,
                     principal_id=principal_id,
@@ -747,7 +814,7 @@ def _make_execute_operation(deps: ToolDeps) -> Tool:
             except OperatorError as exc:
                 return _error_result(exc)
         pinned_environment_id = pinned_operation.environment if deps.enable_v2 else None
-        preflight_port, _, dispatch_port = _adapters_for(deps, pinned_environment_id)
+        preflight_port, _, dispatch_port, _ = _adapters_for(deps, pinned_environment_id)
 
         with session_scope(deps.session_factory) as session:
             try:
@@ -1342,7 +1409,7 @@ def _make_retry_operation(deps: ToolDeps) -> Tool:
             except OperatorError as exc:
                 return _error_result(exc)
         pinned_environment_id = pinned_operation.environment if deps.enable_v2 else None
-        preflight_port, _, _ = _adapters_for(deps, pinned_environment_id)
+        preflight_port, _, _, _ = _adapters_for(deps, pinned_environment_id)
 
         with session_scope(deps.session_factory) as session:
             try:
@@ -1423,4 +1490,5 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
         tools.append(_make_request_approval(deps))
         tools.append(_make_get_approval_status(deps))
         tools.append(_make_retry_operation(deps))
+        tools.append(_make_diff_workflow_definition(deps))
     return tools

@@ -1,0 +1,77 @@
+{
+  "active": true,
+  "connections": {
+    "Process": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Respond With Correlation",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Process",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "wf_sanitized_id",
+  "name": "Sanitized Workflow",
+  "nodes": [
+    {
+      "id": "wh-4",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "correlate",
+        "responseMode": "responseNode"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1
+    },
+    {
+      "id": "proc-1",
+      "name": "Process",
+      "parameters": {
+        "jsCode": "return [{ json: { ok: true } }];"
+      },
+      "position": [
+        200,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1
+    },
+    {
+      "id": "respond-1",
+      "name": "Respond With Correlation",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.field_0 + $json.field_1 + $json.field_2 + $json.field_3 + $json.field_4 + $json.field_5 + $json.field_6 + $json.field_7 + $json.field_8 + $json.field_9 + $json.field_10 + $json.field_11 + $json.field_12 + $json.field_13 + $json.field_14 + $json.field_15 + $json.field_16 + $json.field_17 + $json.field_18 + $json.field_19 + $json.field_20 + $json.field_21 + $json.field_22 + $json.field_23 + $json.field_24 + $json.field_25 + $json.field_26 + $json.field_27 + $json.field_28 + $json.field_29 + $json.field_30 + $json.field_31 + $json.field_32 + $json.field_33 + $json.field_34 + $json.field_35 + $json.field_36 + $json.field_37 + $json.field_38 + $json.field_39 + $json.field_40 + $json.field_41 + $json.field_42 + $json.field_43 + $json.field_44 + $json.field_45 + $json.field_46 + $json.field_47 + $json.field_48 + $json.field_49 + $json.field_50 + $json.field_51 + $json.field_52 + $json.field_53 + $json.field_54 + $json.field_55 + $json.field_56 + $json.field_57 + $json.field_58 + $json.field_59 + $json.field_60 + $json.field_61 + $json.field_62 + $json.field_63 + $json.field_64 + $json.field_65 + $json.field_66 + $json.field_67 + $json.field_68 + $json.field_69 + $json.field_70 + $json.field_71 + $json.field_72 + $json.field_73 + $json.field_74 + $json.field_75 + $json.field_76 + $json.field_77 + $json.field_78 + $json.field_79 + $json.field_80 + $json.field_81 + $json.field_82 + $json.field_83 + $json.field_84 + $json.field_85 + $json.field_86 + $json.field_87 + $json.field_88 + $json.field_89 + $json.field_90 + $json.field_91 + $json.field_92 + $json.field_93 + $json.field_94 + $json.field_95 + $json.field_96 + $json.field_97 + $json.field_98 + $json.field_99 + $json.field_100 + $json.field_101 + $json.field_102 + $json.field_103 + $json.field_104 + $json.field_105 + $json.field_106 + $json.field_107 + $json.field_108 + $json.field_109 + $json.field_110 + $json.field_111 + $json.field_112 + $json.field_113 + $json.field_114 + $json.field_115 + $json.field_116 + $json.field_117 + $json.field_118 + $json.field_119 + $json.field_120 + $json.field_121 + $json.field_122 + $json.field_123 + $json.field_124 + $json.field_125 + $json.field_126 + $json.field_127 + $json.field_128 + $json.field_129 + $json.field_130 + $json.field_131 + $json.field_132 + $json.field_133 + $json.field_134 + $json.field_135 + $json.field_136 + $json.field_137 + $json.field_138 + $json.field_139 + $json.field_140 + $json.field_141 + $json.field_142 + $json.field_143 + $json.field_144 + $json.field_145 + $json.field_146 + $json.field_147 + $json.field_148 + $json.field_149 + $json.field_150 + $json.field_151 + $json.field_152 + $json.field_153 + $json.field_154 + $json.field_155 + $json.field_156 + $json.field_157 + $json.field_158 + $json.field_159 + $json.field_160 + $json.field_161 + $json.field_162 + $json.field_163 + $json.field_164 + $json.field_165 + $json.field_166 + $json.field_167 + $json.field_168 + $json.field_169 + $json.field_170 + $json.field_171 + $json.field_172 + $json.field_173 + $json.field_174 + $json.field_175 + $json.field_176 + $json.field_177 + $json.field_178 + $json.field_179 + $json.field_180 + $json.field_181 + $json.field_182 + $json.field_183 + $json.field_184 + $json.field_185 + $json.field_186 + $json.field_187 + $json.field_188 + $json.field_189 + $json.field_190 + $json.field_191 + $json.field_192 + $json.field_193 + $json.field_194 + $json.field_195 + $json.field_196 + $json.field_197 + $json.field_198 + $json.field_199 + $json.field_200 + $json.field_201 + $json.field_202 + $json.field_203 + $json.field_204 + $json.field_205 + $json.field_206 + $json.field_207 + $json.field_208 + $json.field_209 + $json.field_210 + $json.field_211 + $json.field_212 + $json.field_213 + $json.field_214 + $json.field_215 + $json.field_216 + $json.field_217 + $json.field_218 + $json.field_219 + $json.field_220 + $json.field_221 + $json.field_222 + $json.field_223 + $json.field_224 + $json.field_225 + $json.field_226 + $json.field_227 + $json.field_228 + $json.field_229 + $json.field_230 + $json.field_231 + $json.field_232 + $json.field_233 + $json.field_234 + $json.field_235 + $json.field_236 + $json.field_237 + $json.field_238 + $json.field_239 + $json.field_240 + $json.field_241 + $json.field_242 + $json.field_243 + $json.field_244 + $json.field_245 + $json.field_246 + $json.field_247 + $json.field_248 + $json.field_249 + $json.field_250 + $json.field_251 + $json.field_252 + $json.field_253 + $json.field_254 + $json.field_255 + $json.field_256 + $json.field_257 + $json.field_258 + $json.field_259 + $json.field_260 + $json.field_261 + $json.field_262 + $json.field_263 + $json.field_264 + $json.field_265 + $json.field_266 + $json.field_267 + $json.field_268 + $json.field_269 + $json.field_270 + $json.field_271 + $json.field_272 + $json.field_273 + $json.field_274 + $json.field_275 + $json.field_276 + $json.field_277 + $json.field_278 + $json.field_279 + $json.field_280 + $json.field_281 + $json.field_282 + $json.field_283 + $json.field_284 + $json.field_285 + $json.field_286 + $json.field_287 + $json.field_288 + $json.field_289 + $json.field_290 + $json.field_291 + $json.field_292 + $json.field_293 + $json.field_294 + $json.field_295 + $json.field_296 + $json.field_297 + $json.field_298 + $json.field_299 + $json.field_300 + $json.field_301 + $json.field_302 + $json.field_303 + $json.field_304 + $json.field_305 + $json.field_306 + $json.field_307 + $json.field_308 + $json.field_309 + $json.field_310 + $json.field_311 + $json.field_312 + $json.field_313 + $json.field_314 + $json.field_315 + $json.field_316 + $json.field_317 + $json.field_318 + $json.field_319 + $json.field_320 + $json.field_321 + $json.field_322 + $json.field_323 + $json.field_324 + $json.field_325 + $json.field_326 + $json.field_327 + $json.field_328 + $json.field_329 + $json.field_330 + $json.field_331 + $json.field_332 + $json.field_333 + $json.field_334 + $json.field_335 + $json.field_336 + $json.field_337 + $json.field_338 + $json.field_339 + $json.field_340 + $json.field_341 + $json.field_342 + $json.field_343 + $json.field_344 + $json.field_345 + $json.field_346 + $json.field_347 + $json.field_348 + $json.field_349 + $json.field_350 + $json.field_351 + $json.field_352 + $json.field_353 + $json.field_354 + $json.field_355 + $json.field_356 + $json.field_357 + $json.field_358 + $json.field_359 + $json.field_360 + $json.field_361 + $json.field_362 + $json.field_363 + $json.field_364 + $json.field_365 + $json.field_366 + $json.field_367 + $json.field_368 + $json.field_369 + $json.field_370 + $json.field_371 + $json.field_372 + $json.field_373 + $json.field_374 + $json.field_375 + $json.field_376 + $json.field_377 + $json.field_378 + $json.field_379 + $json.field_380 + $json.field_381 + $json.field_382 + $json.field_383 + $json.field_384 + $json.field_385 + $json.field_386 + $json.field_387 + $json.field_388 + $json.field_389 + $json.field_390 + $json.field_391 + $json.field_392 + $json.field_393 + $json.field_394 + $json.field_395 + $json.field_396 + $json.field_397 + $json.field_398 + $json.field_399 }}"
+      },
+      "position": [
+        400,
+        0
+      ],
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

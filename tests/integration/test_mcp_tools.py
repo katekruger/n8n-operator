@@ -181,6 +181,14 @@ class FakeDispatch:
         return self.node_trace
 
 
+class FakeDefinition:
+    """Never invoked by any of the twelve v1 tools this module tests —
+    ``diff_workflow_definition`` is v2-only (see ``test_mcp_diff_workflow_definition_tool.py``)."""
+
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 @pytest.fixture
 def registry_path(tmp_path: Path) -> Path:
     path = tmp_path / "workflows.yaml"
@@ -210,6 +218,7 @@ def make_server(
         preflight=preflight or FakePreflight(),
         health=health or FakeHealth(),
         dispatch=dispatch or FakeDispatch(),
+        definition=FakeDefinition(),
         server_max_argument_bytes=server_max_argument_bytes,
         caller_is_local=caller_is_local,
         approval_base_url="http://127.0.0.1:8765",
@@ -875,3 +884,17 @@ async def test_execute_operation_tool_failed_shape_and_get_execution_log_names_t
     assert log["failed_node"] == "HTTP Request"
     node_names = [n["name"] for n in log["nodes"]]
     assert node_names == ["Webhook", "HTTP Request"]
+
+
+def test_no_gating_code_path_consults_the_structural_diff() -> None:
+    """ADR-008's own "advisory, not deciding": the ``definition_hash`` comparison
+    (``n8n.preflight``'s ``_check_definition_unchanged``) is the *sole* gate a drift
+    check can fail on — ``core.definition_diff`` (stage 07's structural diff algorithm)
+    must never be imported by the module that actually decides pass/fail, only by the
+    separate, advisory ``diff_workflow_definition`` tool/service function."""
+    import inspect
+
+    from n8n_operator.n8n import preflight as preflight_module
+
+    source = inspect.getsource(preflight_module)
+    assert "definition_diff" not in source

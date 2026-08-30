@@ -21,7 +21,9 @@ Phase 3 adds the operation lifecycle, the state machine, redaction, and the audi
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +35,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from n8n_operator.audit import writer as audit_writer
 from n8n_operator.audit.chain import ChainVerificationResult, verify_chain
 from n8n_operator.core import authorization, identity, state_machine
+from n8n_operator.core.definition_diff import diff_canonical_definitions
 from n8n_operator.core.handles import (
     compute_approval_binding,
     hash_approval_token,
@@ -59,10 +62,12 @@ from n8n_operator.core.models import (
     HealthCheckResult,
     NotificationEvent,
     Operation,
+    PreflightCheck,
     PreflightResult,
     ReconciliationRecord,
     RequestApprovalResult,
     WorkflowContract,
+    WorkflowDefinitionDiff,
 )
 from n8n_operator.core.redaction import cap_output, redact, scrub_secrets
 from n8n_operator.errors import (
@@ -98,6 +103,7 @@ from n8n_operator.errors import (
     WorkflowMissingOnInstanceError,
     WorkflowNotFoundError,
 )
+from n8n_operator.n8n.canonicalization import canonical_form, compute_definition_hash
 from n8n_operator.registry.loader import LoadedOverlay, LoadedRegistry, load_overlay, load_registry
 from n8n_operator.registry.schema import (
     RegistryDocument,
@@ -123,6 +129,7 @@ from n8n_operator.storage.repository import (
     OrganizationMembershipRepository,
     RegistrySnapshotRepository,
     WorkflowBindingRepository,
+    WorkflowDefinitionSnapshotRepository,
     WorkflowEnvironmentOverlayRepository,
 )
 from n8n_operator.storage.session import session_scope
@@ -136,9 +143,11 @@ __all__ = [
     "NotificationSink",
     "PreflightPort",
     "ReconciliationPort",
+    "WorkflowDefinitionPort",
     "approve_operation",
     "cancel_operation",
     "describe_workflow",
+    "diff_workflow_definition",
     "dispatch_operation",
     "execute_operation",
     "expire_overdue_operations",
@@ -226,6 +235,19 @@ class ReconciliationPort(Protocol):
     alternative)."""
 
     def get_execution(self, execution_id: str) -> ExecutionLookup: ...
+
+
+class WorkflowDefinitionPort(Protocol):
+    """What ``diff_workflow_definition`` needs from a live n8n workflow-definition
+    fetch (stage 07, ADR-008) — the same live read ``n8n/preflight.py``'s own drift
+    check already makes. Unlike :class:`PreflightPort`/:class:`HealthPort`/
+    :class:`DispatchPort`/:class:`ReconciliationPort`, this port needs no adapter
+    class in the composition root at all: ``n8n.client.N8nClient.get_workflow``
+    already returns a plain ``dict[str, Any]`` (never an ``n8n/``-local Pydantic
+    type — see that method's own docstring), so a real client satisfies this
+    Protocol structurally as-is."""
+
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]: ...
 
 
 class NotificationSink(Protocol):
@@ -1074,7 +1096,176 @@ def preflight_workflow(
             tool_name="preflight_workflow",
             enable_v2=enable_v2,
         )
-    return preflight.check(entry)
+    result = preflight.check(entry)
+    return result.model_copy(
+        update={
+            "checks": [_with_diff_hint(check, workflow_id=workflow_id) for check in result.checks]
+        }
+    )
+
+
+def _with_diff_hint(check: PreflightCheck, *, workflow_id: str) -> PreflightCheck:
+    """Points a failed ``definition_unchanged`` check at ``diff_workflow_definition``/
+    ``registry diff-live`` (stage 07) — advisory only, never consulted by any gating
+    code path (ADR-008's "advisory, not deciding"; the hash comparison this check
+    already ran, not the linked diff, is what actually failed this check)."""
+    if check.check != "definition_unchanged" or check.status != "fail":
+        return check
+    detail = dict(check.detail) if isinstance(check.detail, dict) else {}
+    detail["diff_hint"] = (
+        f"Run `n8n-operator registry diff-live {workflow_id}` to see what changed."
+    )
+    return check.model_copy(update={"detail": detail})
+
+
+def _redact_credential_ids(canonical: dict[str, Any], *, salt: str) -> dict[str, Any]:
+    """Every ``nodes[].credentials.*.id`` value replaced by a salted digest — applied
+    identically to both sides of a diff *before* diffing, so an unchanged credential
+    binding still produces no diff entry (equal ids → equal digests) and a changed one
+    still shows as ``modified`` (different ids → different digests), but the raw
+    credential id itself is never in the result either way. Credential-binding
+    *presence* is semantic (CAN-05) and must stay visible; the identifier itself never
+    needs to be, and this makes forgetting to redact it structurally impossible rather
+    than a redaction pass that could be skipped at one call site."""
+
+    def _digest(raw_id: Any) -> str:
+        return f"[REDACTED:{hashlib.sha256(f'{salt}{raw_id}'.encode()).hexdigest()[:12]}]"
+
+    nodes = []
+    for node in canonical.get("nodes", []):
+        credentials = node.get("credentials")
+        if isinstance(credentials, dict):
+            node = {
+                **node,
+                "credentials": {
+                    cred_type: (
+                        {**cred_ref, "id": _digest(cred_ref["id"])}
+                        if isinstance(cred_ref, dict) and "id" in cred_ref
+                        else cred_ref
+                    )
+                    for cred_type, cred_ref in credentials.items()
+                },
+            }
+        nodes.append(node)
+    return {**canonical, "nodes": nodes}
+
+
+def _redact_diff_value(value: Any, path: str, redact_paths: Sequence[str]) -> Any:
+    """Apply ``output.redact`` (JSONPath, authored against a tool *result* shape) to a
+    single diff entry's ``registered_value``/``live_value``. A diff entry's value is
+    usually a bare scalar (a string, a number) — :func:`~n8n_operator.core.redaction.
+    redact` can only mutate a matched *child* of a dict/list it is given, never a bare
+    root value, so the value is wrapped under a synthetic key named for the field the
+    diff path itself ends in (``/settings/secretField`` -> field ``secretField``) before
+    redaction, then unwrapped. This lets an author write the same
+    ``$.secretField``-style pattern they would for that field anywhere else."""
+    if not redact_paths or value is None:
+        return value
+    field = path.rsplit("/", 1)[-1]
+    wrapped = redact({field: value}, redact_paths)
+    return wrapped.get(field, value)
+
+
+def diff_workflow_definition(
+    session: Session,
+    *,
+    workflow_id: str,
+    definition: WorkflowDefinitionPort,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
+    environment: str | None = None,
+    known_secrets: Sequence[str] = (),
+) -> WorkflowDefinitionDiff:
+    """Structural diff between the registered ``definition_hash`` and the live n8n
+    definition (stage 07, MCP_TOOLS.md section 5.6, ADR-008) — advisory only, presented
+    to a human *after* the hash comparison (the sole gate, unchanged) has already
+    decided pass/fail. Resolution mirrors :func:`describe_workflow`/
+    :func:`preflight_workflow` exactly, so AC-44's bitwise-identical
+    unauthorized-vs-nonexistent requirement holds by reusing the same mechanism those
+    tools already prove it for.
+    """
+    document = _require_active_document(session)
+    entry = _find_entry(document, workflow_id)
+    if entry is None or not entry.enabled:
+        raise WorkflowNotFoundError()
+    resolved_environment_id: str | None = None
+    if principal_id is not None:
+        resolved_environment_id, entry = _apply_environment(
+            session,
+            principal_id=principal_id,
+            environment=environment,
+            workflow_id=workflow_id,
+            base_entry=entry,
+            tool_name="diff_workflow_definition",
+            enable_v2=enable_v2,
+        )
+
+    live_raw = definition.get_workflow(entry.n8n_workflow_id)
+    live_hash = compute_definition_hash(live_raw)
+    changed = live_hash != entry.definition_hash
+
+    snapshot = WorkflowDefinitionSnapshotRepository(session).get(
+        workflow_id=workflow_id, definition_hash=entry.definition_hash
+    )
+    if snapshot is None:
+        return WorkflowDefinitionDiff(
+            workflow_id=workflow_id,
+            environment=resolved_environment_id if enable_v2 else None,
+            registered_hash=entry.definition_hash,
+            live_hash=live_hash,
+            changed=changed,
+            diff=[],
+            diff_available=False,
+            note=(
+                "no stored snapshot for this hash — run `registry hash "
+                "--workflow-id ... --n8n-workflow-id ...` to capture one"
+            ),
+        )
+
+    # Credential-id digesting (structural, always-on) happens before diffing — it
+    # must, so an unchanged binding never shows as a false `modified` and a changed
+    # one always does (equal ids -> equal digests, different ids -> different
+    # digests), without ever exposing the raw id either way.
+    salt = secrets.token_hex(16)
+    registered_canonical = _redact_credential_ids(snapshot.canonical_definition, salt=salt)
+    live_canonical = _redact_credential_ids(canonical_form(live_raw), salt=salt)
+    diff_entries, truncated, total_changes = diff_canonical_definitions(
+        registered_canonical, live_canonical
+    )
+
+    # `output.redact`/`scrub_secrets` are applied to each entry's own *value* only,
+    # after diffing — never before: redacting first would make two genuinely
+    # different values compare equal (both "[REDACTED]"), silently erasing the
+    # entry entirely rather than masking its content. MCP_TOOLS.md section 5.6's own
+    # example shows exactly this shape — a `modified` entry whose `registered_value`/
+    # `live_value` are both `"[REDACTED]"`, still present as an entry, never absent.
+    redact_paths = entry.output.redact
+    redacted_entries = []
+    for diff_entry in diff_entries:
+        registered_value = _redact_diff_value(
+            diff_entry.registered_value, diff_entry.path, redact_paths
+        )
+        live_value = _redact_diff_value(diff_entry.live_value, diff_entry.path, redact_paths)
+        if known_secrets:
+            registered_value = scrub_secrets(registered_value, known_secrets)
+            live_value = scrub_secrets(live_value, known_secrets)
+        redacted_entries.append(
+            diff_entry.model_copy(
+                update={"registered_value": registered_value, "live_value": live_value}
+            )
+        )
+
+    return WorkflowDefinitionDiff(
+        workflow_id=workflow_id,
+        environment=resolved_environment_id if enable_v2 else None,
+        registered_hash=entry.definition_hash,
+        live_hash=live_hash,
+        changed=changed,
+        diff=redacted_entries,
+        diff_available=True,
+        truncated=truncated,
+        total_changes=total_changes,
+    )
 
 
 def get_instance_health(health: HealthPort) -> HealthCheckResult:

@@ -117,12 +117,18 @@ class FakeDispatch:
         raise NotImplementedError
 
 
+class FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 def _make_server(session_factory: sessionmaker[Session], *, principal_id: str) -> MCPServer[Any]:
     deps = ToolDeps(
         session_factory=session_factory,
         preflight=FakePreflight(),
         health=FakeHealth(),
         dispatch=FakeDispatch(),
+        definition=FakeDefinition(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,

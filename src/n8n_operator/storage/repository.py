@@ -45,6 +45,7 @@ from n8n_operator.storage.models import (
     Principal,
     RegistrySnapshot,
     WorkflowBinding,
+    WorkflowDefinitionSnapshot,
     WorkflowEnvironmentOverlay,
     new_ulid,
     utc_now,
@@ -217,6 +218,47 @@ class WorkflowBindingRepository:
             WorkflowBinding.workflow_id == workflow_id,
         )
         return self._session.scalars(stmt).one_or_none()
+
+
+class WorkflowDefinitionSnapshotRepository:
+    """The ``workflow_definition_snapshots`` table (stage 07, ADR-008) —
+    ``diff_workflow_definition``'s "registered" side. ``create`` is a get-or-create:
+    re-capturing an already-stored ``(workflow_id, definition_hash)`` pair is a no-op,
+    not a duplicate — the caller (``registry hash --n8n-workflow-id``) never needs to
+    check first."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def get(self, *, workflow_id: str, definition_hash: str) -> WorkflowDefinitionSnapshot | None:
+        stmt: Select[tuple[WorkflowDefinitionSnapshot]] = select(WorkflowDefinitionSnapshot).where(
+            WorkflowDefinitionSnapshot.workflow_id == workflow_id,
+            WorkflowDefinitionSnapshot.definition_hash == definition_hash,
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def create(
+        self,
+        *,
+        workflow_id: str,
+        definition_hash: str,
+        canonical_definition: dict[str, Any],
+        captured_by: str,
+        id: str | None = None,  # noqa: A002
+    ) -> WorkflowDefinitionSnapshot:
+        existing = self.get(workflow_id=workflow_id, definition_hash=definition_hash)
+        if existing is not None:
+            return existing
+        snapshot = WorkflowDefinitionSnapshot(
+            id=id or new_ulid(),
+            workflow_id=workflow_id,
+            definition_hash=definition_hash,
+            canonical_definition=canonical_definition,
+            captured_by=captured_by,
+        )
+        self._session.add(snapshot)
+        self._session.flush()
+        return snapshot
 
 
 class OperationRepository:
@@ -1181,5 +1223,6 @@ __all__ = [
     "PrincipalRepository",
     "RegistrySnapshotRepository",
     "WorkflowBindingRepository",
+    "WorkflowDefinitionSnapshotRepository",
     "WorkflowEnvironmentOverlayRepository",
 ]

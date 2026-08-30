@@ -163,6 +163,8 @@ _EXPECTED_DATETIME_COLUMNS = {
     ("notification_deliveries", "last_attempted_at"),
     ("notification_deliveries", "delivered_at"),
     ("audit_anchors", "published_at"),
+    # stage 07
+    ("workflow_definition_snapshots", "captured_at"),
 }
 
 
@@ -220,6 +222,8 @@ _EXPECTED_JSON_COLUMNS = {
     "organization_memberships": {"roles", "environment_scope"},
     "workflow_environment_overlays": {"limits_override"},
     "audit_anchors": {"receipt"},
+    # stage 07
+    "workflow_definition_snapshots": {"canonical_definition"},
 }
 
 
@@ -451,6 +455,10 @@ _V2_STAGE_01_TABLES = {
     "audit_anchors",
 }
 
+_V2_STAGE_07_TABLES = {
+    "workflow_definition_snapshots",
+}
+
 
 @pytest.mark.contract
 def test_migration_0001_creates_every_table_and_nothing_else() -> None:
@@ -471,11 +479,20 @@ def test_migration_0003_creates_every_v2_foundation_table_and_nothing_else() -> 
 
 
 @pytest.mark.contract
+def test_migration_0007_creates_every_stage_07_table_and_nothing_else() -> None:
+    text = (VERSIONS_DIR / "0007_workflow_definition_snapshots.py").read_text(encoding="utf-8")
+    created = set(re.findall(r"op\.create_table\(\s*[\"'](\w+)[\"']", text))
+    assert created == _V2_STAGE_07_TABLES
+
+
+@pytest.mark.contract
 def test_every_table_in_the_orm_is_created_by_some_migration() -> None:
     """The complement of the two checks above: no table exists in ``Base.metadata``
     that no migration actually creates (which would mean ``create_all`` was silently
     relied on, or a table was declared but never wired into a migration)."""
-    assert set(Base.metadata.tables.keys()) == _V1_TABLES | _V2_STAGE_01_TABLES
+    assert set(Base.metadata.tables.keys()) == (
+        _V1_TABLES | _V2_STAGE_01_TABLES | _V2_STAGE_07_TABLES
+    )
 
 
 @pytest.mark.contract

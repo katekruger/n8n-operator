@@ -167,6 +167,11 @@ class FakeDispatch:
         return None
 
 
+class FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 class FakeSink:
     def __init__(self) -> None:
         self.events: list[NotificationEvent] = []
@@ -184,6 +189,7 @@ def _make_server(
         preflight=FakePreflight(),
         health=FakeHealth(),
         dispatch=FakeDispatch(),
+        definition=FakeDefinition(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,

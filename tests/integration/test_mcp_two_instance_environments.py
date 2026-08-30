@@ -94,6 +94,9 @@ class UnreachableFallback:
     def fetch_node_trace(self, *args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the fixed v1/dev-mode adapter should never be reached in this test")
 
+    def get_workflow(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the fixed v1/dev-mode adapter should never be reached in this test")
+
 
 def _bundle_for(mock: MockN8n) -> N8nAdapterBundle:
     client = N8nClient(base_url="http://mock-n8n", api_key="fake", transport=mock.transport())
@@ -101,6 +104,7 @@ def _bundle_for(mock: MockN8n) -> N8nAdapterBundle:
         preflight=_PreflightAdapter(N8nPreflight(client)),
         health=_HealthAdapter(N8nHealth(client)),
         dispatch=_DispatchAdapter(N8nDispatch(client)),
+        definition=client,
     )
 
 
@@ -147,6 +151,7 @@ async def test_get_instance_health_reaches_the_resolved_environments_own_instanc
         preflight=UnreachableFallback(),
         health=UnreachableFallback(),
         dispatch=UnreachableFallback(),
+        definition=UnreachableFallback(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,
@@ -221,6 +226,7 @@ async def test_preflight_workflow_reaches_the_resolved_environments_own_instance
         preflight=UnreachableFallback(),
         health=UnreachableFallback(),
         dispatch=UnreachableFallback(),
+        definition=UnreachableFallback(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,
