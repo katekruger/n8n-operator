@@ -424,6 +424,27 @@ class TestTwoOrgThreeEnvironmentScenario:
             )
             org_a_star_viewer_id = org_a_star_viewer.id
 
+            # `scenario.org_b_viewer_id`'s membership is environment-scoped (only
+            # `env_secondary_prod_id`, not `["*"]`), so it contributes zero
+            # workflow-scope patterns to `_resolve_scope` — `AuditLogRepository
+            # .list_page` then forces `workflow_clause`/`operation_clause` to
+            # `false()` and the query can never surface an `operation` subject at
+            # all, regardless of any cross-org leak. A dedicated `"*"`-scoped Org B
+            # viewer is needed so the query actually reaches the operation-matching
+            # code path, making the assertion below a real proof of isolation
+            # rather than a call that returns nothing by construction.
+            org_b_star_viewer = PrincipalRepository(session).create(
+                kind="user", display_name="Org B Star-Scoped Viewer"
+            )
+            OrganizationMembershipRepository(session).create(
+                principal_id=org_b_star_viewer.id,
+                organization_id=scenario.org_b_id,
+                roles=["viewer"],
+                workflow_scope="*",
+                environment_scope=["*"],
+            )
+            org_b_star_viewer_id = org_b_star_viewer.id
+
         with session_scope(scenario.session_factory) as session:
             org_a_metrics = service.get_metrics(
                 session,
@@ -439,15 +460,20 @@ class TestTwoOrgThreeEnvironmentScenario:
 
             org_b_events = service.list_audit_events(
                 session,
-                principal_id=scenario.org_b_viewer_id,
+                principal_id=org_b_star_viewer_id,
                 environment=scenario.env_secondary_prod_id,
                 enable_v2=True,
             )
-            # Org B's viewer has no memberships touching Org A's environments — Org
-            # A's own operation ID, just prepared above, must never appear as a
-            # subject_id in Org B's own audit query. AuditEvent carries no
-            # environment_id field directly, so isolation is proven by subject
-            # identity, not a field comparison.
+            # Org B's `"*"`-scoped viewer has no membership touching Org A's
+            # organization at all — Org A's own operation ID, just prepared above,
+            # must never appear as a subject_id in Org B's own audit query. AuditEvent
+            # carries no environment_id field directly, so isolation is proven by
+            # subject identity, not a field comparison. Because this viewer is
+            # `"*"`-scoped (unlike `scenario.org_b_viewer_id`), the query actually
+            # reaches `AuditLogRepository.list_page`'s operation-matching code path
+            # instead of returning an empty result by construction, so this assertion
+            # is a genuine proof that org membership scoping — not just an empty
+            # pattern list — keeps Org B's query from ever crossing into Org A.
             org_b_subject_ids = {event.subject_id for event in org_b_events.events}
             assert org_a_operation_id not in org_b_subject_ids
 
