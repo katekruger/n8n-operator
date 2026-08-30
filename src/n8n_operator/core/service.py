@@ -21,8 +21,11 @@ Phase 3 adds the operation lifecycle, the state machine, redaction, and the audi
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
+import math
 import secrets
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -53,6 +56,8 @@ from n8n_operator.core.models import (
     ApprovalDecisionContext,
     ApprovalDecisionEntry,
     ApprovalStatus,
+    AuditEvent,
+    AuditEventPage,
     DeliveryOutcome,
     DeliveryReceipt,
     DispatchOutcome,
@@ -60,6 +65,10 @@ from n8n_operator.core.models import (
     ExecutionLookup,
     ExecutionResult,
     HealthCheckResult,
+    LatencyPercentiles,
+    MetricsBreakdownEntry,
+    MetricsResult,
+    MetricsTotals,
     NotificationEvent,
     Operation,
     PreflightCheck,
@@ -146,6 +155,7 @@ __all__ = [
     "WorkflowDefinitionPort",
     "approve_operation",
     "cancel_operation",
+    "check_and_deliver_alerts",
     "describe_workflow",
     "diff_workflow_definition",
     "dispatch_operation",
@@ -157,7 +167,9 @@ __all__ = [
     "get_approval_status",
     "get_execution_result",
     "get_instance_health",
+    "get_metrics",
     "get_operation",
+    "list_audit_events",
     "list_operations",
     "list_reconciliation_events",
     "list_workflows",
@@ -1268,6 +1280,348 @@ def diff_workflow_definition(
     )
 
 
+_METRICS_WINDOW_SECONDS: dict[str, int] = {
+    "1h": 3600,
+    "24h": 86_400,
+    "7d": 7 * 86_400,
+    "30d": 30 * 86_400,
+}
+
+
+def _resolve_scope(
+    session: Session, *, principal_id: str, environment: str | None, tool_name: str, enable_v2: bool
+) -> tuple[str | None, list[str] | None]:
+    """``(resolved_environment, workflow_id_like_patterns)`` for a tool with no single
+    ``workflow_id`` of its own — ``get_metrics``/``list_audit_events`` (stage 08).
+    Mirrors ``list_operations``'s own scope-resolution exactly (not
+    ``_apply_environment``, which is workflow-specific): resolves a real environment
+    the same way every v2 tool does, then gathers ``LIKE`` patterns from every active
+    membership whose ``environment_scope == ["*"]`` and whose roles grant this tool's
+    own capability — an environment-scoped-only membership contributes nothing here,
+    the same simplification ``list_operations`` already makes. ``v1``
+    (``enable_v2=False``): no scope concept exists at all, returns ``(environment,
+    None)`` — ``None`` patterns means "no restriction" to every caller below."""
+    if not enable_v2:
+        return environment, None
+    resolved_environment = identity.resolve_environment(
+        session, principal_id=principal_id, environment=environment
+    ).id
+    memberships = OrganizationMembershipRepository(session).list_active_for_principal(principal_id)
+    patterns: list[str] = []
+    for membership in memberships:
+        if tool_name not in {
+            tool for role in membership.roles for tool in authorization.capabilities_for_role(role)
+        }:
+            continue
+        if membership.environment_scope != ["*"]:
+            continue
+        patterns.append(authorization.workflow_scope_to_sql_like(membership.workflow_scope))
+    return resolved_environment, patterns
+
+
+def _percentile(sorted_samples: list[float], fraction: float) -> float:
+    """Nearest-rank percentile over an already-sorted list — simple, deterministic,
+    and dependency-free, appropriate for the bounded (window + scope limited)
+    in-memory sample ``get_metrics`` computes over (ADR-019 section 4). Index is
+    ``ceil(fraction * n) - 1``, clamped into range."""
+    n = len(sorted_samples)
+    index = max(0, min(n - 1, math.ceil(fraction * n) - 1))
+    return sorted_samples[index]
+
+
+def get_metrics(
+    session: Session,
+    *,
+    principal_id: str,
+    environment: str | None = None,
+    window: str = "24h",
+    group_by: str | None = None,
+    enable_v2: bool = False,
+) -> MetricsResult:
+    """Bounded, authorization-filtered-before-aggregation operational metrics (stage
+    08, MCP_TOOLS.md section 5.7, ADR-019). ``window`` is one of four enumerated
+    values — never a caller-supplied arbitrary range (ADR-019 section 3, an
+    arbitrarily narrow custom window could isolate a single operation). A latency
+    percentile with fewer than 10 samples in the window is reported ``None`` with its
+    own ``*_reason="insufficient_sample"`` rather than a number computed from too few
+    points to mean anything (ADR-019 section 4). A ``group_by="workflow"`` breakdown
+    beyond 50 distinct workflows folds the remainder into one ``"other"`` entry
+    carrying only a count (ADR-019 section 3) — cardinality here is bounded by the
+    registry's own distinct workflow count, never attacker-controlled, since a caller
+    can create operations but never a new workflow id.
+    """
+    if window not in _METRICS_WINDOW_SECONDS:
+        raise InvalidArgumentsError(details={"window": window})
+    if group_by is not None and group_by not in {"workflow", "risk", "side_effects", "outcome"}:
+        raise InvalidArgumentsError(details={"group_by": group_by})
+
+    generated_at = datetime.now(UTC)
+    since = generated_at - timedelta(seconds=_METRICS_WINDOW_SECONDS[window])
+    resolved_environment, like_patterns = _resolve_scope(
+        session,
+        principal_id=principal_id,
+        environment=environment,
+        tool_name="get_metrics",
+        enable_v2=enable_v2,
+    )
+
+    op_repo = OperationRepository(session)
+    by_outcome = op_repo.count_by_outcome(
+        workflow_id_like_patterns=like_patterns, environment=resolved_environment, since=since
+    )
+    totals = MetricsTotals(count=sum(by_outcome.values()), by_outcome=by_outcome)
+
+    durations = sorted(
+        ExecutionResultRepository(session).list_finished_durations_ms(
+            workflow_id_like_patterns=like_patterns, environment=resolved_environment, since=since
+        )
+    )
+    percentiles: dict[str, float | None] = {}
+    reasons: dict[str, str | None] = {}
+    for label, fraction in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+        if len(durations) >= 10:
+            percentiles[label] = round(_percentile(durations, fraction), 2)
+            reasons[f"{label}_reason"] = None
+        else:
+            percentiles[label] = None
+            reasons[f"{label}_reason"] = "insufficient_sample"
+    latency_ms = LatencyPercentiles(
+        p50=percentiles["p50"],
+        p50_reason=reasons["p50_reason"],
+        p95=percentiles["p95"],
+        p95_reason=reasons["p95_reason"],
+        p99=percentiles["p99"],
+        p99_reason=reasons["p99_reason"],
+    )
+
+    breakdown: list[MetricsBreakdownEntry] = []
+    if group_by == "outcome":
+        breakdown = [
+            MetricsBreakdownEntry(key=outcome, count=count) for outcome, count in by_outcome.items()
+        ]
+        breakdown.sort(key=lambda e: e.count, reverse=True)
+    elif group_by == "workflow":
+        rows = op_repo.breakdown_by_workflow(
+            workflow_id_like_patterns=like_patterns, environment=resolved_environment, since=since
+        )
+        top, rest = rows[:50], rows[50:]
+        breakdown = [
+            MetricsBreakdownEntry(key=workflow_id, count=count, by_outcome=outcome_counts)
+            for workflow_id, count, outcome_counts in top
+        ]
+        if rest:
+            breakdown.append(
+                MetricsBreakdownEntry(
+                    key="other",
+                    count=sum(count for _, count, _ in rest),
+                    note=f"{len(rest)} additional workflows below the top-50 cutoff",
+                )
+            )
+    elif group_by in ("risk", "side_effects"):
+        document = _require_active_document(session)
+        attribute_by_workflow = {
+            entry.id: (entry.risk if group_by == "risk" else entry.side_effects)
+            for entry in document.workflows
+        }
+        rows = op_repo.breakdown_by_workflow(
+            workflow_id_like_patterns=like_patterns, environment=resolved_environment, since=since
+        )
+        grouped: dict[str, dict[str, int]] = {}
+        for workflow_id, _count, outcome_counts in rows:
+            key = attribute_by_workflow.get(workflow_id, "other")
+            bucket = grouped.setdefault(key, {})
+            for outcome, count in outcome_counts.items():
+                bucket[outcome] = bucket.get(outcome, 0) + count
+        breakdown = [
+            MetricsBreakdownEntry(key=key, count=sum(counts.values()), by_outcome=counts)
+            for key, counts in grouped.items()
+        ]
+        breakdown.sort(key=lambda e: e.count, reverse=True)
+
+    return MetricsResult(
+        environment=resolved_environment if enable_v2 else None,
+        window=window,  # type: ignore[arg-type]
+        generated_at=generated_at,
+        totals=totals,
+        latency_ms=latency_ms,
+        breakdown=breakdown,
+    )
+
+
+def _encode_audit_cursor(seq: int) -> str:
+    return base64.urlsafe_b64encode(json.dumps({"seq": seq}).encode()).decode()
+
+
+def _decode_audit_cursor(cursor: str) -> int:
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+        return int(payload["seq"])
+    except Exception as exc:
+        raise InvalidArgumentsError(details={"cursor": cursor}) from exc
+
+
+def list_audit_events(
+    session: Session,
+    *,
+    principal_id: str,
+    environment: str | None = None,
+    workflow_id: str | None = None,
+    since: datetime | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+    enable_v2: bool = False,
+) -> AuditEventPage:
+    """Query the audit chain within the caller's authorization scope (stage 08,
+    MCP_TOOLS.md section 5.8, ADR-012 section 3). Authorization filters the query,
+    not the result: an entry whose subject resolves to a workflow or environment
+    outside the caller's scope is excluded from the query entirely, never returned
+    with a redacted ``detail`` — even the existence of an event for an unauthorized
+    workflow is enumeration-adjacent information the caller has no standing to
+    receive. ``detail`` carries the same write-time redaction v1 already applies; this
+    adds no second redaction pass and no broader-role view of any entry's content.
+    Cursor-paginated, anchored to ``audit_log.seq`` — never an offset, which would
+    silently skip or duplicate rows over a concurrently-growing append-only log."""
+    if not (1 <= limit <= 100):
+        raise InvalidArgumentsError(details={"limit": limit})
+    before_seq = _decode_audit_cursor(cursor) if cursor is not None else None
+
+    resolved_environment, like_patterns = _resolve_scope(
+        session,
+        principal_id=principal_id,
+        environment=environment,
+        tool_name="list_audit_events",
+        enable_v2=enable_v2,
+    )
+    include_registry_snapshot_events = True
+    if enable_v2:
+        memberships = OrganizationMembershipRepository(session).list_active_for_principal(
+            principal_id
+        )
+        include_registry_snapshot_events = authorization.has_role(memberships, "admin")
+
+    rows = AuditLogRepository(session).list_page(
+        before_seq=before_seq,
+        limit=limit,
+        since=since,
+        workflow_id=workflow_id,
+        workflow_id_like_patterns=like_patterns,
+        environment_id=resolved_environment,
+        include_registry_snapshot_events=include_registry_snapshot_events,
+    )
+    events = [
+        AuditEvent(
+            seq=row.seq,
+            prev_hash=row.prev_hash,
+            entry_hash=row.entry_hash,
+            occurred_at=row.occurred_at,
+            actor=row.actor,
+            action=row.action,
+            subject_type=row.subject_type,
+            subject_id=row.subject_id,
+            outcome=row.outcome,  # type: ignore[arg-type]
+            detail=row.detail,
+        )
+        for row in rows
+    ]
+    next_cursor = _encode_audit_cursor(events[-1].seq) if len(events) == limit else None
+    return AuditEventPage(events=events, next_cursor=next_cursor)
+
+
+def _alert_on_drift(
+    session: Session, *, sink: NotificationSink, workflow_id: str, preflight_result: PreflightResult
+) -> None:
+    """The reactive half of stage 08's drift alert (BUILD_PLAN section 8) — fired the
+    moment ``prepare_operation``/``retry_operation`` themselves discover
+    ``DEFINITION_DRIFT``, rather than a periodic full-registry n8n-polling sweep this
+    codebase has no other precedent for. ``subject_id`` folds in the *live* hash, not
+    just the workflow id: the same drift persisting across many blocked ``prepare``
+    attempts dedups to one alert (identical live hash -> identical idempotency key),
+    but the workflow drifting *again* afterward, to a different live definition, is a
+    new key and alerts again — this is what makes "repeated drift" (the stage prompt's
+    own wording) mean "once per distinct drift", not "once ever" or "once per blocked
+    attempt"."""
+    drift_check = next(
+        (
+            c
+            for c in preflight_result.checks
+            if c.check == "definition_unchanged"
+            and c.status == "fail"
+            and c.code == DefinitionDriftError.code
+        ),
+        None,
+    )
+    if drift_check is None or not isinstance(drift_check.detail, dict):
+        return
+    live_hash = drift_check.detail.get("live")
+    if not live_hash:
+        return
+    event = NotificationEvent(
+        event_type="drift.detected",
+        subject_type="workflow",
+        subject_id=f"{workflow_id}:{live_hash}",
+        principal_id=None,
+        occurred_at=datetime.now(UTC),
+        fetch_reference=f"n8n-operator registry diff-live {workflow_id}",
+    )
+    _deliver_with_dedup(session, sink=sink, event=event)
+
+
+def check_and_deliver_alerts(
+    session: Session, *, sink: NotificationSink, executing_stuck_threshold_seconds: int = 3600
+) -> int:
+    """Alert-hook sweep for the two conditions that need periodic detection rather
+    than a reactive hook (stage 08, BUILD_PLAN section 8): an ``EXECUTING`` operation
+    stuck past a threshold, and an operation that has reached ``UNKNOWN``. Mirrors
+    ``expire_overdue_operations``/``retry_failed_notifications``'s own "swept
+    reconciliation, safe to run on a timer, idempotent" shape exactly — re-scanning
+    every matching row on every tick is safe because ``_deliver_with_dedup``'s
+    permanent per-``(subject_id, event_type)`` dedup, not this function, is what
+    keeps an already-alerted operation from alerting again. Returns the count of
+    deliveries that succeeded on this sweep, mirroring
+    ``retry_failed_notifications``'s own return contract.
+
+    Drift detection is deliberately *not* part of this sweep — see
+    ``_prepare_or_retry``'s own reactive drift-alert hook, fired the moment
+    ``prepare_operation``/``retry_operation`` already discover drift, rather than a
+    second, redundant n8n-polling mechanism this codebase has nowhere else.
+
+    A receipt's own ``delivered`` field is ``True`` both for a fresh, successful
+    delivery *and* for a deduplicated "already delivered" lookup that never called
+    the sink at all (:func:`_deliver_with_dedup`'s own contract) — this function's
+    return value counts only the former (``receipt.detail != _ALREADY_DELIVERED_DETAIL``),
+    matching "count of deliveries that succeeded *on this sweep*", not "count of
+    events that are, as of now, in a delivered state".
+    """
+    threshold = datetime.now(UTC) - timedelta(seconds=executing_stuck_threshold_seconds)
+    op_repo = OperationRepository(session)
+    delivered = 0
+    for row in op_repo.stuck_executing(older_than=threshold):
+        event = NotificationEvent(
+            event_type="operation.stuck",
+            subject_type="operation",
+            subject_id=row.id,
+            principal_id=None,
+            occurred_at=datetime.now(UTC),
+            fetch_reference=f"n8n-operator operations show {row.id}",
+        )
+        receipt = _deliver_with_dedup(session, sink=sink, event=event)
+        if receipt.delivered and receipt.detail != _ALREADY_DELIVERED_DETAIL:
+            delivered += 1
+    for row in op_repo.list_unknown():
+        event = NotificationEvent(
+            event_type="operation.unknown",
+            subject_type="operation",
+            subject_id=row.id,
+            principal_id=None,
+            occurred_at=datetime.now(UTC),
+            fetch_reference=f"n8n-operator operations show {row.id}",
+        )
+        receipt = _deliver_with_dedup(session, sink=sink, event=event)
+        if receipt.delivered and receipt.detail != _ALREADY_DELIVERED_DETAIL:
+            delivered += 1
+    return delivered
+
+
 def get_instance_health(health: HealthPort) -> HealthCheckResult:
     """Whether the configured n8n instance is reachable (MCP_TOOLS.md section 2.3).
 
@@ -1315,6 +1669,7 @@ def prepare_operation(
     idempotency_key: str | None = None,
     reason: str | None = None,
     enable_v2: bool = False,
+    notification_sink: NotificationSink | None = None,
 ) -> tuple[Operation, bool, str | None]:
     """Validate, preflight, and mint an operation handle (ADR-003, ARCHITECTURE.md 4.1).
 
@@ -1380,6 +1735,7 @@ def prepare_operation(
         idempotency_key=idempotency_key,
         reason=reason,
         enable_v2=enable_v2,
+        notification_sink=notification_sink,
     )
 
 
@@ -1399,12 +1755,19 @@ def _prepare_or_retry(
     reason: str | None,
     enable_v2: bool,
     parent_operation_id: str | None = None,
+    notification_sink: NotificationSink | None = None,
 ) -> tuple[Operation, bool, str | None]:
     """The shared body of :func:`prepare_operation` and :func:`retry_operation` —
     argument-size/rate-limit checks, idempotency, creation, validation, preflight, and
     approval-or-auto-approve — parameterized only by whether this new operation has a
     parent. See :func:`prepare_operation`'s own docstring for the full return-shape
     and result-vs-exception contract; nothing about that contract differs by caller.
+
+    ``notification_sink`` (stage 08, ADR-018): when given, a preflight block on
+    ``DEFINITION_DRIFT`` fires a reactive ``drift.detected`` alert (see the
+    ``if not preflight_result.ready:`` branch below) — ``None`` (v1, and v2 before a
+    sink is configured) is a pure no-op, identical to how ``request_approval``'s own
+    sink dependency already works.
     """
     canonical_bytes = canonicalize_arguments(arguments)
     fingerprint = fingerprint_arguments(canonical_bytes)
@@ -1548,6 +1911,13 @@ def _prepare_or_retry(
         operation = _apply_and_audit(
             session, operation, "T03", actor="system", detail=checks_detail
         )
+        if notification_sink is not None:
+            _alert_on_drift(
+                session,
+                sink=notification_sink,
+                workflow_id=workflow_id,
+                preflight_result=preflight_result,
+            )
         return _to_domain(operation), False, None
 
     now = datetime.now(UTC)
@@ -1630,6 +2000,7 @@ def retry_operation(
     idempotency_key: str | None = None,
     reason: str | None = None,
     enable_v2: bool = False,
+    notification_sink: NotificationSink | None = None,
 ) -> tuple[Operation, bool, str | None]:
     """Governed retry (MCP_TOOLS.md section 5.5, ADR-005/ADR-012, invariant I11): a
     brand-new operation, linked by ``parent_operation_id``, with its ``workflow_id``
@@ -1698,6 +2069,7 @@ def retry_operation(
         reason=reason,
         enable_v2=enable_v2,
         parent_operation_id=parent.id,
+        notification_sink=notification_sink,
     )
 
 
@@ -2161,6 +2533,9 @@ def resolve_approval_token(session: Session, *, token: str) -> ApprovalDecisionC
     return _approval_decision_context(session, row, approval_row)
 
 
+_ALREADY_DELIVERED_DETAIL = "already delivered (deduplicated)"
+
+
 def _deliver_with_dedup(
     session: Session, *, sink: NotificationSink, event: NotificationEvent
 ) -> DeliveryReceipt:
@@ -2183,7 +2558,7 @@ def _deliver_with_dedup(
             delivered=True,
             attempts=existing.attempts,
             status="delivered",
-            detail="already delivered (deduplicated)",
+            detail=_ALREADY_DELIVERED_DETAIL,
         )
     delivery = existing or repo.create(
         idempotency_key=idempotency_key,

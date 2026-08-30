@@ -34,6 +34,7 @@ __all__ = [
     "ApprovalDecisionEntry",
     "ApprovalStatus",
     "AuditEvent",
+    "AuditEventPage",
     "DeliveryOutcome",
     "DeliveryReceipt",
     "DiffEntry",
@@ -43,6 +44,10 @@ __all__ = [
     "ExecutionLookup",
     "ExecutionResult",
     "HealthCheckResult",
+    "LatencyPercentiles",
+    "MetricsBreakdownEntry",
+    "MetricsResult",
+    "MetricsTotals",
     "NotificationEvent",
     "Operation",
     "OperationEvent",
@@ -490,3 +495,76 @@ class WorkflowDefinitionDiff(BaseModel):
     truncated: bool = False
     total_changes: int = 0
     note: str | None = None
+
+
+class MetricsTotals(BaseModel):
+    """``get_metrics``'s window-wide totals (stage 08, MCP_TOOLS.md section 5.7,
+    ADR-019) — computed only over operations already filtered to the caller's
+    authorized scope, never a post-hoc redaction of an unscoped aggregate."""
+
+    model_config = ConfigDict(frozen=True)
+
+    count: int
+    by_outcome: dict[str, int]
+
+
+class LatencyPercentiles(BaseModel):
+    """Execution-latency percentiles for one ``get_metrics`` window (ADR-019 section
+    4). A percentile is ``None`` — with its own sibling ``*_reason`` field set to
+    ``"insufficient_sample"`` — whenever its bucket has fewer than 10 samples in the
+    window, rather than a number computed from too few points to mean anything. Field
+    naming (a flat ``pNN``/``pNN_reason`` pair, not a nested object) matches
+    MCP_TOOLS.md section 5.7's own worked JSON example literally."""
+
+    model_config = ConfigDict(frozen=True)
+
+    p50: float | None = None
+    p50_reason: str | None = None
+    p95: float | None = None
+    p95_reason: str | None = None
+    p99: float | None = None
+    p99_reason: str | None = None
+
+
+class MetricsBreakdownEntry(BaseModel):
+    """One row of ``get_metrics``'s ``breakdown`` (ADR-019 section 3). ``note`` is set
+    only on the synthetic ``"other"`` entry folding everything beyond the top-50
+    cardinality cap — never on a real entry, and a real entry's ``key`` is never a raw
+    n8n identifier, only a registry workflow id or a fixed enum value (risk,
+    side_effects, outcome)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    count: int
+    by_outcome: dict[str, int] | None = None
+    note: str | None = None
+
+
+class MetricsResult(BaseModel):
+    """``get_metrics``'s result (stage 08, MCP_TOOLS.md section 5.7, ADR-019) —
+    bounded to one of four enumerated windows, authorization-filtered before any
+    count or percentile is computed, never a caller-supplied arbitrary time range."""
+
+    model_config = ConfigDict(frozen=True)
+
+    environment: str | None
+    window: Literal["1h", "24h", "7d", "30d"]
+    generated_at: datetime
+    totals: MetricsTotals
+    latency_ms: LatencyPercentiles
+    breakdown: list[MetricsBreakdownEntry] = []
+
+
+class AuditEventPage(BaseModel):
+    """``list_audit_events``'s result (stage 08, MCP_TOOLS.md section 5.8, ADR-012
+    section 3) — ``events`` already authorization-filtered *before* pagination ran
+    (an out-of-scope entry is excluded from the query entirely, never returned
+    redacted), ``next_cursor`` set only when a full page came back (omitted, not
+    ``null``-but-present, once a page comes back short — the same rule
+    ``list_operations``'s own MCP adapter already follows)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    events: list[AuditEvent]
+    next_cursor: str | None = None

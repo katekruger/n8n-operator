@@ -184,4 +184,83 @@ def export(
         raise typer.Exit(code=EXIT_CHAIN_BROKEN)
 
 
+@app.command("list")
+def list_events(
+    environment: str | None = typer.Option(
+        None, "--environment", help="Environment id (v2 only; standard resolution)."
+    ),
+    workflow_id: str | None = typer.Option(None, "--workflow-id", help="Filter to one workflow."),
+    since: str | None = typer.Option(None, "--since", help="RFC 3339 timestamp."),
+    limit: int = typer.Option(20, "--limit", help="1-100, default 20."),
+    cursor: str | None = typer.Option(None, "--cursor", help="Opaque pagination cursor."),
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Query the audit chain within the caller's own authorization scope (stage 08,
+    MCP_TOOLS.md section 5.8, ADR-012 section 3) — unlike ``verify``/``export``, this
+    is not admin-only: any role can run it, scoped to whatever workflows/environments
+    that role's own grants cover (``viewer`` included, same as ``list_audit_events``'s
+    own role matrix entry)."""
+    from n8n_operator.errors import OperatorError
+
+    since_dt = None
+    if since is not None:
+        try:
+            from datetime import datetime
+
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            typer.secho(
+                f"'--since' is not a valid RFC 3339 timestamp: {since!r}.",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1) from None
+
+    with _connected() as session_factory:
+        try:
+            with session_scope(session_factory) as session:
+                principal_id, enable_v2 = _resolve_principal(session)
+                page = service.list_audit_events(
+                    session,
+                    principal_id=principal_id,
+                    environment=environment,
+                    workflow_id=workflow_id,
+                    since=since_dt,
+                    limit=limit,
+                    cursor=cursor,
+                    enable_v2=enable_v2,
+                )
+        except OperationalError:
+            _database_not_initialized_or_exit()
+            return
+        except OperatorError as exc:
+            typer.secho(exc.message, fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from None
+
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "events": [e.model_dump(mode="json") for e in page.events],
+                    "next_cursor": page.next_cursor,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    if not page.events:
+        typer.echo("(no audit events in scope)")
+        return
+    for event in page.events:
+        typer.echo(
+            f"seq={event.seq} {event.occurred_at.isoformat()} actor={event.actor} "
+            f"action={event.action} subject={event.subject_type}:{event.subject_id} "
+            f"outcome={event.outcome}"
+        )
+    if page.next_cursor is not None:
+        typer.echo(f"next_cursor: {page.next_cursor}")
+
+
 __all__ = ["app"]

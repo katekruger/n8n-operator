@@ -255,9 +255,9 @@ def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
     """Stage 02's completion gate: v1 mode (``enable_v2`` unset, the default) stays
     exactly the twelve tools AC-23 requires; ``whoami``, ``list_environments``
     (stage 04), ``request_approval``, ``get_approval_status`` (stage 05),
-    ``retry_operation`` (stage 06), and ``diff_workflow_definition`` (stage 07) are a
-    thirteenth through eighteenth tool that exist only when an operator opts in
-    (BUILD_PLAN section 7.2)."""
+    ``retry_operation`` (stage 06), ``diff_workflow_definition`` (stage 07), and
+    ``get_metrics``/``list_audit_events`` (stage 08) are a thirteenth through
+    twentieth tool that exist only when an operator opts in (BUILD_PLAN section 7.2)."""
     v1_tools = build_tools(_make_deps())
     v2_tools = build_tools(ToolDeps(**{**_make_deps().__dict__, "enable_v2": True}))
 
@@ -272,5 +272,7 @@ def test_whoami_is_registered_only_when_v2_is_enabled() -> None:
         "get_approval_status",
         "retry_operation",
         "diff_workflow_definition",
+        "get_metrics",
+        "list_audit_events",
     }
-    assert len(v2_tools) == 18
+    assert len(v2_tools) == 20

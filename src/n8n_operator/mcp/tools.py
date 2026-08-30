@@ -558,6 +558,131 @@ def _make_diff_workflow_definition(deps: ToolDeps) -> Tool:
 
 
 # ======================================================================================
+# get_metrics
+# ======================================================================================
+
+
+class GetMetricsArgs(_ToolArgs):
+    environment: str | None = None
+    window: str = "24h"
+    group_by: str | None = None
+
+
+def _make_get_metrics(deps: ToolDeps) -> Tool:
+    async def handler(
+        environment: str | None = None, window: str = "24h", group_by: str | None = None
+    ) -> dict[str, Any]:
+        with session_scope(deps.session_factory) as session:
+            try:
+                result = service.get_metrics(
+                    session,
+                    principal_id=_resolve_principal_id(deps),
+                    environment=environment if deps.enable_v2 else deps.environment,
+                    window=window,
+                    group_by=group_by,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        return {
+            "environment": result.environment,
+            "window": result.window,
+            "generated_at": _iso(result.generated_at),
+            "totals": result.totals.model_dump(mode="json"),
+            "latency_ms": result.latency_ms.model_dump(mode="json"),
+            "breakdown": [entry.model_dump(mode="json") for entry in result.breakdown],
+        }
+
+    return _build_tool(
+        name="get_metrics",
+        description=(
+            "Bounded, authorization-filtered operational metrics: operation counts, "
+            "outcome distribution, and execution-latency percentiles over an "
+            "enumerated window — never a caller-supplied arbitrary time range."
+        ),
+        args_model=GetMetricsArgs,
+        handler=handler,
+        annotations=_READ_ONLY,
+    )
+
+
+# ======================================================================================
+# list_audit_events
+# ======================================================================================
+
+
+class ListAuditEventsArgs(_ToolArgs):
+    environment: str | None = None
+    workflow_id: str | None = None
+    since: str | None = None
+    limit: int = 20
+    cursor: str | None = None
+
+
+def _make_list_audit_events(deps: ToolDeps) -> Tool:
+    async def handler(
+        environment: str | None = None,
+        workflow_id: str | None = None,
+        since: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        since_dt: datetime | None = None
+        if since is not None:
+            try:
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            except ValueError:
+                return _error_result(
+                    InvalidArgumentsError(
+                        f"'since' is not a valid RFC 3339 timestamp: {since!r}.",
+                        details={"since": since},
+                    )
+                )
+        with session_scope(deps.session_factory) as session:
+            try:
+                page = service.list_audit_events(
+                    session,
+                    principal_id=_resolve_principal_id(deps),
+                    environment=environment if deps.enable_v2 else deps.environment,
+                    workflow_id=workflow_id,
+                    since=since_dt,
+                    limit=limit,
+                    cursor=cursor,
+                    enable_v2=deps.enable_v2,
+                )
+            except OperatorError as exc:
+                return _error_result(exc)
+        return {
+            "events": [
+                {
+                    "seq": event.seq,
+                    "occurred_at": _iso(event.occurred_at),
+                    "actor": event.actor,
+                    "action": event.action,
+                    "subject_type": event.subject_type,
+                    "subject_id": event.subject_id,
+                    "outcome": event.outcome,
+                    "detail": event.detail,
+                }
+                for event in page.events
+            ],
+            "next_cursor": page.next_cursor,
+        }
+
+    return _build_tool(
+        name="list_audit_events",
+        description=(
+            "Query the audit chain within the caller's authorization scope — an "
+            "event for a workflow or environment outside the caller's scope is "
+            "excluded from the query entirely, never returned redacted."
+        ),
+        args_model=ListAuditEventsArgs,
+        handler=handler,
+        annotations=_READ_ONLY,
+    )
+
+
+# ======================================================================================
 # prepare_operation
 # ======================================================================================
 
@@ -674,6 +799,7 @@ def _make_prepare_operation(deps: ToolDeps) -> Tool:
                     idempotency_key=idempotency_key,
                     reason=reason,
                     enable_v2=deps.enable_v2,
+                    notification_sink=deps.notification_sink,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -1422,6 +1548,7 @@ def _make_retry_operation(deps: ToolDeps) -> Tool:
                     idempotency_key=idempotency_key,
                     reason=reason,
                     enable_v2=deps.enable_v2,
+                    notification_sink=deps.notification_sink,
                 )
             except OperatorError as exc:
                 return _error_result(exc)
@@ -1491,4 +1618,6 @@ def build_tools(deps: ToolDeps) -> list[Tool]:
         tools.append(_make_get_approval_status(deps))
         tools.append(_make_retry_operation(deps))
         tools.append(_make_diff_workflow_definition(deps))
+        tools.append(_make_get_metrics(deps))
+        tools.append(_make_list_audit_events(deps))
     return tools
