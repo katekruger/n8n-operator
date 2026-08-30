@@ -71,6 +71,11 @@ class FakeDispatch:
         raise NotImplementedError
 
 
+class FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 @pytest.fixture
 def registry_path(tmp_path: Path) -> Path:
     path = tmp_path / "workflows.yaml"
@@ -93,6 +98,7 @@ def make_server(
         preflight=FakePreflight(),
         health=FakeHealth(),
         dispatch=FakeDispatch(),
+        definition=FakeDefinition(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,

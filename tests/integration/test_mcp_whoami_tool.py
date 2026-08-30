@@ -52,6 +52,11 @@ class FakeDispatch:
         raise NotImplementedError
 
 
+class FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 def make_server(
     session_factory: sessionmaker[Session], *, principal_id: str, enable_v2: bool = True
 ) -> MCPServer[Any]:
@@ -60,6 +65,7 @@ def make_server(
         preflight=FakePreflight(),
         health=FakeHealth(),
         dispatch=FakeDispatch(),
+        definition=FakeDefinition(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,
@@ -111,7 +117,8 @@ async def test_whoami_is_the_thirteenth_tool_in_v2_mode(
     assert "request_approval" in names
     assert "get_approval_status" in names
     assert "retry_operation" in names
-    assert len(names) == 17
+    assert "diff_workflow_definition" in names
+    assert len(names) == 18
 
 
 @pytest.mark.integration

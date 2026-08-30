@@ -1,0 +1,104 @@
+{
+  "active": true,
+  "connections": {
+    "Route By Plan": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Paid Path",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "Free Path",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Route By Plan",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "wf_sanitized_id",
+  "name": "Sanitized Workflow",
+  "nodes": [
+    {
+      "id": "wh-5",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "branch"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1
+    },
+    {
+      "id": "switch-1",
+      "name": "Route By Plan",
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.plan }}",
+                    "rightValue": "pro"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "position": [
+        200,
+        0
+      ],
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1
+    },
+    {
+      "id": "paid-1",
+      "name": "Paid Path",
+      "parameters": {},
+      "position": [
+        400,
+        -80
+      ],
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1
+    },
+    {
+      "id": "free-1",
+      "name": "Free Path",
+      "parameters": {},
+      "position": [
+        400,
+        80
+      ],
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1031,6 +1031,36 @@ def test_preflight_workflow_runs_the_injected_port_without_creating_an_operation
     assert count == 0
 
 
+@pytest.mark.integration
+def test_preflight_workflow_links_a_definition_drift_to_diff_live(
+    session_factory: sessionmaker[Session], env: dict[str, Any]
+) -> None:
+    """Stage 07: a failed ``definition_unchanged`` check gets an advisory pointer to
+    ``registry diff-live`` appended to its ``detail`` — never anything that changes
+    ``status``/``code``, since the hash comparison alone decided this check already
+    failed (ADR-008's "advisory, not deciding")."""
+    fake = FakePreflight(
+        extra_checks=[
+            PreflightCheck(
+                check="definition_unchanged",
+                status="fail",
+                code="DEFINITION_DRIFT",
+                detail={"registered": "sha256:aaa", "live": "sha256:bbb"},
+            )
+        ]
+    )
+    with session_scope(session_factory) as session:
+        result = service.preflight_workflow(
+            session, workflow_id="wf.needs_approval", preflight=fake
+        )
+    check = next(c for c in result.checks if c.check == "definition_unchanged")
+    assert check.status == "fail"
+    assert check.code == "DEFINITION_DRIFT"
+    assert check.detail is not None
+    assert check.detail["registered"] == "sha256:aaa"
+    assert "registry diff-live wf.needs_approval" in check.detail["diff_hint"]
+
+
 # --------------------------------------------------------------------------------------
 # REGISTRY_UNAVAILABLE: no snapshot loaded yet
 # --------------------------------------------------------------------------------------

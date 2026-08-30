@@ -36,6 +36,7 @@ __all__ = [
     "AuditEvent",
     "DeliveryOutcome",
     "DeliveryReceipt",
+    "DiffEntry",
     "DispatchOutcome",
     "Environment",
     "EnvironmentSummary",
@@ -51,6 +52,7 @@ __all__ = [
     "ReconciliationRecord",
     "RequestApprovalResult",
     "WorkflowContract",
+    "WorkflowDefinitionDiff",
 ]
 
 
@@ -429,3 +431,62 @@ class ReconciliationRecord(BaseModel):
     note: str
     actor: str
     recorded_at: datetime
+
+
+class DiffEntry(BaseModel):
+    """One structural change between two canonical workflow-definition forms (stage
+    07, ADR-008, MCP_TOOLS.md section 5.6) — ``core.definition_diff``'s own output unit,
+    computed over exactly the same ``{nodes, connections, settings}`` scope
+    ``n8n.canonicalization.compute_definition_hash`` hashes, so a diff and a drift
+    detection can never disagree about what changed.
+
+    ``path`` is JSON-Pointer-style (``/nodes/2/parameters/url``). ``registered_value``/
+    ``live_value`` are populated for ``modified`` (both sides) and, when available, for
+    ``added``/``removed`` (whichever side actually has the value) — ``None`` otherwise.
+    ``summary`` stands in for a whole-node ``added``/``removed`` entry's value: a
+    bounded ``{type, name}`` rather than the full node body (MCP_TOOLS.md's own example
+    shows no value at all for a whole-node add). ``from_index``/``to_index`` are set
+    only for ``moved`` — a node whose content is unchanged but whose position in the
+    ``nodes`` array differs, which invariant "hash differs ⟺ diff is non-empty" requires
+    surfacing as *something*, since CAN-04 makes array order hash-significant and no
+    exclusion-allowlist entry covers node order itself."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    change_type: Literal["added", "removed", "modified", "moved"]
+    registered_value: Any = None
+    live_value: Any = None
+    summary: dict[str, Any] | None = None
+    from_index: int | None = None
+    to_index: int | None = None
+    truncated: bool = False
+
+
+class WorkflowDefinitionDiff(BaseModel):
+    """``diff_workflow_definition``'s result (stage 07, MCP_TOOLS.md section 5.6) — a
+    structural diff between the registered ``definition_hash`` and the live n8n
+    definition, presented to a human *after* the hash comparison has already decided
+    pass/fail (ADR-008's "advisory, not deciding"; the hash comparison, not this
+    result, is what ``preflight``/``execute`` gate on).
+
+    ``diff_available`` is ``False`` when no ``WorkflowDefinitionSnapshot`` was ever
+    captured for ``registered_hash`` (a pre-existing registry entry, or one whose hash
+    was set by hand rather than via ``registry hash --n8n-workflow-id``) — ``changed``
+    is still a fully honest hash comparison either way; only the itemized ``diff`` list
+    needs a stored snapshot to exist at all. ``truncated``/``total_changes`` cover the
+    "huge diffs" case: once the entry-count cap is hit, ``diff`` stops growing but
+    ``total_changes`` still reports the real count."""
+
+    model_config = ConfigDict(frozen=True)
+
+    workflow_id: str
+    environment: str | None
+    registered_hash: str
+    live_hash: str
+    changed: bool
+    diff: list[DiffEntry] = []
+    diff_available: bool = True
+    truncated: bool = False
+    total_changes: int = 0
+    note: str | None = None

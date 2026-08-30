@@ -1,0 +1,66 @@
+{
+  "active": true,
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "Map CRM Fields",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "id": "wf_sanitized_id",
+  "name": "Sanitized Workflow",
+  "nodes": [
+    {
+      "id": "set-1",
+      "name": "Map CRM Fields",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "email",
+              "type": "string",
+              "value": "={{ $json.body.contact_email }}"
+            },
+            {
+              "id": "a2",
+              "name": "account_name",
+              "type": "string",
+              "value": "={{ $json.body.org_name }}"
+            }
+          ]
+        }
+      },
+      "position": [
+        200,
+        0
+      ],
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1
+    },
+    {
+      "id": "wh-1",
+      "name": "Webhook",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crm-sync"
+      },
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

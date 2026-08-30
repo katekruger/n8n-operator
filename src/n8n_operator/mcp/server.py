@@ -210,6 +210,7 @@ class _EnvironmentAdapterFactory:
             preflight=_PreflightAdapter(N8nPreflight(client)),
             health=_HealthAdapter(N8nHealth(client)),
             dispatch=_DispatchAdapter(N8nDispatch(client)),
+            definition=client,
         )
 
 
@@ -364,6 +365,7 @@ def build_server(
         preflight=_PreflightAdapter(N8nPreflight(client)),
         health=_HealthAdapter(N8nHealth(client)),
         dispatch=_DispatchAdapter(N8nDispatch(client)),
+        definition=client,
         server_max_argument_bytes=settings.max_argument_bytes,
         principal_id=principal_id,
         caller_is_local=caller_is_local,

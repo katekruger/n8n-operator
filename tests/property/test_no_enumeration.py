@@ -194,6 +194,11 @@ class _FakeDispatch:
         raise NotImplementedError
 
 
+class _FakeDefinition:
+    def get_workflow(self, n8n_workflow_id: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
 _REGISTRY_YAML = """apiVersion: n8n-operator/v1
 metadata:
   name: ac44-test
@@ -231,6 +236,7 @@ def _make_server(session_factory: sessionmaker[Session], *, principal_id: str) -
         preflight=_FakePreflight(),
         health=_FakeHealth(),
         dispatch=_FakeDispatch(),
+        definition=_FakeDefinition(),
         server_max_argument_bytes=262_144,
         principal_id=principal_id,
         caller_is_local=True,

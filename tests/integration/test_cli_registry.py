@@ -10,12 +10,16 @@ read-only commands (``validate``/``list``/``show``/``hash``) require a database 
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
+from integration.mock_n8n import MockN8n
 from n8n_operator.cli.main import app
+from n8n_operator.n8n.client import N8nClient
 
 runner = CliRunner()
 
@@ -211,11 +215,95 @@ def test_hash_matches_validate(registry_env: None) -> None:
     assert hash_result.stdout.strip() in validate_result.stdout
 
 
+@pytest.fixture
+def mock_n8n() -> MockN8n:
+    return MockN8n()
+
+
+@pytest.fixture
+def hash_env(registry_env: None, mock_n8n: MockN8n, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("N8N_OPERATOR_N8N_BASE_URL", "https://n8n.invalid")
+    monkeypatch.setenv("N8N_OPERATOR_N8N_API_KEY", "test-key")
+
+    def _fake_n8n_client(
+        *, base_url: str, api_key: str, connect_timeout_seconds: float
+    ) -> N8nClient:
+        return N8nClient(
+            base_url=base_url,
+            api_key=api_key,
+            connect_timeout_seconds=connect_timeout_seconds,
+            transport=mock_n8n.transport(),
+        )
+
+    monkeypatch.setattr("n8n_operator.cli.commands.registry.N8nClient", _fake_n8n_client)
+
+
 @pytest.mark.integration
-def test_hash_with_n8n_workflow_id_reports_not_yet_implemented(registry_env: None) -> None:
+def test_hash_with_n8n_workflow_id_requires_workflow_id(registry_env: None) -> None:
     result = runner.invoke(app, ["registry", "hash", "--n8n-workflow-id", "abc"])
     assert result.exit_code == 1
-    assert "phase 4" in result.stdout.lower() or "phase 4" in result.stderr
+    assert "--workflow-id is required" in result.stderr
+
+
+@pytest.mark.integration
+def test_hash_with_n8n_workflow_id_captures_a_snapshot(hash_env: None, mock_n8n: MockN8n) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+
+    mock_n8n.add_workflow(
+        "n8n-secret-id-999",
+        {
+            "id": "n8n-secret-id-999",
+            "name": "A workflow",
+            "active": True,
+            "nodes": [
+                {
+                    "id": "n1",
+                    "name": "Webhook",
+                    "type": "n8n-nodes-base.webhook",
+                    "position": [0, 0],
+                    "parameters": {},
+                }
+            ],
+            "connections": {},
+            "settings": {},
+        },
+    )
+
+    result = runner.invoke(
+        app, ["registry", "hash", "--n8n-workflow-id", "n8n-secret-id-999", "--workflow-id", "wf.a"]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0].startswith("sha256:")
+    assert "snapshot captured" in result.stdout.lower()
+
+
+@pytest.mark.integration
+def test_hash_with_n8n_workflow_id_run_twice_reuses_the_snapshot(
+    hash_env: None, mock_n8n: MockN8n
+) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+
+    definition = {
+        "id": "n8n-secret-id-999",
+        "name": "A workflow",
+        "active": True,
+        "nodes": [],
+        "connections": {},
+        "settings": {},
+    }
+    mock_n8n.add_workflow("n8n-secret-id-999", definition)
+
+    first = runner.invoke(
+        app, ["registry", "hash", "--n8n-workflow-id", "n8n-secret-id-999", "--workflow-id", "wf.a"]
+    )
+    second = runner.invoke(
+        app, ["registry", "hash", "--n8n-workflow-id", "n8n-secret-id-999", "--workflow-id", "wf.a"]
+    )
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert first.stdout.splitlines()[0] == second.stdout.splitlines()[0]
 
 
 # --------------------------------------------------------------------------------------
@@ -277,3 +365,113 @@ def test_no_secret_or_n8n_id_appears_in_reload_output(registry_env: None) -> Non
     result = runner.invoke(app, ["registry", "reload"])
     assert "n8n-secret-id-999" not in result.stdout
     assert "SOME_SECRET_NAME" not in result.stdout
+
+
+# --------------------------------------------------------------------------------------
+# diff-live
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_diff_live_with_no_captured_snapshot_reports_unavailable(
+    hash_env: None, mock_n8n: MockN8n
+) -> None:
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+    mock_n8n.add_workflow(
+        "n8n-secret-id-999",
+        {
+            "id": "n8n-secret-id-999",
+            "name": "A workflow",
+            "active": True,
+            "nodes": [],
+            "connections": {},
+            "settings": {},
+        },
+    )
+
+    reload_result = runner.invoke(app, ["registry", "reload"])
+    assert reload_result.exit_code == 0, reload_result.output
+
+    result = runner.invoke(app, ["registry", "diff-live", "wf.a"])
+    assert result.exit_code == 0, result.output
+    assert "diff not available" in result.stdout.lower()
+
+
+@pytest.mark.integration
+def test_diff_live_with_a_captured_snapshot_shows_a_real_diff(
+    tmp_path: Path, mock_n8n: MockN8n, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from n8n_operator.n8n.canonicalization import compute_definition_hash
+    from n8n_operator.n8n.client import N8nClient
+
+    base_definition: dict[str, Any] = {
+        "id": "n8n-secret-id-999",
+        "name": "A workflow",
+        "active": True,
+        "nodes": [
+            {
+                "id": "n1",
+                "name": "Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "position": [0, 0],
+                "parameters": {"url": "https://old.example.com"},
+            }
+        ],
+        "connections": {},
+        "settings": {},
+    }
+    real_hash = compute_definition_hash(base_definition)
+
+    registry = VALID_REGISTRY.replace("sha256:" + "a" * 64, real_hash, 1)
+    registry_path = tmp_path / "workflows.yaml"
+    registry_path.write_text(registry)
+
+    monkeypatch.setenv("N8N_OPERATOR_REGISTRY_PATH", str(registry_path))
+    monkeypatch.setenv(
+        "N8N_OPERATOR_DATABASE_URL", f"sqlite+pysqlite:///{tmp_path / 'diff_live.db'}"
+    )
+    monkeypatch.setenv("N8N_OPERATOR_N8N_BASE_URL", "https://n8n.invalid")
+    monkeypatch.setenv("N8N_OPERATOR_N8N_API_KEY", "test-key")
+
+    def _fake_n8n_client(
+        *, base_url: str, api_key: str, connect_timeout_seconds: float
+    ) -> N8nClient:
+        return N8nClient(
+            base_url=base_url,
+            api_key=api_key,
+            connect_timeout_seconds=connect_timeout_seconds,
+            transport=mock_n8n.transport(),
+        )
+
+    monkeypatch.setattr("n8n_operator.cli.commands.registry.N8nClient", _fake_n8n_client)
+
+    mock_n8n.add_workflow("n8n-secret-id-999", base_definition)
+    init_result = runner.invoke(app, ["db", "init"])
+    assert init_result.exit_code == 0
+    reload_result = runner.invoke(app, ["registry", "reload"])
+    assert reload_result.exit_code == 0, reload_result.output
+    hash_result = runner.invoke(
+        app, ["registry", "hash", "--n8n-workflow-id", "n8n-secret-id-999", "--workflow-id", "wf.a"]
+    )
+    assert hash_result.exit_code == 0, hash_result.output
+
+    changed_definition = {
+        **base_definition,
+        "nodes": [
+            {**base_definition["nodes"][0], "parameters": {"url": "https://new.example.com"}}
+        ],
+    }
+    mock_n8n.add_workflow("n8n-secret-id-999", changed_definition)
+
+    result = runner.invoke(app, ["registry", "diff-live", "wf.a"])
+    assert result.exit_code == 0, result.output
+    assert "changed:         True" in result.stdout
+    assert "/nodes/0/parameters/url" in result.stdout
+
+    json_result = runner.invoke(app, ["registry", "diff-live", "wf.a", "--json"])
+    assert json_result.exit_code == 0
+    body = json.loads(json_result.stdout)
+    assert body["changed"] is True
+    assert body["diff_available"] is True
+    assert len(body["diff"]) == 1

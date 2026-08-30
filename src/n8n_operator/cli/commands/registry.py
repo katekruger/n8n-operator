@@ -8,7 +8,10 @@ or cross-capability orchestration involved in reporting what a file on disk cont
 ``registry/`` and ``storage/`` at once (ARCHITECTURE.md section 2.1).
 
 None of these commands require ``N8N_OPERATOR_N8N_BASE_URL``/``N8N_OPERATOR_N8N_API_KEY``
-to be set: the registry path and the argument-size ceiling are resolved via
+to be set, with one exception: ``registry hash --n8n-workflow-id`` genuinely calls n8n
+(v1) or a resolved environment's own credentials (v2, ``--environment``), since it fetches
+a live definition. Every other command's registry path and the argument-size ceiling are
+resolved via
 :func:`~n8n_operator.config.resolve_registry_path` and
 :func:`~n8n_operator.config.resolve_max_argument_bytes`, which — like
 :func:`~n8n_operator.config.resolve_database_url` in phase 1 — never require the rest of
@@ -16,13 +19,13 @@ to be set: the registry path and the argument-size ceiling are resolved via
 
 ``registry hash`` computes the registry **document's** canonical content hash (BUILD_PLAN
 section 6.7) — a file-only, n8n-free operation. WORKFLOW_REGISTRY.md section 5 also
-describes a second mode, ``--n8n-workflow-id``, that computes a specific *workflow's*
-``definition_hash`` by fetching its live definition from n8n; that mode is out of scope
-here (phase 2 implements no n8n network calls) and arrives with n8n integration in
-phase 4. Passing ``--n8n-workflow-id`` now reports that plainly rather than being
-silently ignored.
+describes a second mode, ``--n8n-workflow-id`` (stage 07), that fetches a specific
+*workflow's* live definition from n8n, computes its ``definition_hash``, and persists a
+snapshot ``diff_workflow_definition`` can later diff against — the one command in this
+module that touches both the registry file and storage/n8n, since capturing a snapshot
+is itself a persisted fact, not just a report of one.
 
-Phase 2 (BUILD_PLAN section 12).
+Phase 2 (BUILD_PLAN section 12); ``--n8n-workflow-id`` added stage 07.
 """
 
 from __future__ import annotations
@@ -32,7 +35,12 @@ from pathlib import Path
 
 import typer
 
-from n8n_operator.config import resolve_max_argument_bytes, resolve_registry_path
+from n8n_operator.config import (
+    resolve_max_argument_bytes,
+    resolve_registry_path,
+    resolve_secret_reference,
+)
+from n8n_operator.n8n.client import N8nClient
 from n8n_operator.registry.loader import (
     LoadedRegistry,
     RegistryParseError,
@@ -178,24 +186,94 @@ def hash_(
     n8n_workflow_id: str | None = typer.Option(
         None,
         "--n8n-workflow-id",
-        help="Not yet implemented — arrives with n8n integration in phase 4.",
+        help="Fetch this live n8n workflow, compute its definition_hash, and capture "
+        "a snapshot for diff_workflow_definition (stage 07).",
+    ),
+    workflow_id: str | None = typer.Option(
+        None,
+        "--workflow-id",
+        help="The registry's own workflow id (required with --n8n-workflow-id) — the "
+        "identity diff_workflow_definition looks snapshots up by. Distinct from "
+        "--n8n-workflow-id, which is the live instance's own internal id.",
+    ),
+    environment: str | None = typer.Option(
+        None,
+        "--environment",
+        help="Environment id whose credentials to use (v2 only; ignored in v1, which "
+        "always uses the single configured instance).",
     ),
 ) -> None:
     """Print the registry document's canonical content hash (BUILD_PLAN section 6.7) —
-    the same hash ``registry reload`` would create a snapshot for."""
-    if n8n_workflow_id is not None:
+    the same hash ``registry reload`` would create a snapshot for.
+
+    With ``--n8n-workflow-id``, instead fetches that workflow's *live* definition from
+    n8n (WORKFLOW_REGISTRY.md section 5), prints its ``definition_hash``, and persists a
+    ``workflow_definition_snapshots`` row keyed by ``(--workflow-id, definition_hash)`` —
+    the "registered" side ``diff_workflow_definition`` (stage 07) compares against.
+    """
+    if n8n_workflow_id is None:
+        resolved_path = _resolve_path(path)
+        loaded = _load_or_exit(resolved_path, server_max_argument_bytes=server_max_argument_bytes)
+        typer.echo(loaded.content_hash)
+        return
+
+    if workflow_id is None:
         typer.secho(
-            "--n8n-workflow-id is not yet implemented: computing a workflow's own "
-            "definition_hash requires fetching its live definition from n8n, which "
-            "arrives with n8n integration in phase 4. This command currently computes "
-            "the registry document's own content hash only.",
-            fg=typer.colors.YELLOW,
+            "--workflow-id is required together with --n8n-workflow-id.",
+            fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=1)
-    resolved_path = _resolve_path(path)
-    loaded = _load_or_exit(resolved_path, server_max_argument_bytes=server_max_argument_bytes)
-    typer.echo(loaded.content_hash)
+
+    from n8n_operator.config import load_settings, resolve_database_url, resolve_v2_identity_flags
+    from n8n_operator.core.identity import resolve_cli_principal_id, resolve_environment
+    from n8n_operator.logging_setup import register_secret
+    from n8n_operator.n8n.canonicalization import canonical_form, compute_definition_hash
+    from n8n_operator.storage.repository import WorkflowDefinitionSnapshotRepository
+    from n8n_operator.storage.session import (
+        create_engine_for_url,
+        create_session_factory,
+        session_scope,
+    )
+
+    enable_v2, dev_principal_id = resolve_v2_identity_flags()
+    engine = create_engine_for_url(resolve_database_url())
+    session_factory = create_session_factory(engine)
+    with session_scope(session_factory) as session:
+        principal_id = resolve_cli_principal_id(
+            session, enable_v2=enable_v2, dev_principal_id=dev_principal_id
+        )
+        if enable_v2:
+            resolved_env = resolve_environment(
+                session, principal_id=principal_id, environment=environment
+            )
+            base_url = resolve_secret_reference(resolved_env.n8n_base_url_ref)
+            api_key = resolve_secret_reference(resolved_env.n8n_api_key_ref)
+            register_secret(api_key)
+            client = N8nClient(base_url=base_url, api_key=api_key, connect_timeout_seconds=60.0)
+        else:
+            settings = load_settings()
+            register_secret(settings.n8n_api_key.get_secret_value())
+            client = N8nClient(
+                base_url=str(settings.n8n_base_url),
+                api_key=settings.n8n_api_key.get_secret_value(),
+                connect_timeout_seconds=float(settings.request_timeout_seconds),
+            )
+
+        raw = client.get_workflow(n8n_workflow_id)
+        digest = compute_definition_hash(raw)
+        WorkflowDefinitionSnapshotRepository(session).create(
+            workflow_id=workflow_id,
+            definition_hash=digest,
+            canonical_definition=canonical_form(raw),
+            captured_by=principal_id,
+        )
+
+    typer.echo(digest)
+    typer.secho(
+        f"snapshot captured: workflow_id={workflow_id} definition_hash={digest}",
+        fg=typer.colors.GREEN,
+    )
 
 
 @app.command("reload")
@@ -258,6 +336,104 @@ def reload_(
         typer.secho("Registry reloaded; a new snapshot is now active.", fg=typer.colors.GREEN)
     typer.echo(f"  snapshot_id:   {snapshot.id}")
     typer.echo(f"  content_hash:  {snapshot.content_hash}")
+
+
+@app.command("diff-live")
+def diff_live(
+    workflow_id: str = typer.Argument(..., help="The registry's own workflow id."),
+    environment: str | None = typer.Option(
+        None, "--environment", help="Environment id whose credentials to use (v2 only)."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print the full machine-readable result."),
+) -> None:
+    """A structural diff between the registered definition and the workflow's current
+    live n8n definition (stage 07, MCP_TOOLS.md section 5.6) — advisory only: the
+    ``definition_hash`` comparison, not this diff, is what ``preflight_workflow``/
+    ``prepare_operation`` gate on (ADR-008's "advisory, not deciding")."""
+    from n8n_operator.config import load_settings, resolve_database_url, resolve_v2_identity_flags
+    from n8n_operator.core import service
+    from n8n_operator.core.identity import resolve_cli_principal_id
+    from n8n_operator.errors import OperatorError
+    from n8n_operator.logging_setup import register_secret
+    from n8n_operator.storage.session import (
+        create_engine_for_url,
+        create_session_factory,
+        session_scope,
+    )
+
+    enable_v2, dev_principal_id = resolve_v2_identity_flags()
+    engine = create_engine_for_url(resolve_database_url())
+    try:
+        session_factory = create_session_factory(engine)
+        with session_scope(session_factory) as session:
+            principal_id = resolve_cli_principal_id(
+                session, enable_v2=enable_v2, dev_principal_id=dev_principal_id
+            )
+            settings = None if enable_v2 else load_settings()
+            if settings is not None:
+                register_secret(settings.n8n_api_key.get_secret_value())
+                client = N8nClient(
+                    base_url=str(settings.n8n_base_url),
+                    api_key=settings.n8n_api_key.get_secret_value(),
+                    connect_timeout_seconds=float(settings.request_timeout_seconds),
+                )
+            else:
+                # v2: `service.diff_workflow_definition` resolves the environment and
+                # authorizes the call internally; the actual live fetch below needs a
+                # client bound to *that same* environment's own credentials, so it is
+                # resolved the identical way `hash_`'s `--n8n-workflow-id` mode does.
+                from n8n_operator.core.identity import resolve_environment
+
+                resolved_env = resolve_environment(
+                    session, principal_id=principal_id, environment=environment
+                )
+                base_url = resolve_secret_reference(resolved_env.n8n_base_url_ref)
+                api_key = resolve_secret_reference(resolved_env.n8n_api_key_ref)
+                register_secret(api_key)
+                client = N8nClient(base_url=base_url, api_key=api_key, connect_timeout_seconds=60.0)
+
+            try:
+                result = service.diff_workflow_definition(
+                    session,
+                    workflow_id=workflow_id,
+                    definition=client,
+                    principal_id=principal_id,
+                    enable_v2=enable_v2,
+                    environment=environment,
+                )
+            except OperatorError as exc:
+                typer.secho(exc.message, fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1) from None
+    finally:
+        engine.dispose()
+
+    if as_json:
+        typer.echo(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
+        return
+
+    typer.echo(f"registered_hash: {result.registered_hash}")
+    typer.echo(f"live_hash:       {result.live_hash}")
+    typer.echo(f"changed:         {result.changed}")
+    if not result.diff_available:
+        typer.secho(f"diff not available: {result.note}", fg=typer.colors.YELLOW)
+        return
+    if not result.diff:
+        typer.secho("no structural changes.", fg=typer.colors.GREEN)
+        return
+    for entry in result.diff:
+        typer.echo(
+            f"  {entry.change_type:8} {entry.path}"
+            + (
+                f"  {entry.registered_value!r} -> {entry.live_value!r}"
+                if entry.change_type == "modified"
+                else ""
+            )
+        )
+    if result.truncated:
+        typer.secho(
+            f"(truncated: showing {len(result.diff)} of {result.total_changes} changes)",
+            fg=typer.colors.YELLOW,
+        )
 
 
 __all__ = ["app"]
