@@ -37,8 +37,15 @@ a package. Visibility and publication are separate, explicit operator decisions.
 - [x] Built-wheel MCP stdio protocol session retained as automated evidence (this does
       not claim that the Claude Desktop GUI itself was launched)
 - [x] OpenAI-compatible Streamable HTTP protocol test retained as automated evidence
-- [ ] Live n8n compatibility workflow green against every version claimed in the matrix
-- [ ] Hosted OpenAI connector claim matches a retained real-client test
+- [x] Live n8n compatibility workflow green against every version claimed in the
+      matrix — the matrix claims exactly one version (2.35.7) and the repeatable
+      Docker harness run against it is green (8/8); see
+      `docs/evidence/stage11-live-n8n-run.md`
+- [ ] Hosted OpenAI connector claim matches a retained real-client test — **pending**:
+      no hosted Claude/OpenAI credentials exist in this environment; the retained
+      protocol-conformance evidence (`docs/evidence/stage11-protocol-sessions.md`)
+      stands in for now; any operator with their own client credentials can complete
+      this check
 
 ## Release identity
 
