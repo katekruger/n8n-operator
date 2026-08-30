@@ -34,6 +34,7 @@ from n8n_operator.errors import OptimisticLockError
 from n8n_operator.storage.models import (
     GENESIS_HASH,
     Approval,
+    AuditAnchor,
     AuditLogEntry,
     Environment,
     ExecutionResult,
@@ -1197,6 +1198,61 @@ class AuditLogRepository:
             stmt = stmt.where(AuditLogEntry.seq < before_seq)
 
         stmt = stmt.order_by(AuditLogEntry.seq.desc()).limit(limit)
+        return list(self._session.scalars(stmt))
+
+
+class AuditAnchorRepository:
+    """The ``audit_anchors`` table (stage 09, ADR-012 section 2) — one row per
+    publish attempt, successful or not (``publish_failed``, fail-visible per the
+    ADR's own requirement). No update or delete method exists here, matching
+    ``AuditLogRepository``'s own append-only discipline (boundary B11, extended to
+    this table) — a failed attempt gets a *new* row on retry, never an edit to the
+    old one. This class has no opinion on dedup/idempotency (whether a fresh publish
+    is even needed): that policy lives in ``core.service.publish_anchor``, one layer
+    up, the same "storage has no policy" rule every other repository here follows.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def create(
+        self,
+        *,
+        covers_through_seq: int,
+        entry_hash: str,
+        implementation: str,
+        receipt: dict[str, Any],
+        publish_failed: bool = False,
+        id: str | None = None,  # noqa: A002
+    ) -> AuditAnchor:
+        anchor = AuditAnchor(
+            id=id or new_ulid(),
+            covers_through_seq=covers_through_seq,
+            entry_hash=entry_hash,
+            implementation=implementation,
+            receipt=receipt,
+            publish_failed=publish_failed,
+        )
+        self._session.add(anchor)
+        self._session.flush()
+        return anchor
+
+    def get_latest(
+        self, *, implementation: str, successful_only: bool = True
+    ) -> AuditAnchor | None:
+        stmt: Select[tuple[AuditAnchor]] = select(AuditAnchor).where(
+            AuditAnchor.implementation == implementation
+        )
+        if successful_only:
+            stmt = stmt.where(AuditAnchor.publish_failed.is_(False))
+        stmt = stmt.order_by(AuditAnchor.published_at.desc()).limit(1)
+        return self._session.scalars(stmt).one_or_none()
+
+    def list_all(self, *, implementation: str | None = None) -> list[AuditAnchor]:
+        stmt: Select[tuple[AuditAnchor]] = select(AuditAnchor)
+        if implementation is not None:
+            stmt = stmt.where(AuditAnchor.implementation == implementation)
+        stmt = stmt.order_by(AuditAnchor.published_at.asc())
         return list(self._session.scalars(stmt))
 
 

@@ -53,11 +53,15 @@ from n8n_operator.core.idempotency import (
     resolve_idempotency,
 )
 from n8n_operator.core.models import (
+    AnchorReceipt,
+    AnchorStatusSummary,
+    AnchorVerification,
     ApprovalDecisionContext,
     ApprovalDecisionEntry,
     ApprovalStatus,
     AuditEvent,
     AuditEventPage,
+    ChainAnchor,
     DeliveryOutcome,
     DeliveryReceipt,
     DispatchOutcome,
@@ -125,10 +129,12 @@ from n8n_operator.registry.schema import (
 from n8n_operator.registry.validation import ArgumentError, validate_arguments
 from n8n_operator.storage.models import STATES, RegistrySnapshot
 from n8n_operator.storage.models import Approval as ApprovalRow
+from n8n_operator.storage.models import AuditAnchor as AuditAnchorRow
 from n8n_operator.storage.models import ExecutionResult as ExecutionResultRow
 from n8n_operator.storage.models import Operation as OperationRow
 from n8n_operator.storage.repository import (
     ApprovalRepository,
+    AuditAnchorRepository,
     AuditLogRepository,
     EnvironmentRepository,
     ExecutionResultRepository,
@@ -141,12 +147,17 @@ from n8n_operator.storage.repository import (
     WorkflowDefinitionSnapshotRepository,
     WorkflowEnvironmentOverlayRepository,
 )
-from n8n_operator.storage.session import session_scope
+from n8n_operator.storage.session import (
+    create_engine_for_url,
+    create_session_factory,
+    session_scope,
+)
 
 _logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_RETRY_CHAIN_DEPTH",
+    "AuditAnchorPort",
     "DispatchPort",
     "HealthPort",
     "NotificationSink",
@@ -163,10 +174,12 @@ __all__ = [
     "expire_overdue_operations",
     "export_audit_record",
     "get_active_snapshot",
+    "get_anchor_status",
     "get_approval_decision_context",
     "get_approval_status",
     "get_execution_result",
     "get_instance_health",
+    "get_latest_anchor",
     "get_metrics",
     "get_operation",
     "list_audit_events",
@@ -175,6 +188,7 @@ __all__ = [
     "list_workflows",
     "preflight_workflow",
     "prepare_operation",
+    "publish_anchor",
     "reconcile_operation",
     "record_execution_outcome",
     "reject_operation",
@@ -185,6 +199,7 @@ __all__ = [
     "retry_operation",
     "validate_input",
     "validate_registry",
+    "verify_anchor_against_database",
     "verify_audit_chain",
 ]
 
@@ -273,6 +288,20 @@ class NotificationSink(Protocol):
     responsible for deciding whether *to* attempt."""
 
     def deliver(self, event: NotificationEvent) -> DeliveryOutcome: ...
+
+
+class AuditAnchorPort(Protocol):
+    """What :func:`publish_anchor` needs from an anchor sink (stage 09, ADR-012
+    section 2) — one interface for both implementations, the same "one seam, several
+    implementations" shape :class:`NotificationSink` already establishes. The
+    composition root injects a real local-file or webhook sink (``audit_anchor/``);
+    tests inject a fake. Dedup (whether a fresh publish is even needed) lives in
+    :func:`publish_anchor`, one layer above this port — an implementation's
+    ``publish``/``verify`` is called at most once per attempt, never responsible for
+    deciding whether to attempt."""
+
+    def publish(self, anchor: ChainAnchor) -> AnchorReceipt: ...
+    def verify(self, anchor: ChainAnchor, receipt: AnchorReceipt) -> AnchorVerification: ...
 
 
 # ----------------------------------------------------------------------------------
@@ -3355,6 +3384,175 @@ def verify_audit_chain(
     _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
     entries = AuditLogRepository(session).list_all()
     return verify_chain(entries)
+
+
+def publish_anchor(
+    session: Session,
+    *,
+    sink: AuditAnchorPort,
+    implementation: str,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
+) -> AuditAnchorRow | None:
+    """Publish the current chain tip as a new anchor (stage 09, ADR-012 section 2) —
+    admin-gated, the same as :func:`verify_audit_chain`/:func:`export_audit_record`.
+
+    Idempotent: if the latest *successful* anchor already published for
+    ``implementation`` already covers the current chain tip, this is a no-op — the
+    existing row is returned, ``sink.publish`` is never called a second time for
+    nothing new to anchor (the "repeated anchor" edge case, handled here, above the
+    port, the same shape :func:`_deliver_with_dedup` already establishes for
+    :class:`NotificationSink`).
+
+    Fail-visible, never fail-open (ADR-012's own hard requirement): a ``sink.publish``
+    exception is caught and recorded as a new ``audit_anchors`` row with
+    ``publish_failed=True`` — never silently dropped, never left to propagate and
+    disappear into a caller that doesn't log it.
+
+    An empty chain (no audit entries at all yet) is a well-defined no-op: nothing to
+    anchor, so nothing is published and no row is written; the caller can distinguish
+    this from a real anchor by checking the return value's own ``covers_through_seq``
+    against what it already knew.
+    """
+    _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
+    tip = AuditLogRepository(session).get_last()
+    if tip is None:
+        return None  # nothing to anchor yet; see docstring
+
+    anchor_repo = AuditAnchorRepository(session)
+    latest = anchor_repo.get_latest(implementation=implementation, successful_only=True)
+    if latest is not None and latest.covers_through_seq >= tip.seq:
+        return latest
+
+    anchor = ChainAnchor(
+        covers_through_seq=tip.seq,
+        entry_hash=tip.entry_hash,
+        entry_count=tip.seq,
+        anchored_at=datetime.now(UTC),
+    )
+    try:
+        receipt = sink.publish(anchor)
+    except Exception as exc:
+        _logger.warning(
+            "anchor_publish_failed",
+            extra={
+                "implementation": implementation,
+                "covers_through_seq": tip.seq,
+                "error": str(exc),
+            },
+        )
+        return anchor_repo.create(
+            covers_through_seq=tip.seq,
+            entry_hash=tip.entry_hash,
+            implementation=implementation,
+            receipt={"error": type(exc).__name__},
+            publish_failed=True,
+        )
+    # `anchor.anchored_at` is part of what got signed — it must be stored verbatim
+    # alongside the receipt so a later `verify` reconstructs the *exact* ChainAnchor
+    # that was signed. `audit_anchors.published_at` is a different timestamp (when
+    # this row was inserted, a moment later) and is never close enough to be
+    # byte-identical, so it cannot stand in for this value.
+    stored_receipt = receipt.model_dump(mode="json")
+    stored_receipt["anchored_at"] = anchor.anchored_at.isoformat()
+    return anchor_repo.create(
+        covers_through_seq=tip.seq,
+        entry_hash=tip.entry_hash,
+        implementation=implementation,
+        receipt=stored_receipt,
+        publish_failed=False,
+    )
+
+
+def get_anchor_status(
+    session: Session, *, principal_id: str | None = None, enable_v2: bool = False
+) -> list[AnchorStatusSummary]:
+    """One summary per implementation that has ever published (stage 09) —
+    admin-gated. ``entries_since_last_anchor`` is the caller-visible "is this
+    stale?" signal; a growing number with no fresh anchor means the sweep isn't
+    running, not that anything is wrong with the chain itself."""
+    _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
+    tip = AuditLogRepository(session).get_last()
+    chain_tip_seq = tip.seq if tip is not None else 0
+    anchor_repo = AuditAnchorRepository(session)
+    summaries: list[AnchorStatusSummary] = []
+    for implementation in ("local_file", "https_webhook"):
+        latest_any = anchor_repo.get_latest(implementation=implementation, successful_only=False)
+        if latest_any is None:
+            continue
+        latest_ok = anchor_repo.get_latest(implementation=implementation, successful_only=True)
+        covered = latest_ok.covers_through_seq if latest_ok is not None else None
+        summaries.append(
+            AnchorStatusSummary(
+                implementation=implementation,
+                last_covers_through_seq=covered,
+                last_published_at=latest_any.published_at,
+                last_publish_failed=latest_any.publish_failed,
+                chain_tip_seq=chain_tip_seq,
+                entries_since_last_anchor=chain_tip_seq - (covered or 0),
+            )
+        )
+    return summaries
+
+
+def get_latest_anchor(
+    session: Session,
+    *,
+    implementation: str,
+    principal_id: str | None = None,
+    enable_v2: bool = False,
+) -> AuditAnchorRow | None:
+    """The latest *successful* anchor published for ``implementation`` (stage 09) —
+    admin-gated, the same as :func:`get_anchor_status`. Exists so CLI commands (e.g.
+    ``anchor verify``) never read ``AuditAnchorRepository`` directly and bypass the
+    admin gate every other anchor-related read already enforces."""
+    _require_admin(session, principal_id=principal_id, enable_v2=enable_v2)
+    return AuditAnchorRepository(session).get_latest(implementation=implementation)
+
+
+def verify_anchor_against_database(
+    *, database_url: str, covers_through_seq: int, entry_hash: str, signature: str, public_key: str
+) -> AnchorVerification:
+    """Verify one anchor against a genuinely independent database copy (stage 09) —
+    opens its **own** engine/session against ``database_url``, reads only, and
+    disposes the engine before returning, exactly mirroring
+    ``core.postgres_migration.py``'s own destination-session pattern for "verify
+    without mutating either source." Recomputes the chain from genesis through
+    ``covers_through_seq`` on the copy and confirms the entry at that sequence number
+    has ``entry_hash`` — the signature itself is checked by the caller's own
+    ``AuditAnchorPort.verify`` (this function only re-derives *chain* correctness on
+    the independent copy; signature verification needs the specific implementation's
+    own key material, not something this generic, implementation-agnostic function
+    should assume the shape of).
+    """
+    engine = create_engine_for_url(database_url)
+    try:
+        session_factory = create_session_factory(engine)
+        with session_scope(session_factory) as session:
+            entries = AuditLogRepository(session).list_range(start_seq=1, limit=covers_through_seq)
+    finally:
+        engine.dispose()
+
+    if not entries or entries[-1].seq != covers_through_seq:
+        return AnchorVerification(
+            ok=False,
+            reason=f"database copy has no entry at seq={covers_through_seq}",
+            checked_through_seq=None,
+        )
+    result = verify_chain(entries)
+    if not result.ok:
+        return AnchorVerification(
+            ok=False,
+            reason=f"chain broken on the database copy at seq={result.first_break_seq}",
+            checked_through_seq=None,
+        )
+    if entries[-1].entry_hash != entry_hash:
+        return AnchorVerification(
+            ok=False,
+            reason="entry_hash at covers_through_seq does not match the anchor",
+            checked_through_seq=None,
+        )
+    return AnchorVerification(ok=True, reason=None, checked_through_seq=covers_through_seq)
 
 
 def export_audit_record(

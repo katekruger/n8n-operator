@@ -222,6 +222,7 @@ n8n-operator/
 │   ├── OIDC_SETUP.md               # provider-neutral OIDC setup + reference config (stage 02)
 │   ├── LEAST_PRIVILEGE.md          # worked role/scope profiles for three org shapes (stage 03)
 │   ├── METRICS_AND_ALERTS.md       # get_metrics/list_audit_events/alert-hook guide (stage 08)
+│   ├── AUDIT_ANCHORING.md          # key mgmt, publish/verify, protection scope (stage 09)
 │   └── adr/
 │       ├── ADR-001-portable-mcp-core.md
 │       ├── ADR-002-default-deny-registry.md
@@ -333,6 +334,12 @@ n8n-operator/
 │       │   ├── __init__.py
 │       │   ├── chain.py            # chain construction + verification
 │       │   └── writer.py           # the only writer of audit records
+│       ├── audit_anchor/           # AuditAnchor implementations (ADR-012 section 2; stage 09)
+│       │   ├── __init__.py
+│       │   ├── keys.py             # Ed25519 keygen, 0600 private-key file storage
+│       │   ├── base.py             # local ChainAnchorLike shapes + sign/verify
+│       │   ├── local_file.py       # LocalFileAnchor — signed, append-only, flock-guarded
+│       │   └── webhook.py          # HttpsWebhookAnchor — authenticated HTTPS POST
 │       ├── approval/               # out-of-band human approval
 │       │   ├── __init__.py
 │       │   ├── app.py              # FastAPI app, loopback-bound
@@ -358,7 +365,8 @@ n8n-operator/
 │               ├── identity.py     # orgs, memberships, service principals (stage 02)
 │               ├── environment.py  # environments, overlays (stage 04)
 │               ├── notifications.py  # retry-failed (stage 05), check-alerts (stage 08)
-│               └── metrics.py      # show (stage 08)
+│               ├── metrics.py      # show (stage 08)
+│               └── anchor.py       # init-key, publish, verify, status (stage 09)
 └── tests/
     ├── conftest.py
     ├── fixtures/
@@ -2509,10 +2517,11 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 09 — External audit anchoring
 
-- [ ] `AuditAnchor` interface plus the signed local anchor file and authenticated
+- [x] `AuditAnchor` interface plus the signed local anchor file and authenticated
       HTTPS webhook implementations (ADR-012 section 2)
-- [ ] `audit_anchors` table (section 8.3); fail-visible publication failures recorded,
-      never silently skipped
+- [x] `audit_anchors` table (section 8.3) — already schema-present since stage 01;
+      fail-visible publication failures recorded (`publish_failed`), never silently
+      skipped
 
 #### Stage 10 — GTM starter kits and onboarding
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import typer
 
+from n8n_operator.cli.commands import anchor as anchor_commands
 from n8n_operator.cli.commands import audit as audit_commands
 from n8n_operator.cli.commands import db as db_commands
 from n8n_operator.cli.commands import environment as environment_commands
@@ -71,6 +72,7 @@ app.add_typer(identity_commands.app, name="identity")
 app.add_typer(environment_commands.app, name="environment")
 app.add_typer(notifications_commands.app, name="notifications")
 app.add_typer(metrics_commands.app, name="metrics")
+app.add_typer(anchor_commands.app, name="anchor")
 app.command("health")(health_commands.health)
 
 __all__ = ["app"]
