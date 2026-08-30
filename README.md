@@ -29,6 +29,12 @@ approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.*
 > [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
 > [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
 > do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
+>
+> **v2** (organizations, RBAC, environments, team approvals, governed retry, structural
+> diffs, metrics/audit query, alert hooks, external audit anchoring) is merged and
+> individually tested stage by stage — [docs/V2_TRACEABILITY.md](docs/V2_TRACEABILITY.md)
+> tracks each one. End-to-end v2 integration and proof against the full acceptance
+> criteria is Stage 11's own explicit job, not yet claimed done.
 
 | Client / target | Transport | Evidence |
 |---|---|---|
@@ -103,6 +109,25 @@ thing happened."
 - Let an MCP client approve its own operation — approval is out-of-band, always.
 - Retry anything automatically. Ambiguous outcomes surface as `UNKNOWN` for a human.
 - Edit workflows (v1 and v2). Authoring stays in the n8n UI.
+
+Full list with the "why" behind each one:
+[docs/WHAT_THIS_REFUSES_TO_DO.md](docs/WHAT_THIS_REFUSES_TO_DO.md).
+
+## Starter kits
+
+Seven annotated, sanitized GTM automation patterns — read-only reporting, lead
+enrichment, CRM upsert, lead routing, campaign audience sync, customer communication,
+and data-quality exception reporting — plus real, runnable versions of the three v2
+user journeys in [docs/ARCHITECTURE.md section 11](docs/ARCHITECTURE.md#11-v2-user-journeys).
+No credentials or live n8n instance needed to try them:
+
+```bash
+n8n-operator registry validate --path examples/registry/starter-kits/gtm-starter-kits.yaml
+```
+
+See [docs/GTM_STARTER_KITS.md](docs/GTM_STARTER_KITS.md) for the full tour, and
+[docs/OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md) for the timed, clean-machine path from
+this command to a working local staging environment (measured under two minutes).
 
 ## Quickstart
 
@@ -194,6 +219,13 @@ decision — never the only way to decide an operation.
 | [LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md) | How to run the real-instance compatibility gate. |
 | [V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) | Plain-language index of what v1 deliberately doesn't do. |
 | [RECONCILING_UNKNOWN.md](docs/RECONCILING_UNKNOWN.md) | Step-by-step manual procedure for resolving an `UNKNOWN` operation. |
+| [GTM_STARTER_KITS.md](docs/GTM_STARTER_KITS.md) | Annotated starter-kit registry, real journey walkthroughs, and what to customize before production use. |
+| [OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md) | Clean-machine path from a fresh checkout to a working local staging environment, timed. |
+| [APPROVER_GUIDE.md](docs/APPROVER_GUIDE.md) | What to read before deciding, self-approval and quorum rules, the web approval page. |
+| [LEAST_PRIVILEGE.md](docs/LEAST_PRIVILEGE.md) | Three worked role/scope policy packs — startup, centralized RevOps, Series C multi-approver. |
+| [MCP_CLIENT_RECIPES.md](docs/MCP_CLIENT_RECIPES.md) | The literal tool-call JSON for every step of a client session, using only the 20-tool surface. |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom-to-cause decision tree. |
+| [WHAT_THIS_REFUSES_TO_DO.md](docs/WHAT_THIS_REFUSES_TO_DO.md) | Every deliberate refusal, why, and which threat it closes. |
 | [RELEASE_ROLLBACK.md](docs/RELEASE_ROLLBACK.md) | How to roll back a bad GitHub Release or yank a bad PyPI package. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, the PR gate, and house conventions. |

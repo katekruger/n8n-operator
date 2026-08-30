@@ -84,36 +84,74 @@ grant a role directly to an existing `service`-kind principal by ID. Flagged her
 known gap, not glossed over — track it against whichever stage adds service-principal
 authorization scoping, rather than assuming today's CLI already supports it.
 
-## 3. A Series C marketing/sales operations org: staged for multi-environment
+## 3. A Series C marketing/sales operations org: separate sales ops, marketing ops, security, and legal approvers
 
-A larger, more mature org that genuinely needs staging/production isolation, per-team
-scoping, and an approval quorum — most of which is Stage 04 (`environments`,
-`list_environments`, the `environment` tool argument, `ENVIRONMENT_REQUIRED`) and
-Stage 05 (`request_approval`, real quorum routing) territory, not yet built. What's
-buildable **today**, staged so it composes cleanly once those stages land:
+A larger, mature org that genuinely needs staging/production isolation, per-team
+workflow scoping, and a real approval quorum for its riskiest workflows — all of this
+is buildable today (environments landed in Stage 04, quorum in Stage 05).
 
 ```bash
-# Narrow workflow-scope grants exactly as profile 2, per team.
+n8n-operator identity bootstrap --org-name "Acme Corp" \
+  --admin-issuer https://idp.example.com --admin-subject admin@acme.com
+# -> Organization created: <org-id>
+
+# Real, separate staging and production environments — connection details are always
+# indirected references, never a literal secret or URL (ADR-016 section 2).
+n8n-operator environment create --org <org-id> --name staging \
+  --n8n-base-url-ref env:STAGING_N8N_BASE_URL --n8n-api-key-ref env:STAGING_N8N_API_KEY
+# -> Environment created: <staging-id>
+n8n-operator environment create --org <org-id> --name production \
+  --n8n-base-url-ref env:PROD_N8N_BASE_URL --n8n-api-key-ref env:PROD_N8N_API_KEY --production
+# -> Environment created: <production-id>
+
+# Sales ops: operate on crm.* in both environments, decide on it only in staging —
+# see the caveat below on why this is granted as one broadened membership, not two
+# independently-scoped roles.
 n8n-operator identity add-membership --org <org-id> \
   --issuer https://idp.example.com --subject sales-ops@acme.com \
-  --roles operator,approver --workflow-scope "sales.*"
+  --roles operator,approver --workflow-scope "crm.*" \
+  --environment-scope "<staging-id>,<production-id>"
 
-# environment_scope is left at its default (*) deliberately — narrowing it today
-# would deny every real call (Stage 03's own scoping decision: a v1 tool call has no
-# `environment` argument yet, so a scoped environment_scope can never be satisfied by
-# a real call — see docs/adr/ADR-015-rbac-authorization-evaluation.md and this
-# codebase's own core/authorization.py module docstring). Once Stage 04 ships real
-# environment rows and the `environment` argument, re-grant this membership with
-# `--environment-scope <staging-env-id>` for staging-only operators and a separate,
-# narrower grant for whoever should reach production — never the same grant for both.
+# Marketing ops: the mkt.* equivalent.
+n8n-operator identity add-membership --org <org-id> \
+  --issuer https://idp.example.com --subject mkt-ops@acme.com \
+  --roles operator,approver --workflow-scope "mkt.*" \
+  --environment-scope "<staging-id>,<production-id>"
+
+# Security and legal: approve high-risk, irreversible operations only — never operate
+# them (no `operator` role at all, so they can never be the one preparing what they'll
+# later be asked to approve).
+n8n-operator identity add-membership --org <org-id> \
+  --issuer https://idp.example.com --subject security-lead@acme.com \
+  --roles approver --workflow-scope "*" --environment-scope "<production-id>"
+n8n-operator identity add-membership --org <org-id> \
+  --issuer https://idp.example.com --subject legal-lead@acme.com \
+  --roles approver --workflow-scope "comms.*" --environment-scope "<production-id>"
 ```
 
-The load-bearing point for this profile: **don't pre-narrow `environment_scope` before
-Stage 04 exists to honor it** — a membership narrowed today to specific environment IDs
-that don't exist yet would deny every call, since the evaluator can only satisfy a
-narrowed `environment_scope` against a real `environment` argument no v1 tool carries
-(`core/authorization.py`'s own documented scoping decision). Leave it at `*` and revisit
-once Stage 04 lands `environments`/`list_environments`/the `environment` argument.
+**One `add-membership` call is one membership**: one role set, one `workflow_scope`
+glob, one `environment_scope` list, shared across every role in that call. It cannot
+express "`operator` on `crm.*` in both environments, but `approver` on `crm.*` in
+staging only" as two independently-scoped roles for the same principal — a second
+`add-membership` call for a principal that already has an active membership in the
+organization is refused outright ("remove it first"). In practice this means either
+granting the roles a person needs with one scope broad enough to cover all of them (as
+above — sales-ops's `operator`+`approver` share one `crm.*`/`{staging,production}`
+grant), or splitting genuinely different scopes across distinct principals (as above —
+security and legal are separate approver-only identities, not roles bolted onto an
+existing operator). Track this against ADR-015 if per-role scoping within one
+membership becomes a real requirement; today, design the org's principal list around
+this constraint rather than around the scoping you'd ideally want.
+
+**Quorum**: `crm.bulk_update_stage` in
+[the GTM starter kits](GTM_STARTER_KITS.md#journey-only-bulk-crm-update-two-approver-quorum--crmbulk_update_stage)
+sets `limits.quorum_count: 2` — two of sales-ops's/security's/legal's `approver`
+principals (whichever are eligible for that workflow×environment) must decide before
+the operation executes, and the requester is structurally excluded from their own
+request's eligible list even if they hold `approver` themselves. Walk the full,
+real CLI sequence — `operations approval-status`, `operations request-approval`,
+two `operations approve` calls — in
+[GTM_STARTER_KITS.md's RevOps journey](GTM_STARTER_KITS.md#journey-2--a-revops-team-requiring-two-person-approval-for-a-bulk-crm-update).
 
 ## Previewing a grant before or after making it
 
@@ -126,3 +164,14 @@ Runs every `(role, tool)` pair in ADR-015's matrix through the real evaluator ag
 that principal's real, active memberships — the same decision every real tool call
 makes, read-only, changes nothing. Use it to sanity-check a grant before handing over
 credentials, or to debug "why can't this principal do X" without guessing.
+
+**Caveat for any membership narrowed to specific environments** (profile 3's own
+grants above, for instance): this command has no `--environment-id` flag, so it always
+evaluates as if no environment were named at all. A membership's `environment_scope`
+can only be satisfied by "no environment named" when the scope is exactly the default
+`*` (`core/authorization.py`'s own "Environment-scope today" note) — so previewing a
+`crm.*`/`{staging-id,production-id}`-scoped grant shows **everything denied**, even
+though the grant works correctly for a real MCP tool call carrying an actual
+`environment` argument. This is a limitation of the preview command, not a sign the
+grant is broken; don't "fix" a correctly-narrowed grant by widening
+`environment_scope` to `*` just to make this preview show allowed tools.

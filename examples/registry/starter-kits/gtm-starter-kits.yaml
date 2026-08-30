@@ -1,0 +1,672 @@
+# n8n Operator — GTM starter kits (stage 10)
+#
+# Seven common GTM automation patterns, one workflow entry each, plus one extra entry
+# (`crm.bulk_update_stage`) used only by the RevOps quorum journey. Every entry here is
+# fully sanitized: `n8n_workflow_id`/`definition_hash` are fake-shaped placeholders,
+# `secret_ref` is always an indirect `env:`/`keyring:` reference (rule R6), and
+# `trigger.path` is a path only, never an instance URL (rule R8) — this file is designed
+# to be committed and contains nothing that would need to be scrubbed before publishing.
+#
+# Read alongside: docs/GTM_STARTER_KITS.md (what each entry means and how to try it),
+# docs/WORKFLOW_REGISTRY.md (the authoring reference), docs/LEAST_PRIVILEGE.md (who
+# should be granted which role against which of these), examples/environments/ (the
+# staging/production overlay pattern referenced throughout).
+#
+# Validate before loading:
+#     n8n-operator registry validate --path examples/registry/starter-kits/gtm-starter-kits.yaml
+#
+# Before this is more than a demo, every entry needs: a real `n8n_workflow_id` (copy
+# from your n8n instance's own workflow URL), a real `definition_hash` (run
+# `n8n-operator registry hash --n8n-workflow-id <id> --workflow-id <registry-id>` once
+# connected to a real environment), a real `secret_ref` target (set the named
+# environment variable, or a keyring entry), and a `trigger.path` matching your
+# instance's actual webhook path.
+
+apiVersion: n8n-operator/v1
+
+metadata:
+  name: gtm-starter-kits
+  description: >
+    Seven annotated GTM automation patterns plus a two-approver bulk-update example,
+    covering every side-effect class and the three worked journeys in
+    ARCHITECTURE.md section 11.
+
+defaults:
+  approval: required
+  timeout_seconds: 60
+  approval_ttl_seconds: 900
+  execution_ttl_seconds: 300
+
+workflows:
+  # ===========================================================================
+  # 1. Read-only pipeline and campaign reporting
+  # ===========================================================================
+  # Side effects: read_only — reads pipeline/campaign figures, writes nothing anywhere.
+  # Approval: none — the only side-effect class permitted to skip human approval (R5).
+  # Recommended role: `viewer` is sufficient for anyone who only needs to run this;
+  #   grant `operator` only if the same person also runs write-side workflows.
+  # Environment differences: safe to run identically in every environment — there is
+  #   nothing to differentiate a report's own risk between staging and production.
+  # Idempotency key: unnecessary — read-only calls have no side effect to deduplicate,
+  #   so a caller can safely omit `idempotency_key` entirely.
+  # Correlation: `trigger.correlation: none` (the default) — a read has nothing to
+  #   correlate against; an indeterminate dispatch here just means "ask again."
+  # Redaction: none configured — this workflow returns aggregate figures only, no PII.
+  # Argument limits: tightened well below the server ceiling (two dates and an enum
+  #   is nowhere near 256KiB) — a request this small that hits the limit is malformed,
+  #   not legitimately large (R11).
+  # Rollback/reconciliation: not applicable — nothing was written.
+  # To customize: point `n8n_workflow_id`/`trigger.path` at your own reporting
+  #   workflow; add or remove `properties` to match its actual input contract.
+  - id: reports.pipeline_summary
+    n8n_workflow_id: "7Qx4kLmN2pRstUvW"
+    title: Summarize the current sales pipeline
+    description: >
+      Returns aggregate pipeline figures by stage for a date range. Reads only; writes
+      nothing anywhere. Use for reporting questions about deal volume or stage mix.
+    owner: revops
+    version: 1
+    definition_hash: "sha256:3f2c8a91d4e57b60c1a8f3927d5e6b40a29f18c7d3b5e0a4f6c9d2e8b7a10f53"
+    risk: low
+    side_effects: read_only
+    approval: none
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/pipeline-summary
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_REPORTS
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [start_date, end_date]
+      properties:
+        start_date:
+          type: string
+          format: date
+          description: Inclusive start of the reporting window, YYYY-MM-DD.
+        end_date:
+          type: string
+          format: date
+          description: Inclusive end of the reporting window, YYYY-MM-DD.
+        stage:
+          type: string
+          enum: [prospecting, qualified, proposal, closed_won, closed_lost]
+          description: Optional. Restrict the summary to a single pipeline stage.
+    output:
+      max_bytes: 32768
+      include_node_trace: true
+    limits:
+      timeout_seconds: 45
+      max_concurrent: 2
+      max_argument_bytes: 4096
+    tags: [reports, sales, starter-kit]
+
+  # ===========================================================================
+  # 2. Lead / account enrichment
+  # ===========================================================================
+  # Side effects: read_only — writes to an internal enrichment cache the workflow
+  #   itself owns, never to the CRM record directly (the upsert into the CRM is a
+  #   *separate*, external_write workflow — see crm.sync_contact below — so a failed
+  #   or partial enrichment run never leaves the CRM itself in a half-written state).
+  # Approval: none.
+  # Recommended role: `operator` for whoever triggers enrichment runs; `viewer` for
+  #   anyone just checking results.
+  # Environment differences: enrichment providers are often rate-limited per API key —
+  #   consider a staging-only `limits_override.rate_limit_per_minute` overlay if your
+  #   staging provider account has a lower quota than production (see
+  #   examples/environments/staging.yaml for the overlay shape).
+  # Idempotency key: recommend the batch ID a caller is enriching (e.g.
+  #   `idempotency_key=batch-2026-08-30-1`) — re-running the same batch replays the
+  #   original result rather than re-spending enrichment-provider API quota.
+  # Correlation: none — enrichment results are read back from the response body
+  #   directly, not reconciled against a downstream execution ID.
+  # Redaction: enrichment can return real PII (emails, phone numbers, company
+  #   revenue) about the *enriched* records — redact anything the calling client
+  #   doesn't need to see in full.
+  # Argument limits: a batch of lead IDs can legitimately be large; the limit here is
+  #   set higher than the reporting example, but still well below the server ceiling.
+  # Rollback/reconciliation: an enrichment provider's own credential binding can go
+  #   stale (expired API key) — this surfaces as a preflight `credential_bindings`
+  #   failure or a dispatch error, never a partial write to reconcile (see
+  #   docs/RECONCILING_UNKNOWN.md if a dispatch to this workflow specifically returns
+  #   `UNKNOWN` rather than a clean failure).
+  # To customize: point at your real enrichment provider's n8n workflow; the
+  #   `lead_ids` argument shape below assumes a batch call — adjust to your provider's
+  #   own batching limits.
+  - id: mkt.enrich_leads
+    n8n_workflow_id: "En1r1chL34dsAbCd"
+    title: Enrich a batch of inbound leads
+    description: >
+      Looks up firmographic and contact data for a batch of lead IDs against an
+      enrichment provider and writes results to an internal cache. Does not touch the
+      CRM record directly — pair with crm.sync_contact to apply results.
+    owner: marketing-ops
+    version: 1
+    definition_hash: "sha256:8a5e2f13c94b76d0a1f8e3c5b90d47a2e6f1c8b3d5a90e4f7c2b8d1a6e30f957"
+    risk: low
+    side_effects: read_only
+    approval: none
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/enrich-leads
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_ENRICHMENT
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [lead_ids]
+      properties:
+        lead_ids:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 64
+          description: Batch of internal lead IDs to enrich, up to 200 per call.
+    output:
+      redact:
+        - "$..email"
+        - "$..phone"
+        - "$..api_key"
+      max_bytes: 65536
+      include_node_trace: false
+    limits:
+      timeout_seconds: 60
+      rate_limit_per_minute: 10
+      max_argument_bytes: 16384
+    tags: [enrichment, marketing, starter-kit]
+
+  # ===========================================================================
+  # 3. CRM contact/account upsert
+  # ===========================================================================
+  # Side effects: external_write — creates or updates a CRM record. Recoverable (a bad
+  #   sync can be corrected with a follow-up sync), but not read-only, so approval is
+  #   mandatory (R5).
+  # Approval: required.
+  # Recommended role: `operator` to prepare/execute, `approver` (a distinct person —
+  #   ADR-015's self-decision rule enforces this at call time, not just convention)
+  #   to approve.
+  # Environment differences: this is the exact workflow ARCHITECTURE.md section 11.1's
+  #   startup-GTM journey and examples/environments/staging.yaml's own worked overlay
+  #   both use — staging tightens `rate_limit_per_minute` to 5 (the base registry sets
+  #   none at all), production keeps the base registry's own approval requirement.
+  #   Try the real overlay: `n8n-operator environment validate-overlay <env-id> --path
+  #   examples/environments/staging.yaml`.
+  # Idempotency key: strongly recommended — pass the contact's own email or CRM ID as
+  #   `idempotency_key` so a retried `prepare_operation` call (a flaky client, a
+  #   double-submit) replays the original decision instead of creating a duplicate
+  #   approval request for the same upsert.
+  # Correlation: `response_envelope` — an upsert should always be confirmable by
+  #   execution ID (ADR-009); a dispatch here that returns `UNKNOWN` can be reconciled
+  #   exactly (docs/RECONCILING_UNKNOWN.md), not just reasoned about from timing.
+  # Redaction: contact email/phone are PII — redacted in every result by default; a
+  #   catch-all `$..api_key` guards against a future node accidentally echoing a
+  #   provider credential back in its output.
+  # Argument limits: bounded well below the server ceiling — a legitimate contact
+  #   record and a short note is nowhere near 16KiB.
+  # Rollback/reconciliation: a wrong upsert is fixed by a follow-up call with corrected
+  #   values (it's an upsert, not an append) — no separate rollback mechanism needed.
+  # To customize: point at your real CRM-sync n8n workflow; the `tier` enum and
+  #   `notes` field are illustrative — adjust `properties` to your CRM's actual schema.
+  - id: crm.sync_contact
+    n8n_workflow_id: "AbC123dEfG456hIj"
+    title: Sync a contact into the CRM
+    description: >
+      Upserts one contact by email address: creates the record if absent, updates it
+      if present. Does not send any message to the contact.
+    owner: revops
+    version: 3
+    definition_hash: "sha256:9d4b7e1c05a3f826b0d47e93c1a5f80b2e6d19c4a7f30b58e2c9d1a6b430f7e8"
+    risk: medium
+    side_effects: external_write
+    approval: required
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/crm-sync-contact
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_CRM
+      correlation: response_envelope
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [email, tier]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Contact's primary email. Used as the upsert key.
+        tier:
+          type: string
+          enum: [free, pro, enterprise]
+          description: Subscription tier to set on the contact record.
+        notes:
+          type: string
+          maxLength: 2000
+          description: Optional free-text note appended to the contact record.
+    output:
+      redact:
+        - "$.contact.email"
+        - "$.contact.phone"
+        - "$..api_key"
+      max_bytes: 16384
+      include_node_trace: false
+    limits:
+      timeout_seconds: 30
+      approval_ttl_seconds: 900
+      execution_ttl_seconds: 180
+      max_concurrent: 1
+      rate_limit_per_minute: 10
+      max_argument_bytes: 16384
+    tags: [crm, contacts, starter-kit]
+
+  # ===========================================================================
+  # 4. Lead routing / ownership update
+  # ===========================================================================
+  # Side effects: external_write — reassigns a lead's owner in the CRM. Recoverable
+  #   (ownership can be reassigned again), but a wrong assignment can mean a rep works
+  #   a lead that was never theirs, or a lead sits unworked — approval stays required.
+  # Approval: required.
+  # Recommended role: `operator` scoped to `crm.*` (matching docs/LEAST_PRIVILEGE.md's
+  #   profile 2 naming convention) to prepare; a sales-ops lead as `approver`.
+  # Environment differences: routing rules (territory maps, round-robin state) often
+  #   differ meaningfully between staging and production — never assume a staging
+  #   routing test reflects real production assignment; treat this workflow's
+  #   production approval as a genuine review, not a formality.
+  # Idempotency key: recommended — pass the lead ID, so a retried call re-confirms the
+  #   same assignment rather than potentially reassigning to a different rep on a
+  #   round-robin rotation that advanced between the original attempt and the retry.
+  # Correlation: `response_envelope` — "was the lead actually reassigned" must be
+  #   answerable exactly, the same reasoning as the CRM upsert above.
+  # Redaction: the new owner's own contact details are redacted from the result — the
+  #   caller needs confirmation of *which* owner was assigned, not that owner's own
+  #   private contact info.
+  # Argument limits: small — a lead ID and an owner ID, nothing more.
+  # Rollback/reconciliation: reassign again to correct a wrong routing decision; if a
+  #   dispatch returns `UNKNOWN`, reconcile before reassigning again to avoid a lead
+  #   bouncing between two reps (docs/RECONCILING_UNKNOWN.md).
+  # To customize: point at your real routing/assignment n8n workflow; `owner_id`'s
+  #   shape (an opaque rep identifier) should match your CRM's own ID scheme.
+  - id: crm.assign_lead_owner
+    n8n_workflow_id: "R0ut3L34dOwnErAb"
+    title: Reassign a lead's owner
+    description: >
+      Updates the owning sales rep on one lead record. Does not notify the lead or the
+      new owner — pairing with a notification workflow is a separate concern.
+    owner: sales-ops
+    version: 1
+    definition_hash: "sha256:2c6f9a04d8b71e35a0c4f9d2b8a5e63f1c7a4d9b2e5f80c3a6d1b9e4f728c05a"
+    risk: medium
+    side_effects: external_write
+    approval: required
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/assign-lead-owner
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_CRM
+      correlation: response_envelope
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [lead_id, owner_id]
+      properties:
+        lead_id:
+          type: string
+          maxLength: 64
+          description: Internal CRM lead ID to reassign.
+        owner_id:
+          type: string
+          maxLength: 64
+          description: Internal CRM ID of the new owning rep.
+        reason:
+          type: string
+          maxLength: 500
+          description: Optional short reason recorded alongside the reassignment.
+    output:
+      redact:
+        - "$..owner.email"
+        - "$..owner.phone"
+      max_bytes: 8192
+      include_node_trace: false
+    limits:
+      timeout_seconds: 20
+      approval_ttl_seconds: 900
+      execution_ttl_seconds: 120
+      max_concurrent: 2
+      rate_limit_per_minute: 20
+      max_argument_bytes: 4096
+    tags: [crm, routing, starter-kit]
+
+  # ===========================================================================
+  # 5. Campaign audience sync
+  # ===========================================================================
+  # Side effects: external_write — pushes an audience/segment definition to a
+  #   marketing platform. Recoverable (the audience can be re-synced), but affects
+  #   who receives live campaign sends downstream, so approval stays required.
+  # Approval: required.
+  # Recommended role: `operator` scoped to `mkt.*` to prepare; a marketing-ops lead
+  #   as `approver` — exactly the role split ARCHITECTURE.md section 11.1's own
+  #   worked journey uses for `mkt.*` workflows.
+  # Environment differences: this is the workflow named (but never built as a real
+  #   registry entry until this stage) in ARCHITECTURE.md sections 11.1 and 11.3 — a
+  #   `staging` audience sync should point at a non-production marketing-platform
+  #   account; never let a staging test push to a list that feeds real sends.
+  # Idempotency key: recommended — pass the campaign/segment ID, so a retried sync
+  #   converges on the same audience definition rather than appending duplicate members
+  #   on a platform that treats each sync as additive.
+  # Correlation: `response_envelope` — confirms the sync actually reached the
+  #   platform, not just that Operator's own dispatch succeeded.
+  # Redaction: audience membership can include real email addresses — redact the
+  #   member list itself from the result; a caller reviewing this only needs the
+  #   audience size and sync status, not every member's address.
+  # Argument limits: bounded — a segment ID and filter criteria, not the member list
+  #   itself (the workflow resolves membership server-side, not from the call).
+  # Rollback/reconciliation: re-sync to correct a bad audience definition; an
+  #   indeterminate sync should be reconciled before the next scheduled campaign send
+  #   reads the (possibly stale) audience (docs/RECONCILING_UNKNOWN.md).
+  # To customize: point at your real marketing-platform sync workflow; the
+  #   `filter_criteria` shape is illustrative — match it to your own segmentation
+  #   fields.
+  - id: mkt.campaign_sync
+    n8n_workflow_id: "AudS7ncCmp41gnAb"
+    title: Sync a campaign audience segment
+    description: >
+      Pushes an audience/segment definition to the marketing platform for one
+      campaign. Resolves membership server-side from the given filter criteria — the
+      member list itself never appears in the call.
+    owner: marketing-ops
+    version: 1
+    definition_hash: "sha256:6b3d8f21a95c04e7b1d9a3f6c8e05b42a7d1f9c3e6b80a5d2f4c9e7b103a6f8d"
+    risk: medium
+    side_effects: external_write
+    approval: required
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/campaign-audience-sync
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_MARKETING
+      correlation: response_envelope
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [campaign_id, filter_criteria]
+      properties:
+        campaign_id:
+          type: string
+          maxLength: 64
+          description: Internal campaign ID whose audience is being synced.
+        filter_criteria:
+          type: object
+          additionalProperties: false
+          description: Segment filter (e.g. tier, region, lifecycle stage).
+          properties:
+            tier:
+              type: string
+              enum: [free, pro, enterprise]
+            region:
+              type: string
+              maxLength: 64
+    output:
+      redact:
+        - "$..members"
+        - "$..email"
+      max_bytes: 16384
+      include_node_trace: false
+    limits:
+      timeout_seconds: 45
+      approval_ttl_seconds: 900
+      execution_ttl_seconds: 300
+      max_concurrent: 1
+      rate_limit_per_minute: 5
+      max_argument_bytes: 8192
+    tags: [marketing, campaigns, starter-kit]
+
+  # ===========================================================================
+  # 6. Customer communication requiring approval
+  # ===========================================================================
+  # Side effects: irreversible — an email that has been sent cannot be recalled.
+  #   Highest risk class; approval is forced regardless of registry configuration
+  #   (R10: `risk: high` requires `approval: required`).
+  # Approval: required (and cannot be otherwise — see above).
+  # Recommended role: `operator` to prepare (and to show the caller the exact body for
+  #   confirmation before preparing — see the description field below), a distinct
+  #   `approver` who reads the full decision context (recipient, subject, body) before
+  #   deciding.
+  # Environment differences: never point a staging environment's `secret_ref` at a
+  #   real transactional-email provider account — use a sandboxed/test provider
+  #   account for staging so a mistaken staging send cannot reach a real customer.
+  # Idempotency key: strongly recommended — pass a caller-generated message ID, so a
+  #   retried `prepare_operation` call never results in the same email being prepared
+  #   (and potentially approved and sent) twice.
+  # Correlation: `response_envelope` — "did it actually send" must be answerable
+  #   exactly; this is the canonical case ADR-009 names for why correlation matters.
+  # Redaction: the recipient address and the provider's own message ID are redacted
+  #   from the result — an approver needs to review `to`/`subject`/`body` at decision
+  #   time (via the decision context, not the redacted result), but nothing about the
+  #   send needs to remain visible in the execution result afterward.
+  # Argument limits: bounded — one recipient, a short subject, a capped body length;
+  #   no CC/BCC field exists at all (an intentional omission, not an oversight).
+  # Rollback/reconciliation: none — this is exactly what "irreversible" means. An
+  #   `UNKNOWN` dispatch here needs the most conservative reconciliation treatment
+  #   (docs/RECONCILING_UNKNOWN.md's own "when undeterminable, treat as occurred"
+  #   default applies with the least room for error of any workflow in this file).
+  # To customize: point at your real transactional-email n8n workflow; never widen
+  #   this to accept a template or multiple recipients without re-reviewing the
+  #   approval/redaction posture — that would meaningfully change the blast radius of
+  #   a single bad approval.
+  - id: comms.send_customer_email
+    n8n_workflow_id: "Kp9RtY2mNqXvB4Lc"
+    title: Send an email to a customer
+    description: >
+      Sends a single email to one customer address through the transactional
+      provider. The email leaves immediately and cannot be recalled. Use only when
+      the user has explicitly asked to send a message and has seen the exact body.
+    owner: support
+    version: 2
+    definition_hash: "sha256:7b1e4d0a95c3f28e6d4a17b09c5e83f2a6d19b47c0e5a3f81d6c297b4e0a538f"
+    risk: high
+    side_effects: irreversible
+    approval: required
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/send-customer-email
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_COMMS
+      correlation: response_envelope
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [to, subject, body]
+      properties:
+        to:
+          type: string
+          format: email
+          maxLength: 254
+          description: Single recipient address. Exactly one; no CC or BCC.
+        subject:
+          type: string
+          maxLength: 200
+          description: Subject line, as it will appear. No templating is applied.
+        body:
+          type: string
+          maxLength: 10000
+          description: >
+            Plain-text body, sent verbatim. Show this to the user for confirmation
+            before preparing the operation.
+    output:
+      redact:
+        - "$.to"
+        - "$..message_id"
+      max_bytes: 4096
+      include_node_trace: false
+    limits:
+      timeout_seconds: 20
+      approval_ttl_seconds: 600
+      execution_ttl_seconds: 120
+      max_concurrent: 1
+      rate_limit_per_minute: 5
+      max_argument_bytes: 16384
+    tags: [comms, customer-facing, starter-kit]
+
+  # ===========================================================================
+  # 7. Data-quality check and exception report
+  # ===========================================================================
+  # Side effects: read_only — scans records for a data-quality rule violation and
+  #   reports exceptions; fixes nothing itself (a fix is a separate, explicit
+  #   external_write call the report's reader decides to make).
+  # Approval: none.
+  # Recommended role: `viewer` for anyone consuming the report; `operator` for
+  #   whoever schedules/triggers the scan.
+  # Environment differences: run identically everywhere — a data-quality scan of
+  #   staging data has no production side effect to worry about.
+  # Idempotency key: unnecessary, for the same reason as the reporting example above.
+  # Correlation: none — a read has nothing to correlate against.
+  # Redaction: exception rows can include real customer/lead PII (whatever field
+  #   failed validation, e.g. a malformed email) — redact the offending field values
+  #   themselves, keep the record ID and rule name visible so the report is still
+  #   actionable.
+  # Argument limits: bounded — a rule name and an optional date range.
+  # Rollback/reconciliation: not applicable — nothing was written. If the report
+  #   itself is later found wrong (a bad rule definition), that's an n8n-side workflow
+  #   fix, not something Operator's own governance layer reconciles.
+  # To customize: point at your real data-quality-scan n8n workflow; the `rule` enum
+  #   should list your organization's actual configured validation rules.
+  - id: dq.flag_pipeline_exceptions
+    n8n_workflow_id: "DqExc3pt10nRpAbC"
+    title: Flag pipeline data-quality exceptions
+    description: >
+      Scans CRM pipeline records against a named validation rule and returns the
+      records that fail it. Read-only; fixing a flagged record is a separate,
+      explicit call the report's reader decides to make.
+    owner: revops
+    version: 1
+    definition_hash: "sha256:4f7a1e83d06c92b5a3f7e1d8c4b906a2e5f8c1d7b3a604e9f2c5b8d1a706e39c"
+    risk: low
+    side_effects: read_only
+    approval: none
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/flag-pipeline-exceptions
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_REPORTS
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [rule]
+      properties:
+        rule:
+          type: string
+          enum: [missing_close_date, duplicate_email, stale_stage, invalid_amount]
+          description: Which data-quality rule to check pipeline records against.
+        since:
+          type: string
+          format: date
+          description: Optional. Only check records touched on or after this date.
+    output:
+      redact:
+        - "$..email"
+        - "$..phone"
+      max_bytes: 65536
+      include_node_trace: false
+    limits:
+      timeout_seconds: 60
+      max_concurrent: 2
+      max_argument_bytes: 4096
+    tags: [data-quality, reports, starter-kit]
+
+  # ===========================================================================
+  # 8. (Journey-only) Bulk CRM stage update — two-approver quorum
+  # ===========================================================================
+  # Not one of the seven named starter-kit categories on its own — this entry exists
+  # to make the RevOps two-person-approval journey (ARCHITECTURE.md section 11.2)
+  # runnable against this same file, reusing the crm.sync_contact upsert pattern
+  # above but at higher risk (a *bulk* write, not a single record) and with a real
+  # quorum requirement.
+  #
+  # Side effects: external_write, high risk — a bulk write touches many records at
+  #   once; a mistake has a much larger blast radius than the single-record upsert
+  #   above, even though it's still technically recoverable (each record can be
+  #   corrected). `limits.quorum_count: 2` requires two *distinct* approvers, never
+  #   the same person twice and never the requester (ADR-015's structural exclusion —
+  #   ARCHITECTURE.md section 11.2's own worked scenario).
+  # Approval: required, quorum 2.
+  # Recommended role: `operator` to prepare; at least three people holding `approver`
+  #   scoped to `crm.*` in production, so quorum is reachable even if one approver is
+  #   unavailable (a quorum of 2 with only 2 eligible approvers means a single
+  #   out-of-office person blocks everything).
+  # Environment differences: this is a production-only concern in practice — a
+  #   staging equivalent would typically use `quorum_count: 1` (see
+  #   docs/LEAST_PRIVILEGE.md's RevOps profile), since staging mistakes are cheap and
+  #   two-person review is a production-specific safeguard for a *bulk* write.
+  # Idempotency key: strongly recommended — pass the batch/segment ID being updated,
+  #   so a retried prepare call never spins up a second, redundant quorum request for
+  #   the same bulk change.
+  # Correlation: `response_envelope` — a bulk update absolutely needs exact
+  #   confirmation of what happened.
+  # Redaction: none configured here (bulk-update results are aggregate counts, not
+  #   individual record content) — add redaction if your own bulk-update workflow
+  #   echoes back individual record data.
+  # Argument limits: kept small — a stage name and a segment filter, not the record
+  #   list itself (the workflow resolves the affected records server-side).
+  # Rollback/reconciliation: correct with a follow-up bulk update; an `UNKNOWN` bulk
+  #   dispatch is the highest-stakes reconciliation case in this file — treat it with
+  #   the same conservative default as the customer-email workflow above.
+  - id: crm.bulk_update_stage
+    n8n_workflow_id: "Bulk5t4g3Upd4t3Ab"
+    title: Bulk-update deal stage
+    description: >
+      Updates the pipeline stage on every deal matching a segment filter. A
+      production-scale write — requires two distinct approvals (quorum 2).
+    owner: revops
+    version: 1
+    definition_hash: "sha256:5e9c2a06f83b17d4a6c9f2e5b80a3d67f1c4a9e2b5d80f3a7c1e4b96d203f85a"
+    risk: high
+    side_effects: external_write
+    approval: required
+    trigger:
+      type: webhook
+      method: POST
+      path: /webhook/bulk-update-stage
+      auth: header
+      secret_ref: env:N8N_WEBHOOK_TOKEN_CRM
+      correlation: response_envelope
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [segment_filter, new_stage]
+      properties:
+        segment_filter:
+          type: object
+          additionalProperties: false
+          description: Which deals this update applies to.
+          properties:
+            current_stage:
+              type: string
+              maxLength: 64
+            region:
+              type: string
+              maxLength: 64
+        new_stage:
+          type: string
+          maxLength: 64
+          description: The pipeline stage to move matching deals into.
+    output:
+      max_bytes: 8192
+      include_node_trace: false
+    limits:
+      timeout_seconds: 60
+      approval_ttl_seconds: 1800
+      execution_ttl_seconds: 300
+      max_concurrent: 1
+      rate_limit_per_minute: 2
+      max_argument_bytes: 4096
+      quorum_count: 2
+    tags: [crm, bulk, starter-kit, journey-revops]
