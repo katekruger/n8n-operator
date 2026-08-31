@@ -244,26 +244,29 @@ n8n-operator/
 │   │   │   └── 2026-08-30-stage-11-v2-integration-release-and-proof.md
 │   │   └── specs/
 │   │       └── 2026-08-30-stage-11-v2-integration-release-and-proof-design.md
-│   └── adr/
-│       ├── ADR-001-portable-mcp-core.md
-│       ├── ADR-002-default-deny-registry.md
-│       ├── ADR-003-operation-handles.md
-│       ├── ADR-004-sqlite-to-postgres.md
-│       ├── ADR-005-no-automatic-retry-v1.md
-│       ├── ADR-006-server-owned-n8n-credentials.md
-│       ├── ADR-007-deterministic-before-llm.md
-│       ├── ADR-008-conservative-definition-canonicalization.md
-│       ├── ADR-009-dispatch-correlation.md
-│       ├── ADR-010-approval-delivery-and-expiry.md
-│       ├── ADR-011-argument-limits-and-idempotency.md
-│       ├── ADR-012-governed-retry-and-audit-anchoring.md
-│       ├── ADR-013-organization-tenant-and-principal-model.md
-│       ├── ADR-014-oidc-trust-and-session-model.md
-│       ├── ADR-015-rbac-authorization-evaluation.md
-│       ├── ADR-016-environment-registry-overlays.md
-│       ├── ADR-017-team-approval-quorum-semantics.md
-│       ├── ADR-018-notification-and-alert-hook-delivery.md
-│       └── ADR-019-metrics-cardinality-and-privacy.md
+│   ├── adr/
+│   │   ├── ADR-001-portable-mcp-core.md
+│   │   ├── ADR-002-default-deny-registry.md
+│   │   ├── ADR-003-operation-handles.md
+│   │   ├── ADR-004-sqlite-to-postgres.md
+│   │   ├── ADR-005-no-automatic-retry-v1.md
+│   │   ├── ADR-006-server-owned-n8n-credentials.md
+│   │   ├── ADR-007-deterministic-before-llm.md
+│   │   ├── ADR-008-conservative-definition-canonicalization.md
+│   │   ├── ADR-009-dispatch-correlation.md
+│   │   ├── ADR-010-approval-delivery-and-expiry.md
+│   │   ├── ADR-011-argument-limits-and-idempotency.md
+│   │   ├── ADR-012-governed-retry-and-audit-anchoring.md
+│   │   ├── ADR-013-organization-tenant-and-principal-model.md
+│   │   ├── ADR-014-oidc-trust-and-session-model.md
+│   │   ├── ADR-015-rbac-authorization-evaluation.md
+│   │   ├── ADR-016-environment-registry-overlays.md
+│   │   ├── ADR-017-team-approval-quorum-semantics.md
+│   │   ├── ADR-018-notification-and-alert-hook-delivery.md
+│   │   └── ADR-019-metrics-cardinality-and-privacy.md
+│   └── decisions/                          # MADR 4.0.0 ADRs — a second, newer
+│       ├── 0001-token-link-approval-not-an-authenticated-web-session.md
+│       └── 0002-external-anchoring-guarantee-is-manual-and-narrow.md
 ├── examples/
 │   ├── registry/
 │   │   ├── workflows.example.yaml         # annotated sample registry
