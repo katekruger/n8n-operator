@@ -263,10 +263,9 @@ n8n-operator/
 │   │   ├── ADR-016-environment-registry-overlays.md
 │   │   ├── ADR-017-team-approval-quorum-semantics.md
 │   │   ├── ADR-018-notification-and-alert-hook-delivery.md
-│   │   └── ADR-019-metrics-cardinality-and-privacy.md
-│   └── decisions/                          # MADR 4.0.0 ADRs — a second, newer
-│       ├── 0001-token-link-approval-not-an-authenticated-web-session.md
-│       └── 0002-external-anchoring-guarantee-is-manual-and-narrow.md
+│   │   ├── ADR-019-metrics-cardinality-and-privacy.md
+│   │   ├── ADR-020-token-link-approval-not-an-authenticated-web-session.md
+│   │   └── ADR-021-external-anchoring-guarantee-is-manual-and-narrow.md
 ├── examples/
 │   ├── registry/
 │   │   ├── workflows.example.yaml         # annotated sample registry
@@ -1149,7 +1148,7 @@ The invariants worth generating inputs for:
 - The argument-size check is enforced in `core/`, not in an adapter (B12).
 - The canonicalization exclusion allowlist is an explicit enumerated table; no wildcard or
   regex entry exists (CAN-03).
-- Every ADR from ADR-001 to ADR-019 exists, carries a Status and a Decision, and is
+- Every ADR from ADR-001 to ADR-021 exists, carries a Status and a Decision, and is
   referenced by at least one normative document.
 - `scripts/check_docs_consistency.py` passes: state names, transition IDs, tool
   inventory, canonicalization rules, the error taxonomy, ADR wiring, and the repository

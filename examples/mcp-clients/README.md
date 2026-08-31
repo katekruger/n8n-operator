@@ -9,14 +9,30 @@ Two files here, matching Operator's two transports (BUILD_PLAN section 7.2):
 | [`openai_responses_tool.json`](openai_responses_tool.json) | Streamable HTTP | The MCP tool object for an OpenAI Responses API request. |
 
 Both were verified against a real build of this package — a full stdio session and a
-full Streamable HTTP session, each confirming the documented 12-tool/2-resource
-surface and live tool calls, not just that the process starts. Both sessions used the
-reference `mcp` Python client, not Claude Desktop's own GUI application, which has not
-been separately launched. The stdio session is no longer a one-time check: it's
-automated in [`scripts/mcp_session_smoke.py`](../../scripts/mcp_session_smoke.py) and
-runs inside `scripts/release_smoke.sh` on every CI push. The Streamable HTTP session
-remains the one-time result from phase 9 release testing. See
-`docs/BUILD_PLAN.md`'s phase 9 checklist entry for what was run.
+full Streamable HTTP session, each confirming live tool calls, not just that the
+process starts. Both sessions used the reference `mcp` Python client, not Claude
+Desktop's own GUI application, which has not been separately launched.
+
+**Tool count, precisely**: the two automated sessions below deliberately run in
+v1-compatibility mode and confirm the 12-tool/2-resource surface — that's what a
+client connecting without `N8N_OPERATOR_ENABLE_V2` set actually sees, and it's the
+surface worth verifying on every push. The full v2 surface is 20 tools (12 v1 + 8
+v2 additions: `diff_workflow_definition`, `get_metrics`, `list_audit_events`,
+`whoami`, `list_environments`, `request_approval`, `get_approval_status`,
+`retry_operation`), continuously verified by `tests/contract/test_mcp_tool_inventory.py`
+(server-object level, not a wire session) and, as of this file's own last edit,
+re-confirmed by a real, manually-run stdio session with `N8N_OPERATOR_ENABLE_V2=true`:
+20 tools, 1 resource (`registry://workflows`) plus 1 resource template
+(`audit://operations/{operation_id}`) — the same 2-resource surface either mode
+reports. No wire-level Streamable HTTP session has been run against the full v2
+surface; `test_mcp_http_openai_compat.py` (below) also runs in v1-compatibility mode
+today.
+
+The stdio v1-compat session is no longer a one-time check: it's automated in
+[`scripts/mcp_session_smoke.py`](../../scripts/mcp_session_smoke.py) and runs inside
+`scripts/release_smoke.sh` on every CI push. The Streamable HTTP session remains the
+one-time result from phase 9 release testing. See `docs/BUILD_PLAN.md`'s phase 9
+checklist entry for what was run.
 
 ## stdio (Claude Desktop)
 
@@ -97,8 +113,11 @@ every CI pytest pass: `tests/integration/test_mcp_http_openai_compat.py` drives 
 real `build_server`/`serve_http` middleware stack in-process, configured non-loopback
 so the actual bearer-token and Origin-allowlist enforcement (boundary B9) runs exactly
 as a real remote deployment would hit it — a full MCP session using the documented
-`Authorization`+`Origin` header shape (init, the identical 12-tool/2-resource surface,
-a safe tool call, session continuation), plus the missing-bearer, missing-origin, and
-disallowed-origin rejections. This is protocol-and-transport-level evidence, not a
-substitute for an actual hosted OpenAI request; see `docs/BUILD_PLAN.md`'s phase 9
-notes for the full detail of what's covered and what still isn't.
+`Authorization`+`Origin` header shape (init, the same v1-compatibility 12-tool/
+2-resource surface as the stdio session above, a safe tool call, session
+continuation), plus the missing-bearer, missing-origin, and disallowed-origin
+rejections. This is protocol-and-transport-level evidence, not a substitute for an
+actual hosted OpenAI request; see `docs/BUILD_PLAN.md`'s phase 9 notes for the full
+detail of what's covered and what still isn't. This test also runs in
+v1-compatibility mode today — see the tool-count note above for the full v2 surface's
+own, separately-verified evidence.
