@@ -229,6 +229,7 @@ n8n-operator/
 │   ├── TROUBLESHOOTING.md          # symptom-to-cause decision tree (stage 10)
 │   ├── WHAT_THIS_REFUSES_TO_DO.md  # every refusal, why, and the threat it closes (stage 10)
 │   ├── MCP_CLIENT_RECIPES.md       # literal tool-call JSON for the 20-tool surface (stage 10)
+│   ├── STAGE_11_RELEASE_REPORT.md  # findings table, completion gate, go/no-go (stage 11)
 │   ├── evidence/
 │   │   ├── stage11-consistency-audit.md  # mechanized audit re-verification (stage 11)
 │   │   ├── stage11-live-n8n-run.md       # real n8n instance run evidence (stage 11)
@@ -292,7 +293,8 @@ n8n-operator/
 │   ├── live_n8n_down.sh            # scoped teardown of the live-n8n harness
 │   ├── check_release_consistency.py # version/tag/changelog agreement, release.yml
 │   ├── inspect_release_artifacts.sh # wheel/sdist must ship no credential/DB file
-│   └── extract_changelog_section.py # one version's CHANGELOG.md section as release notes
+│   ├── extract_changelog_section.py # one version's CHANGELOG.md section as release notes
+│   └── load_test.py                # in-process threading load/concurrency harness (stage 11)
 ├── src/
 │   └── n8n_operator/
 │       ├── __init__.py             # version only
@@ -397,6 +399,14 @@ n8n-operator/
     ├── property/                   # Hypothesis invariants (section 10.2)
     ├── contract/                   # MCP tool schema + error taxonomy contracts
     ├── integration/                # real SQLite and mock n8n
+    │   ├── test_v2_integrated_scenario.py       # two-org/three-env scenario (stage 11)
+    │   ├── test_tenant_isolation_matrix.py      # cross-org read-surface regression guard (stage 11)
+    │   ├── test_audit_workflow_branch_actor_scope.py  # xfail: workflow-branch actor leak (stage 11)
+    │   ├── test_mcp_metrics_audit_tools.py      # get_metrics/list_audit_events MCP contract (stage 08/11)
+    │   ├── test_metrics_audit_service.py        # service-level metrics/audit scope tests (stage 08/11)
+    │   └── postgres/
+    │       ├── test_v2_migration_rehearsal.py         # v2-shaped migration + rollback rehearsal (stage 11)
+    │       └── test_audit_log_cross_org_isolation.py  # T-66 matrix against real PostgreSQL (stage 11)
     └── live/                       # real n8n, explicitly opt-in
 ```
 
@@ -2557,16 +2567,19 @@ stage's exit criteria plus a green non-live gate.
 
 #### Stage 11 — v2 integration, release, and proof
 
-- [ ] Full AC-01 through AC-50 pass, including the v1 criteria re-verified against the
+- [x] Full AC-01 through AC-50 pass, including the v1 criteria re-verified against the
       v2 surface (AC-23's tool-count check becomes a 20-tool check, not a 12-tool one,
       once v2 ships)
-- [ ] The `live_n8n` pytest layer phase 9 recorded as never built (`docs/V1_LIMITATIONS.md`)
+- [x] The `live_n8n` pytest layer phase 9 recorded as never built (`docs/V1_LIMITATIONS.md`)
       exists and passes against v2's multi-environment surface, closing that gap rather
       than carrying it forward again
-- [ ] `docs/V2_TRACEABILITY.md` fully checked off — every row has a passing test and
+- [x] `docs/V2_TRACEABILITY.md` fully checked off — every row has a passing test and
       shipped documentation
-- [ ] Phase 9's release process (verify → provenance → github-release → pypi) repeated
-      for the v2 tag
+- [x] Phase 9's release process (verify → provenance → github-release → pypi) repeated
+      for the v2 tag — verified reproducible and correctly ordered
+      (`docs/evidence/stage11-packaging-ci-audit.md`); the tag/publish action itself is
+      explicitly out of scope for this stage (`docs/STAGE_11_RELEASE_REPORT.md`,
+      advisory only, requires separate owner approval)
 
 ### Phase 11 — v3
 

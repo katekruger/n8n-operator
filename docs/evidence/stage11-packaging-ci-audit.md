@@ -107,7 +107,7 @@ is `id-token: write`.
 
 ## 4. Dependency specifiers (`pyproject.toml`)
 
-All eleven runtime dependencies use a lower-bound-and-upper-bound (`>=X,<Y`) "compatible
+All sixteen runtime dependencies use a lower-bound-and-upper-bound (`>=X,<Y`) "compatible
 release" range rather than an exact pin — this is normal/expected for a library
 `pyproject.toml` (as opposed to an application's exact-pinned lockfile) and every range
 excludes the next major version:
