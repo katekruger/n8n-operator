@@ -1,5 +1,37 @@
 # Stage 11 security review — addendum
 
+> **STILL PENDING as of 2026-08-31.** A final whole-branch review of this stage found
+> that this finding — while honestly documented here, in `CHANGELOG.md`, and in
+> `docs/STAGE_11_RELEASE_REPORT.md` — has **not yet been reflected** in the two more
+> standing/authoritative artifacts that a reader would reasonably expect to carry it:
+> `docs/THREAT_MODEL.md` (no T-number entry exists for this finding, and the existing
+> T-66 entry still reads as if the `"workflow"` branch is fully org-agnostic and safe,
+> with no cross-reference to this addendum) and `docs/evidence/stage11-security-review.md`
+> (the *original* evidence doc, which still states "No additional vulnerabilities of
+> this class were found beyond the T-66 finding," unqualified, with no reference to this
+> addendum). `src/n8n_operator/storage/repository.py`'s `list_page` docstring has since
+> been updated to note this gap; those two doc files have not.
+>
+> **Why not done now:** both `docs/THREAT_MODEL.md` and `docs/evidence/stage11-security-review.md`
+> remain locked — modified, uncommitted, by a concurrent separate session doing unrelated
+> work in this same shared working tree — as of this note. Per the fix-wave rules for this
+> pass, edits were not forced into those locked files.
+>
+> **Required next step:** once `docs/THREAT_MODEL.md` and `docs/evidence/stage11-security-review.md`
+> unlock (the concurrent session commits and moves on), this must be the *very first* thing
+> done to them, before any other work touches them:
+> 1. Add a new T-number entry to `docs/THREAT_MODEL.md` for this finding — status
+>    `open`/`accepted`, not `mitigated` — citing this addendum and the `xfail` test at
+>    `tests/integration/test_audit_workflow_branch_actor_scope.py`. Cross-reference it from
+>    T-66's own entry (a short "see also T-XX" note) so nobody reads T-66 in isolation and
+>    concludes the workflow branch is fully safe.
+> 2. Fix the "No additional vulnerabilities of this class were found beyond the T-66
+>    finding" sentence in `docs/evidence/stage11-security-review.md` to explicitly
+>    reference this addendum and the open finding, rather than reading as fully clean.
+>
+> This is a genuine, unresolved residual item, not a technicality — flag it to a human
+> directly rather than treating it as closed by this note alone.
+
 This addendum records one finding from a later adversarial review pass over Stage 11
 that is deliberately left **unfixed** this round, tracked here rather than silently
 dropped. It supplements, and does not replace, `docs/evidence/stage11-security-review.md`.

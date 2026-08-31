@@ -1123,6 +1123,18 @@ class AuditLogRepository:
           ``environment_id``/``organization_id`` check applies to this branch — the same
           workflow scope pattern that authorizes reads of the shared registry entry
           authorizes reads of audit events keyed directly on that entry's own id.
+          **Known open gap:** this branch also carries ``operation.prepare_denied``
+          rows, whose ``actor`` field is set to the *denied caller's own* principal
+          id (not the workflow owner's) with no organization check — so a caller in
+          one organization who shares a wildcard-or-overlapping workflow scope with
+          another organization can observe a cross-org principal id plus the timing
+          of that principal's denied operations. This is a confirmed, still-OPEN,
+          narrower sibling of the T-66 cross-tenant leak (T-66 itself was fixed);
+          it is NOT fixed here. See
+          ``docs/evidence/stage11-security-review-addendum.md`` for the full
+          analysis and ``tests/integration/test_audit_workflow_branch_actor_scope.py``
+          for the ``xfail``-marked regression test that documents and pins the gap
+          until it is fixed.
         * ``subject_type="operation"``: the referenced operation's own ``workflow_id``
           matches a pattern AND its own ``environment_id`` equals the caller's resolved
           ``environment_id`` (a correlated ``EXISTS`` against ``operations``, not a join,
