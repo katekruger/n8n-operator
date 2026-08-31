@@ -1118,10 +1118,32 @@ class AuditLogRepository:
         is included only if its ``subject_type``/``subject_id`` resolves to something
         in scope —
 
-        * ``subject_type="workflow"``: ``subject_id`` matches a pattern directly.
+        * ``subject_type="workflow"``: ``subject_id`` matches a pattern directly. Workflow
+          definitions are global, not organization-namespaced, so no further
+          ``environment_id``/``organization_id`` check applies to this branch — the same
+          workflow scope pattern that authorizes reads of the shared registry entry
+          authorizes reads of audit events keyed directly on that entry's own id.
+          **Known open gap:** this branch also carries ``operation.prepare_denied``
+          rows, whose ``actor`` field is set to the *denied caller's own* principal
+          id (not the workflow owner's) with no organization check — so a caller in
+          one organization who shares a wildcard-or-overlapping workflow scope with
+          another organization can observe a cross-org principal id plus the timing
+          of that principal's denied operations. This is a confirmed, still-OPEN,
+          narrower sibling of the T-66 cross-tenant leak (T-66 itself was fixed);
+          it is NOT fixed here. See
+          ``docs/evidence/stage11-security-review-addendum.md`` for the full
+          analysis and ``tests/integration/test_audit_workflow_branch_actor_scope.py``
+          for the ``xfail``-marked regression test that documents and pins the gap
+          until it is fixed.
         * ``subject_type="operation"``: the referenced operation's own ``workflow_id``
-          matches a pattern (a correlated ``EXISTS`` against ``operations``, not a join,
-          so a matching operation never duplicates its audit rows).
+          matches a pattern AND its own ``environment_id`` equals the caller's resolved
+          ``environment_id`` (a correlated ``EXISTS`` against ``operations``, not a join,
+          so a matching operation never duplicates its audit rows). Unlike a workflow
+          definition, an operation belongs to exactly one organization/environment
+          (ADR-016 section 2) — a workflow-scope pattern of ``"*"`` matches *any*
+          workflow id, so without this conjunct a caller in one organization with a
+          wildcard workflow scope could see another organization's operations against a
+          workflow id both organizations happen to share.
         * ``subject_type="environment"``: ``subject_id == environment_id`` — the caller
           already only ever has a caller-visible ``environment_id`` to pass here
           (``identity.resolve_environment`` applied its own visibility rule before this
@@ -1162,7 +1184,11 @@ class AuditLogRepository:
                 workflow_clause = (AuditLogEntry.subject_type == "workflow") & workflow_like
                 operation_clause = (AuditLogEntry.subject_type == "operation") & (
                     select(Operation.id)
-                    .where(Operation.id == AuditLogEntry.subject_id, operation_like)
+                    .where(
+                        Operation.id == AuditLogEntry.subject_id,
+                        operation_like,
+                        Operation.environment_id == environment_id if environment_id else false(),
+                    )
                     .exists()
                 )
             environment_clause: Any = (AuditLogEntry.subject_type == "environment") & (

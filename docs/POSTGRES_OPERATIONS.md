@@ -134,7 +134,11 @@ always available, not aspirational.
 **A bad cutover to PostgreSQL entirely**: point `N8N_OPERATOR_DATABASE_URL` back at the
 original SQLite file (never modified by the migration, per the section above) and
 restart. Nothing about the SQLite-era database becomes invalid by having been copied
-elsewhere; the copy is additive, not destructive.
+elsewhere; the copy is additive, not destructive. Rehearsed for real against a v2-shaped
+dataset (organizations, environments, memberships, an anchored audit chain) in
+`tests/integration/postgres/test_v2_migration_rehearsal.py::test_rollback_restores_the_pre_migration_sqlite_file_untouched`,
+which byte-compares the source SQLite file before and after `migrate()` runs — see
+`docs/evidence/stage11-migration-rehearsal.md` for the recorded result.
 
 **A migration that "succeeded" but failed verification** (`migrate-to-postgres` exits
 `2`): treat the destination as unproven, not as a fallback with a known-good subset.

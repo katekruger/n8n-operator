@@ -41,8 +41,13 @@ This window is one process between two adjacent statements — not an extended p
 so it is rare in practice, not a routine occurrence. When it happens, resolving it
 requires a direct, careful database edit; see
 [Reconciling UNKNOWN operations](RECONCILING_UNKNOWN.md#a-crash-stranded-executing-operation)
-for the exact procedure. v2 is expected to add a supported reconciliation command so
-this never requires touching the database by hand.
+for the exact procedure. **This remains true in v2.** v2 does add an admin-gated
+`reconcile_operation` command (Stage 11's integrated-scenario tests exercise it for
+real against Postgres), but it only records exact-ID evidence for operations already
+in `UNKNOWN` — it is an audit-log annotation, never a state transition, and refuses
+to run against any other state (including `EXECUTING`). A crash-stranded `EXECUTING`
+operation still has no automated recovery path in v2 and still requires the same
+direct database edit.
 
 ## Arguments are stored raw at rest
 
@@ -83,7 +88,14 @@ that access alone doesn't reach (T-35, [ADR-012](adr/ADR-012-governed-retry-and-
 `rate_limit_per_minute` and `max_concurrent` are both per-workflow. A caller cannot
 flood a single workflow past its configured limit, but nothing stops a caller from
 issuing requests against many different workflows at once — there is no per-principal
-or system-wide quota in v1 (T-11, partial). v2 adds per-principal quotas.
+or system-wide quota in v1 (T-11, partial). **This remains true in v2**: Stage 11's
+security review (`docs/evidence/stage11-security-review.md`) confirmed
+`OperationRepository.count_recent`/`count_in_states` are still deliberately
+workflow-scoped, not principal- or organization-scoped, by design — the review found
+this means a `rate_limit_per_minute` count can reflect cross-organization request
+volume for a shared workflow id, which is tracked as accepted-for-now, documented
+residual scope (not fixed in this stage) rather than a v2 feature that landed.
+Per-principal quotas are not yet implemented in any released version.
 
 ## A workflow's title and description are not verified against its behavior
 

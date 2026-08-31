@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Fixed a cross-organization audit log visibility issue in v2.** A principal with a
+  broad workflow/environment grant in one organization could, under `list_audit_events`,
+  see audit events belonging to another organization's operation when both
+  organizations happened to reference the same shared workflow id. The missing
+  environment-ownership check has been added and is now covered by a dedicated,
+  parameterized regression test suite (`tests/integration/test_tenant_isolation_matrix.py`
+  and related files) across every v2 read surface, in both SQLite and real PostgreSQL.
+  No exploitation of this issue outside of internal testing is known. Full write-up:
+  `docs/evidence/stage11-security-review.md` and `docs/THREAT_MODEL.md` (T-66).
+- A narrower, related finding — audit events about a *denied* attempt against a shared
+  workflow can reveal the denied caller's identifier across organizations — was
+  identified and is tracked as documented, unresolved residual scope pending a small
+  architectural change (threading caller-organization context into the audit query
+  layer); see `docs/evidence/stage11-security-review-addendum.md`. Global (not
+  per-organization) workflow rate-limiting counts were also reviewed and found to be a
+  pre-existing, out-of-scope design tradeoff rather than an unauthorized-read bug.
+
+### Added
+
+- Stage 11's v2 integration and proof work: an integrated two-organization,
+  three-environment scenario test exercising the full v2 lifecycle end to end
+  (prepare/approve/execute, retry, reconciliation, structural diffs, metrics and audit
+  queries, alert delivery, and both audit-anchor implementations) against real
+  PostgreSQL; a rehearsed SQLite-to-PostgreSQL migration; an internal security review
+  covering every v2 read surface for cross-tenant isolation; and load/soak testing.
+  See `docs/STAGE_11_RELEASE_REPORT.md` for the consolidated findings and the
+  go/no-go recommendation.
+
 ### Fixed
 
 - **The live-n8n harness now actually works, run for real and confirmed 8/8 passing
