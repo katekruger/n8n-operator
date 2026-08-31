@@ -16,19 +16,35 @@ what was verified and when.</sub>
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
-> **Status: v1 release candidate, public repository, pre-release GitHub tag.** All
-> nine product phases are implemented and the local release gate is green: registry,
-> MCP server (stdio + Streamable HTTP), n8n integration, execution, and the full
-> operator CLI (`db`, `registry`, `operations`, `audit`, `health`, `serve`). The
-> reproducible, Docker-based live-n8n harness
-> ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) has been run for real
-> (2026-08-28, 8/8 passed). A GitHub Release exists as a marked pre-release; **PyPI
-> publishing is deliberately deferred** (`.github/workflows/release.yml`'s `pypi` job
-> is disabled until a PyPI trusted publisher is registered). One thing remains before
-> a final, non-candidate v1.0.0: a real hosted OpenAI connector call. See
-> [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) section 12 for the phase checklist,
-> [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md) for what v1 deliberately does not
-> do, and [CHANGELOG.md](CHANGELOG.md) for the full history.
+> **Status: v1 release candidate, public repository, pre-release GitHub tag —
+> deliberately not final, not abandoned.** All nine product phases are implemented
+> and the local release gate is green: registry, MCP server (stdio + Streamable
+> HTTP), n8n integration, execution, and the full operator CLI (`db`, `registry`,
+> `operations`, `audit`, `health`, `serve`). The reproducible, Docker-based live-n8n
+> harness ([docs/LIVE_N8N_TESTING.md](docs/LIVE_N8N_TESTING.md)) has been run for
+> real (2026-08-28, 8/8 passed). A GitHub Release exists as a marked pre-release.
+> **Exactly two named things block cutting a final, non-candidate `v1.0.0`**, both
+> requiring the maintainer's own action rather than further engineering: (1) a real
+> hosted OpenAI connector call, against a public TLS endpoint with real credentials —
+> the protocol shape is already automated in CI
+> (`tests/integration/test_mcp_http_openai_compat.py`), but an actual hosted request
+> has never been made; (2) a PyPI "trusted publisher" registered for this repository
+> — a human, PyPI-account-holder action — before which
+> `.github/workflows/release.yml`'s `pypi` job stays disabled (`if: false`) by
+> design. Neither is a code change. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md)
+> section 12 for the phase checklist, [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md)
+> for what v1 deliberately does not do, and [CHANGELOG.md](CHANGELOG.md) for the
+> full history.
+>
+> **Tag naming has drifted and the final tag should fix it deliberately**: the three
+> release-candidate tags cut so far are `v1.0.0-rc1`, `v1.0.0-rc2`, then
+> `v1.0.0rc3` — the third dropped the hyphen before `rc`. PEP 440 normalizes both
+> forms to the same version, but they are not guaranteed to sort identically in
+> every tool that compares tags as plain strings rather than parsing them as PEP 440
+> versions. The final `v1.0.0` tag carries no `rc` suffix at all, so this specific
+> ambiguity resolves itself then — but if another release candidate is cut before
+> that, use the hyphenated form (`v1.0.0-rc4`) to match the first two, not the
+> third.
 >
 > **v2** (organizations, RBAC, environments, team approvals, governed retry, structural
 > diffs, metrics/audit query, alert hooks, external audit anchoring) is merged and
@@ -251,6 +267,15 @@ decision — never the only way to decide an operation.
 | [010](docs/adr/ADR-010-approval-delivery-and-expiry.md) | Approval delivery and expiry semantics |
 | [011](docs/adr/ADR-011-argument-limits-and-idempotency.md) | Core argument limits and idempotency namespaces |
 | [012](docs/adr/ADR-012-governed-retry-and-audit-anchoring.md) | Governed retry and external audit anchoring |
+| [013](docs/adr/ADR-013-organization-tenant-and-principal-model.md) | Organization is the tenant; membership, not principal attribute |
+| [014](docs/adr/ADR-014-oidc-trust-and-session-model.md) | Operator validates OIDC bearer tokens itself, no proxy delegation |
+| [015](docs/adr/ADR-015-rbac-authorization-evaluation.md) | Four-role RBAC: workflow-scope AND environment-scope AND capability |
+| [016](docs/adr/ADR-016-environment-registry-overlays.md) | Environment overlays adjust reach and gating only, never the contract |
+| [017](docs/adr/ADR-017-team-approval-quorum-semantics.md) | Team approval quorum: snapshotted eligibility, no self-approval |
+| [018](docs/adr/ADR-018-notification-and-alert-hook-delivery.md) | Notification/alert delivery: at-least-once, dedup, content-free payloads |
+| [019](docs/adr/ADR-019-metrics-cardinality-and-privacy.md) | Metrics pre-filtered by scope before aggregation, no low-sample percentiles |
+| [020](docs/adr/ADR-020-token-link-approval-not-an-authenticated-web-session.md) | Keep single-use token-link approval, no OIDC-authenticated web session |
+| [021](docs/adr/ADR-021-external-anchoring-guarantee-is-manual-and-narrow.md) | External anchoring: protects DB-only tampering, publish is manual |
 
 ## Version boundaries
 

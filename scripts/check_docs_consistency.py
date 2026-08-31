@@ -27,7 +27,7 @@ D11 The error taxonomy is closed: every code a tool declares is defined in MCP_T
     code, and the superseded spelling IDEMPOTENCY_KEY_CONFLICT survives only where the
     supersession itself is documented (ADR-011).
 D12 Every ADR exists, carries a Status and a Decision, and is referenced by at least one
-    normative document -- no ADR is orphaned (ADR-008..ADR-019).
+    normative document -- no ADR is orphaned (ADR-008..ADR-021).
 D13 The v2 tool inventory is consistent across documents: BUILD_PLAN section 7.2's table
     matches the set of `### 5.x` tool contracts in MCP_TOOLS.md section 5, and matches
     EXPECTED_V2_TOOLS exactly (added at v2 stage 00, contract closure).
@@ -70,6 +70,8 @@ ADRS = [
     "ADR-017-team-approval-quorum-semantics.md",
     "ADR-018-notification-and-alert-hook-delivery.md",
     "ADR-019-metrics-cardinality-and-privacy.md",
+    "ADR-020-token-link-approval-not-an-authenticated-web-session.md",
+    "ADR-021-external-anchoring-guarantee-is-manual-and-narrow.md",
 ]
 
 NORMATIVE_DOCS = [

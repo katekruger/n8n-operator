@@ -298,55 +298,29 @@ What it does **not** guarantee, and what a future change could silently break:
   published before the change — there's no version field in the anchor's own payload
   guarding against this today.
 
-## ADRs live in two places — a known, unresolved duplication
+## ADRs — one location, `docs/adr/`
 
-`docs/adr/` holds 19 existing architectural decision records (`ADR-NNN-slug.md`, a
-homegrown format: `Status`/`Date`/`Deciders`/`Phase`/`Related` metadata bullets, then
-`Context` → `Decision` → `Consequences` → `Alternatives considered`) — this is this
-repo's own established convention, referenced throughout `docs/BUILD_PLAN.md` and
-`CONTRIBUTING.md`. `docs/decisions/` is a second, newer location using MADR 4.0.0
-format (YAML frontmatter, `Context and Problem Statement` → `Considered Options` →
-`Decision Outcome` → `Consequences`), added to match a portfolio-wide convention used
-by sibling repos. Two records exist there so far, both deliberately narrower than and
-cross-referencing an existing `docs/adr/` entry rather than duplicating it — see
-`0001-token-link-approval-not-an-authenticated-web-session.md` (extends ADR-010) and
-`0002-external-anchoring-guarantee-is-manual-and-narrow.md` (extends ADR-012).
+All architectural decisions live in `docs/adr/` (`ADR-NNN-slug.md`, this repo's own
+established format: `Status`/`Date`/`Deciders`/`Phase`/`Related` metadata bullets,
+then `Context` → `Decision` → `Consequences` → `Alternatives considered`), currently
+21 files, referenced throughout `docs/BUILD_PLAN.md`, `CONTRIBUTING.md`, and this
+file. This repo briefly had a second, MADR-4.0.0-formatted `docs/decisions/` directory
+(added to match the portfolio-wide convention used by sibling repos) — resolved
+2026-08-31 by moving both of its records into `docs/adr/` as ADR-020 and ADR-021,
+consistency within this repo taking priority over consistency across the portfolio,
+since a code reference (e.g. `core/authorization.py`'s citation of ADR-015) only
+resolves correctly if every decision lives in one place. A new architectural decision
+gets a new `ADR-NNN-slug.md` here — there is no second location to consider.
 
-**This is a real inconsistency, not a resolved one.** A new architectural decision
-today has two plausible homes with different formats and no stated rule for which one
-to use. Until this repo picks one convention and migrates (or explicitly decides to
-keep both, with a stated reason), default to `docs/decisions/` for a genuinely new
-decision and use `docs/adr/`'s format only when directly extending or superseding an
-existing entry there.
+## Divergences found between docs and reality — resolved 2026-08-31
 
-## Divergences found between docs and reality
-
-Found while writing this file — reported here rather than silently corrected in
-place, per instruction:
-
-1. **README.md's "Decision records" table lists ADR-001 through ADR-012 (12 rows)**,
-   but `docs/adr/` on disk contains 19 files, ADR-001 through ADR-019. The seven
-   missing rows (ADR-013 through ADR-019) are the v2-era decisions — organization/
-   tenant model, OIDC trust, RBAC evaluation, environment overlays, team-approval
-   quorum, notification/alert delivery, metrics cardinality — and are actively cited
-   elsewhere in the codebase (e.g. `core/authorization.py` cites ADR-015).
-2. **`CONTRIBUTING.md` line 76** says "see `docs/adr/` for the existing twelve and
-   their format" — same staleness; should read nineteen.
-3. **`CONTRIBUTING.md` lines 53-54** claim coverage is "gated on
-   `src/n8n_operator/core/` and `src/n8n_operator/registry/` — at least 90% line
-   coverage." The actual CI gate (`.github/workflows/ci.yml`'s `coverage` job,
-   mirrored in `release.yml`) runs `--fail-under=90` against the **whole**
-   `src/n8n_operator` package — `pyproject.toml`'s `[tool.coverage.run]` sets
-   `source = ["src/n8n_operator"]` with no module-scoped carve-out anywhere. The
-   *that there's a 90% gate* claim is correct; the *scope* claim is not.
-4. **`examples/mcp-clients/README.md`** states (twice, lines 12 and 100) that its
-   verification sessions confirm "the documented 12-tool/2-resource surface." The
-   actual registered MCP surface is 20 tools (12 v1 + 8 v2, confirmed by counting
-   `mcp/tools.py`'s registrations) — this file reflects only the v1 baseline and
-   wasn't updated when the 8 v2 tools were added, even though README.md's own
-   Documentation table elsewhere correctly says `docs/MCP_CLIENT_RECIPES.md` covers
-   "the literal tool-call JSON for every step... using only the 20-tool surface."
-
-None of these were fixed as part of writing this file — reporting them, per
-instruction, rather than quietly writing the corrected version into `AGENTS.md` and
-leaving the source docs stale.
+The four divergences this file originally reported here (README's ADR table missing
+seven v2-era rows, `CONTRIBUTING.md`'s "twelve" ADR count, `CONTRIBUTING.md`'s
+core/registry-only coverage-scope claim, and `examples/mcp-clients/README.md`'s stale
+12-tool figure) were all fixed in the PR that resolved them — see that PR's own
+findings list for exactly what changed and how each was verified (the tool-count fix
+in particular was re-verified with a real, live, v2-enabled MCP session rather than a
+find-replace, since the two automated sessions genuinely still test the v1-compat
+12-tool surface on purpose). If a new divergence is found later, report it the same
+way this section originally did — a dated, resolved note here beats a growing list of
+known-wrong docs sitting in the source of truth.

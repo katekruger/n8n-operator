@@ -50,9 +50,11 @@ BUILD_PLAN.md section 4 all agree with each other and with the actual repository
 most of what it catches is a doc edit that fell out of sync with a code change, or vice
 versa.
 
-Coverage is gated on `src/n8n_operator/core/` and `src/n8n_operator/registry/` — at
-least 90% line coverage, because a bug in either of those is a security bug
-(BUILD_PLAN section 10.4):
+Coverage is gated at 90% line coverage across the whole `src/n8n_operator` package
+(`.github/workflows/ci.yml`'s `coverage` job, mirrored in `release.yml`;
+`pyproject.toml`'s `[tool.coverage.run]` sets no per-module carve-out). `core/` and
+`registry/` are where a bug is a security bug (BUILD_PLAN section 10.4) and are worth
+the closest attention, but the enforced gate is not scoped to just those two:
 
 ```bash
 uv run pytest --cov --cov-report=term-missing
@@ -73,7 +75,7 @@ instead, and BUILD_PLAN.md section 10.1 for the full test-layer breakdown.
   before adding a new one; the convention is deliberate and consistently applied for a
   reason (it's how a large, security-sensitive codebase stays reviewable).
 - **A new architectural decision gets an ADR**, not just a paragraph in a PR
-  description — see `docs/adr/` for the existing twelve and their format. If you're not
+  description — see `docs/adr/` for the existing twenty-one and their format. If you're not
   sure whether your change rises to that level, ask in the issue first.
 - **A change to a security boundary updates `docs/THREAT_MODEL.md`.** Never mark a
   threat `mitigated` without a real, tested control backing it — this project's own

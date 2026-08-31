@@ -45,6 +45,8 @@ ADRS = [
     "ADR-017-team-approval-quorum-semantics.md",
     "ADR-018-notification-and-alert-hook-delivery.md",
     "ADR-019-metrics-cardinality-and-privacy.md",
+    "ADR-020-token-link-approval-not-an-authenticated-web-session.md",
+    "ADR-021-external-anchoring-guarantee-is-manual-and-narrow.md",
 ]
 
 # Decisions closed in phase 0.1, and the identifier each one is obliged to introduce into
