@@ -194,6 +194,91 @@ async def test_list_audit_events_rejects_a_bad_limit(loaded: sessionmaker[Sessio
     assert body["error"]["code"] == "INVALID_ARGUMENTS"
 
 
+@pytest.mark.integration
+async def test_list_audit_events_never_leaks_another_orgs_operation_through_mcp(
+    session_factory: sessionmaker[Session], tmp_path: Any
+) -> None:
+    """Full ``MCPServer.call_tool`` round trip (Stage 11 security review) — proves the
+    fix holds at the actual client-facing boundary, not only at the service/repository
+    layers. Org B's ``"*"``-scoped viewer must never see Org A's operation, in *either*
+    of the two ways a leak could show up: as a present event (the confirmed bug this
+    stage fixed) or as a present-but-redacted stand-in (the anti-enumeration shape this
+    codebase already uses everywhere else, e.g. ``WORKFLOW_NOT_FOUND`` never
+    distinguishing "doesn't exist" from "you can't see it" — an absent row is the only
+    correct shape, never a placeholder that confirms the row's existence)."""
+    from datetime import UTC, datetime
+
+    from n8n_operator.core import service as core_service
+    from n8n_operator.core.models import PreflightResult
+
+    class ReadyPreflight:
+        def check(self, workflow: Any) -> Any:
+            return PreflightResult(ready=True, checks=[], checked_at=datetime.now(UTC))
+
+    registry_path = tmp_path / "workflows.yaml"
+    registry_path.write_text(REGISTRY_YAML)
+    with session_scope(session_factory) as session:
+        core_service.reload_registry(session, registry_path, server_max_argument_bytes=262_144)
+        org_a = OrganizationRepository(session).create(name="Org A")
+        org_b = OrganizationRepository(session).create(name="Org B")
+        env_a = EnvironmentRepository(session).create(
+            organization_id=org_a.id,
+            name="production",
+            n8n_base_url_ref="env:A_URL",
+            n8n_api_key_ref="env:A_KEY",
+        )
+        env_b = EnvironmentRepository(session).create(
+            organization_id=org_b.id,
+            name="production",
+            n8n_base_url_ref="env:B_URL",
+            n8n_api_key_ref="env:B_KEY",
+        )
+        operator_a = PrincipalRepository(session).create(kind="user", display_name="Org A Operator")
+        viewer_b = PrincipalRepository(session).create(kind="user", display_name="Org B Viewer")
+        OrganizationMembershipRepository(session).create(
+            principal_id=operator_a.id,
+            organization_id=org_a.id,
+            roles=["operator"],
+            workflow_scope="*",
+            environment_scope=[env_a.id],
+        )
+        OrganizationMembershipRepository(session).create(
+            principal_id=viewer_b.id,
+            organization_id=org_b.id,
+            roles=["viewer"],
+            workflow_scope="*",
+            environment_scope=["*"],
+        )
+        operator_a_id, viewer_b_id, env_a_id, env_b_id = (
+            operator_a.id,
+            viewer_b.id,
+            env_a.id,
+            env_b.id,
+        )
+
+    with session_scope(session_factory) as session:
+        operation, _replay, _token = core_service.prepare_operation(
+            session,
+            principal_id=operator_a_id,
+            environment=env_a_id,
+            workflow_id="crm.sync_contact",
+            arguments={},
+            preflight=ReadyPreflight(),
+            server_max_argument_bytes=262_144,
+            enable_v2=True,
+        )
+        org_a_operation_id = operation.id
+
+    server = make_server(session_factory, principal_id=viewer_b_id)
+    result = await call(server, "list_audit_events", environment=env_b_id, limit=100)
+    subject_ids = {event["subject_id"] for event in result["events"]}
+    assert org_a_operation_id not in subject_ids
+    # Not present at all — never present with a redacted/placeholder detail either,
+    # which would itself be an enumeration oracle.
+    for event in result["events"]:
+        assert event["subject_id"] != org_a_operation_id
+
+
 def test_get_metrics_and_list_audit_events_never_reference_a_raw_n8n_identifier() -> None:
     """Static source check (mirrors stage 07's "no gating path imports
     definition_diff" technique): ``get_metrics``'s breakdown keys are always a

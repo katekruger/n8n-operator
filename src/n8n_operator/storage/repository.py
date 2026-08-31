@@ -1118,10 +1118,20 @@ class AuditLogRepository:
         is included only if its ``subject_type``/``subject_id`` resolves to something
         in scope —
 
-        * ``subject_type="workflow"``: ``subject_id`` matches a pattern directly.
+        * ``subject_type="workflow"``: ``subject_id`` matches a pattern directly. Workflow
+          definitions are global, not organization-namespaced, so no further
+          ``environment_id``/``organization_id`` check applies to this branch — the same
+          workflow scope pattern that authorizes reads of the shared registry entry
+          authorizes reads of audit events keyed directly on that entry's own id.
         * ``subject_type="operation"``: the referenced operation's own ``workflow_id``
-          matches a pattern (a correlated ``EXISTS`` against ``operations``, not a join,
-          so a matching operation never duplicates its audit rows).
+          matches a pattern AND its own ``environment_id`` equals the caller's resolved
+          ``environment_id`` (a correlated ``EXISTS`` against ``operations``, not a join,
+          so a matching operation never duplicates its audit rows). Unlike a workflow
+          definition, an operation belongs to exactly one organization/environment
+          (ADR-016 section 2) — a workflow-scope pattern of ``"*"`` matches *any*
+          workflow id, so without this conjunct a caller in one organization with a
+          wildcard workflow scope could see another organization's operations against a
+          workflow id both organizations happen to share.
         * ``subject_type="environment"``: ``subject_id == environment_id`` — the caller
           already only ever has a caller-visible ``environment_id`` to pass here
           (``identity.resolve_environment`` applied its own visibility rule before this
@@ -1162,7 +1172,11 @@ class AuditLogRepository:
                 workflow_clause = (AuditLogEntry.subject_type == "workflow") & workflow_like
                 operation_clause = (AuditLogEntry.subject_type == "operation") & (
                     select(Operation.id)
-                    .where(Operation.id == AuditLogEntry.subject_id, operation_like)
+                    .where(
+                        Operation.id == AuditLogEntry.subject_id,
+                        operation_like,
+                        Operation.environment_id == environment_id if environment_id else false(),
+                    )
                     .exists()
                 )
             environment_clause: Any = (AuditLogEntry.subject_type == "environment") & (

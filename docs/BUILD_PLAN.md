@@ -230,7 +230,13 @@ n8n-operator/
 │   ├── WHAT_THIS_REFUSES_TO_DO.md  # every refusal, why, and the threat it closes (stage 10)
 │   ├── MCP_CLIENT_RECIPES.md       # literal tool-call JSON for the 20-tool surface (stage 10)
 │   ├── evidence/
-│   │   └── stage11-consistency-audit.md  # mechanized audit re-verification (stage 11)
+│   │   ├── stage11-consistency-audit.md  # mechanized audit re-verification (stage 11)
+│   │   ├── stage11-live-n8n-run.md       # real n8n instance run evidence (stage 11)
+│   │   ├── stage11-load-test-results.md  # load test evidence (stage 11)
+│   │   ├── stage11-migration-rehearsal.md # v2 migration rehearsal evidence (stage 11)
+│   │   ├── stage11-packaging-ci-audit.md # packaging/provenance/CI audit (stage 11)
+│   │   ├── stage11-protocol-sessions.md  # protocol session evidence (stage 11)
+│   │   └── stage11-security-review.md    # internal security review (stage 11, task 5)
 │   ├── superpowers/
 │   │   ├── plans/
 │   │   │   └── 2026-08-30-stage-11-v2-integration-release-and-proof.md

@@ -40,12 +40,16 @@ def _make_operation(
     workflow_id: str = "wf.a",
     idempotency_key: str | None = None,
     environment: str = "default",
+    environment_id: str | None = None,
+    organization_id: str | None = None,
     state: str = "PREPARING",
 ) -> Operation:
     return OperationRepository(session).create(
         id=id,
         principal_id=seed["principal_id"],
         environment=environment,
+        environment_id=environment_id,
+        organization_id=organization_id,
         snapshot_id=seed["snapshot_id"],
         workflow_id=workflow_id,
         definition_hash="sha256:" + "b" * 64,

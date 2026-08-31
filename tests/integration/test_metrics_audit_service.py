@@ -340,6 +340,238 @@ def test_list_audit_events_workflow_id_filter(loaded: sessionmaker[Session]) -> 
 
 
 # --------------------------------------------------------------------------------------
+# list_audit_events / get_metrics — cross-organization isolation (Stage 11 security
+# review). Goes through the real `_resolve_scope`/`identity.resolve_environment`
+# authorization path, not `AuditLogRepository`/`OperationRepository` directly — proving
+# the fix holds end to end, not only at the query layer these two functions delegate to.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_org_shared_workflow(
+    loaded: sessionmaker[Session],
+) -> dict[str, str]:
+    """Two organizations, three environments (org A: staging + production, org B:
+    production), the same workflow id (``crm.sync_contact``, already registered by
+    ``loaded``) prepared in every environment — the shared scenario every isolation
+    test in this section reuses."""
+    with session_scope(loaded) as session:
+        org_a = OrganizationRepository(session).create(name="Org A")
+        org_b = OrganizationRepository(session).create(name="Org B")
+        env_a_staging = EnvironmentRepository(session).create(
+            organization_id=org_a.id,
+            name="staging",
+            n8n_base_url_ref="env:A_STAGING_URL",
+            n8n_api_key_ref="env:A_STAGING_KEY",
+        )
+        env_a_prod = EnvironmentRepository(session).create(
+            organization_id=org_a.id,
+            name="production",
+            n8n_base_url_ref="env:A_PROD_URL",
+            n8n_api_key_ref="env:A_PROD_KEY",
+        )
+        env_b_prod = EnvironmentRepository(session).create(
+            organization_id=org_b.id,
+            name="production",
+            n8n_base_url_ref="env:B_PROD_URL",
+            n8n_api_key_ref="env:B_PROD_KEY",
+        )
+        viewer_a = PrincipalRepository(session).create(kind="user", display_name="Org A Viewer")
+        viewer_b = PrincipalRepository(session).create(kind="user", display_name="Org B Viewer")
+        OrganizationMembershipRepository(session).create(
+            principal_id=viewer_a.id,
+            organization_id=org_a.id,
+            roles=["viewer"],
+            workflow_scope="*",
+            environment_scope=["*"],
+        )
+        OrganizationMembershipRepository(session).create(
+            principal_id=viewer_b.id,
+            organization_id=org_b.id,
+            roles=["viewer"],
+            workflow_scope="*",
+            environment_scope=["*"],
+        )
+        operator_a = PrincipalRepository(session).create(kind="user", display_name="Org A Operator")
+        operator_b = PrincipalRepository(session).create(kind="user", display_name="Org B Operator")
+        OrganizationMembershipRepository(session).create(
+            principal_id=operator_a.id,
+            organization_id=org_a.id,
+            roles=["operator"],
+            workflow_scope="*",
+            environment_scope=[env_a_staging.id, env_a_prod.id],
+        )
+        OrganizationMembershipRepository(session).create(
+            principal_id=operator_b.id,
+            organization_id=org_b.id,
+            roles=["operator"],
+            workflow_scope="*",
+            environment_scope=[env_b_prod.id],
+        )
+        ids = {
+            "env_a_staging": env_a_staging.id,
+            "env_a_prod": env_a_prod.id,
+            "env_b_prod": env_b_prod.id,
+            "viewer_a": viewer_a.id,
+            "viewer_b": viewer_b.id,
+            "operator_a": operator_a.id,
+            "operator_b": operator_b.id,
+        }
+
+    op_a_id = _prepare_v2(loaded, operator_a_id=ids["operator_a"], environment=ids["env_a_prod"])
+    op_b_id = _prepare_v2(loaded, operator_a_id=ids["operator_b"], environment=ids["env_b_prod"])
+    ids["op_a"] = op_a_id
+    ids["op_b"] = op_b_id
+    return ids
+
+
+def _prepare_v2(
+    session_factory: sessionmaker[Session], *, operator_a_id: str, environment: str
+) -> str:
+    with session_scope(session_factory) as session:
+        operation, _replay, _token = service.prepare_operation(
+            session,
+            principal_id=operator_a_id,
+            environment=environment,
+            workflow_id="crm.sync_contact",
+            arguments={},
+            preflight=FakePreflight(ready=False),
+            server_max_argument_bytes=262_144,
+            enable_v2=True,
+        )
+        return operation.id
+
+
+@pytest.mark.integration
+def test_list_audit_events_v2_never_leaks_an_operation_across_organizations(
+    two_org_shared_workflow: dict[str, str],
+    loaded: sessionmaker[Session],
+) -> None:
+    with session_scope(loaded) as session:
+        org_a_events = service.list_audit_events(
+            session,
+            principal_id=two_org_shared_workflow["viewer_a"],
+            environment=two_org_shared_workflow["env_a_prod"],
+            limit=100,
+            enable_v2=True,
+        )
+        org_b_events = service.list_audit_events(
+            session,
+            principal_id=two_org_shared_workflow["viewer_b"],
+            environment=two_org_shared_workflow["env_b_prod"],
+            limit=100,
+            enable_v2=True,
+        )
+
+    org_a_subject_ids = {e.subject_id for e in org_a_events.events if e.subject_type == "operation"}
+    org_b_subject_ids = {e.subject_id for e in org_b_events.events if e.subject_type == "operation"}
+    assert two_org_shared_workflow["op_a"] in org_a_subject_ids
+    assert two_org_shared_workflow["op_b"] not in org_a_subject_ids
+    assert two_org_shared_workflow["op_b"] in org_b_subject_ids
+    assert two_org_shared_workflow["op_a"] not in org_b_subject_ids
+
+
+@pytest.mark.integration
+def test_get_metrics_v2_never_counts_another_organizations_operation(
+    two_org_shared_workflow: dict[str, str],
+    loaded: sessionmaker[Session],
+) -> None:
+    with session_scope(loaded) as session:
+        org_b_metrics = service.get_metrics(
+            session,
+            principal_id=two_org_shared_workflow["viewer_b"],
+            environment=two_org_shared_workflow["env_b_prod"],
+            group_by="workflow",
+            enable_v2=True,
+        )
+    # Org B prepared exactly one operation against the shared workflow id — if Org A's
+    # own operation (against the same workflow id, in a different organization) ever
+    # counted toward Org B's totals, this would be >= 2.
+    assert org_b_metrics.totals.count == 1
+
+
+@pytest.mark.integration
+def test_list_audit_events_v2_pagination_cursor_reapplies_scope_on_every_page(
+    loaded: sessionmaker[Session],
+) -> None:
+    """A cursor obtained from one organization's own paginated ``list_audit_events``
+    result must not become a way to page into another organization's events — the
+    cursor is opaque but concretely just a ``seq`` boundary, so the scope filter has
+    to be re-applied on every page fetched with it, not only the first."""
+    with session_scope(loaded) as session:
+        org_a = OrganizationRepository(session).create(name="Org A")
+        org_b = OrganizationRepository(session).create(name="Org B")
+        env_a = EnvironmentRepository(session).create(
+            organization_id=org_a.id,
+            name="production",
+            n8n_base_url_ref="env:A_URL",
+            n8n_api_key_ref="env:A_KEY",
+        )
+        env_b = EnvironmentRepository(session).create(
+            organization_id=org_b.id,
+            name="production",
+            n8n_base_url_ref="env:B_URL",
+            n8n_api_key_ref="env:B_KEY",
+        )
+        operator_a = PrincipalRepository(session).create(kind="user", display_name="Org A Operator")
+        viewer_a = PrincipalRepository(session).create(kind="user", display_name="Org A Viewer")
+        OrganizationMembershipRepository(session).create(
+            principal_id=operator_a.id,
+            organization_id=org_a.id,
+            roles=["operator"],
+            workflow_scope="*",
+            environment_scope=[env_a.id],
+        )
+        OrganizationMembershipRepository(session).create(
+            principal_id=viewer_a.id,
+            organization_id=org_a.id,
+            roles=["viewer"],
+            workflow_scope="*",
+            environment_scope=["*"],
+        )
+        operator_b = PrincipalRepository(session).create(kind="user", display_name="Org B Operator")
+        OrganizationMembershipRepository(session).create(
+            principal_id=operator_b.id,
+            organization_id=org_b.id,
+            roles=["operator"],
+            workflow_scope="*",
+            environment_scope=[env_b.id],
+        )
+        operator_a_id, viewer_a_id, operator_b_id = operator_a.id, viewer_a.id, operator_b.id
+        env_a_id, env_b_id = env_a.id, env_b.id
+
+    # Interleave three of Org A's own operations with three of Org B's — a naive
+    # cursor implementation that dropped the scope filter after the first page would
+    # surface Org B's rows on Org A's own second page.
+    for _ in range(3):
+        _prepare_v2(loaded, operator_a_id=operator_a_id, environment=env_a_id)
+        _prepare_v2(loaded, operator_a_id=operator_b_id, environment=env_b_id)
+
+    with session_scope(loaded) as session:
+        page1 = service.list_audit_events(
+            session, principal_id=viewer_a_id, environment=env_a_id, limit=2, enable_v2=True
+        )
+    assert page1.next_cursor is not None
+    with session_scope(loaded) as session:
+        page2 = service.list_audit_events(
+            session,
+            principal_id=viewer_a_id,
+            environment=env_a_id,
+            limit=2,
+            cursor=page1.next_cursor,
+            enable_v2=True,
+        )
+    for page in (page1, page2):
+        for event in page.events:
+            if event.subject_type != "operation":
+                continue
+            with session_scope(loaded) as session:
+                row = OperationRepository(session).get(event.subject_id)
+                assert row is not None
+                assert row.environment_id == env_a_id
+
+
+# --------------------------------------------------------------------------------------
 # check_and_deliver_alerts
 # --------------------------------------------------------------------------------------
 
