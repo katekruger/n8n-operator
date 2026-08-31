@@ -110,7 +110,7 @@ Built on the official MCP Python SDK v2 (`mcp >= 2.1, < 3`).
 ```
 mcp/
 ├── server.py       # constructs MCPServer, registers tools and resources
-├── tools.py        # 12 v1 tools; Pydantic v2 argument models; -> core.service
+├── tools.py        # v1's 12 tools + v2's 8 (enable_v2-gated); Pydantic v2 argument models; -> core.service
 ├── resources.py    # registry://workflows, audit://operations/{id}
 └── transports.py   # stdio and Streamable HTTP entry points + bind guard
 ```

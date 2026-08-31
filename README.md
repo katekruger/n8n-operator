@@ -33,8 +33,13 @@ approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.*
 > **v2** (organizations, RBAC, environments, team approvals, governed retry, structural
 > diffs, metrics/audit query, alert hooks, external audit anchoring) is merged and
 > individually tested stage by stage — [docs/V2_TRACEABILITY.md](docs/V2_TRACEABILITY.md)
-> tracks each one. End-to-end v2 integration and proof against the full acceptance
-> criteria is Stage 11's own explicit job, not yet claimed done.
+> tracks each one. Stage 11's integration, migration, security, and load review is
+> complete: it found and fixed a real cross-organization audit-log isolation bug
+> (confirmed exploitable, now closed and regression-tested), and it left a narrower,
+> related finding open as documented residual scope. See
+> [docs/STAGE_11_RELEASE_REPORT.md](docs/STAGE_11_RELEASE_REPORT.md) for the full
+> findings and go/no-go recommendation — this stage produces a recommendation, not a
+> release.
 
 | Client / target | Transport | Evidence |
 |---|---|---|

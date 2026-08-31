@@ -236,7 +236,8 @@ n8n-operator/
 │   │   ├── stage11-migration-rehearsal.md # v2 migration rehearsal evidence (stage 11)
 │   │   ├── stage11-packaging-ci-audit.md # packaging/provenance/CI audit (stage 11)
 │   │   ├── stage11-protocol-sessions.md  # protocol session evidence (stage 11)
-│   │   └── stage11-security-review.md    # internal security review (stage 11, task 5)
+│   │   ├── stage11-security-review.md    # internal security review (stage 11, task 5)
+│   │   └── stage11-security-review-addendum.md # residual finding: workflow-branch actor leak (stage 11, task 5)
 │   ├── superpowers/
 │   │   ├── plans/
 │   │   │   └── 2026-08-30-stage-11-v2-integration-release-and-proof.md
