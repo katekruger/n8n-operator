@@ -399,6 +399,7 @@ n8n-operator/
     ├── property/                   # Hypothesis invariants (section 10.2)
     ├── contract/                   # MCP tool schema + error taxonomy contracts
     ├── integration/                # real SQLite and mock n8n
+    │   ├── conftest.py                          # moved from integration/postgres/ (stage 11, task 3a)
     │   ├── test_v2_integrated_scenario.py       # two-org/three-env scenario (stage 11)
     │   ├── test_tenant_isolation_matrix.py      # cross-org read-surface regression guard (stage 11)
     │   ├── test_audit_workflow_branch_actor_scope.py  # xfail: workflow-branch actor leak (stage 11)

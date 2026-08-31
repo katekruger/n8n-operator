@@ -46,10 +46,20 @@ well-understood and well-tracked residual risk, no undisclosed gaps.
 
 ## Stage 11 completion gate — checklist
 
-- [x] All required CI checks pass from a clean checkout — confirmed both via
-      `docs/evidence/stage11-packaging-ci-audit.md` (latest `main` CI/CodeQL/secret-scan
-      runs all green) and via this task's own final local gate run below (ruff, ruff
-      format, mypy --strict, docs-consistency, full pytest all pass).
+- [ ] All required CI checks pass from a clean checkout — **not yet true and should not
+      be read as satisfied.** This branch has never been pushed, so CI has never run
+      against Stage 11's actual content; the only CI citation available
+      (`docs/evidence/stage11-packaging-ci-audit.md`) is to `main`, which does not
+      contain this work. In place of that, this task ran a full local verification gate
+      (ruff, ruff format, mypy --strict, docs-consistency, full pytest) and it is green
+      — but that gate ran in a working tree that also carried five files from a
+      concurrent session's uncommitted, unrelated work (`docs/THREAT_MODEL.md`,
+      `docs/evidence/stage11-security-review.md`,
+      `src/n8n_operator/core/service.py`, `tests/integration/test_execute_dispatch.py`,
+      `tests/integration/test_metrics_audit_repository.py`), so it is not a byte-for-byte
+      clean checkout of this branch's own commits either. Both gaps are real,
+      outstanding preconditions: the branch must be pushed and CI must run green on its
+      actual pushed content before merge.
 - [x] Both database backends (SQLite, PostgreSQL) pass their declared test modes —
       SQLite suite and the PostgreSQL integration suite (`tests/integration/postgres`)
       both pass in this task's final gate run below; PostgreSQL coverage additionally
@@ -59,23 +69,28 @@ well-understood and well-tracked residual risk, no undisclosed gaps.
       install, full CLI lifecycle, real MCP session) and
       `docs/evidence/stage11-migration-rehearsal.md` (real migration run with verified
       row counts, FK integrity, and anchor-chain continuity, plus a rollback rehearsal).
-- [x] No open critical/high security findings — the one confirmed Critical finding
-      (T-66) is fixed and adversarially re-verified, not merely noted. One Moderate
-      finding (the workflow-branch actor leak) remains open but is narrower in impact
-      (identifier + timing on denied attempts, not operation content), explicitly
-      tracked, and covered by a strict `xfail` regression test rather than silently
-      dropped — see the go/no-go reasoning below for why this does not block a release
-      *candidate*.
+- [x] No open critical/high security findings — ticked because the one open related
+      finding (the workflow-branch actor leak, #16) is self-assessed here as **Moderate,
+      not High or Critical**, and no independent reviewer has re-rated it. That
+      self-assessment rests on: identifiers + timing only, not operation content
+      (arguments, state, execution results); denied attempts only; and it requires both
+      a workflow id shared across organizations *and* a caller holding a broad wildcard
+      `workflow_scope="*"` grant. A reviewer could reasonably rate a confirmed
+      cross-tenant identifier-and-timing disclosure in a multi-tenant product as High;
+      if so, this box would need to flip to unticked and the go/no-go recommendation
+      would need to change shape accordingly. The one confirmed Critical finding (T-66)
+      is fixed and adversarially re-verified, not merely noted.
 - [x] Every public claim has retained evidence (`docs/evidence/`) — eight
       `docs/evidence/stage11-*.md` files retained, one per audited/built area, each
       referenced by this findings table.
-- [x] The GTM starter journey succeeds without privileged repository knowledge —
-      established in stage 10 (`docs/GTM_STARTER_KITS.md`, `docs/OPERATOR_GUIDE.md`);
-      not re-audited from scratch in stage 11 (out of this stage's scope, which is
-      integration/release/proof, not GTM content), but nothing in stage 11's changes
-      touches the starter-kit registry, onboarding docs, or the tool surface those
-      guides depend on (confirmed by the mechanized consistency audit and the 12/20
-      tool-count contract test, both passing).
+- [x] (inherited from Stage 10, not re-verified this stage) The GTM starter journey
+      succeeds without privileged repository knowledge — established in stage 10
+      (`docs/GTM_STARTER_KITS.md`, `docs/OPERATOR_GUIDE.md`); not re-audited from
+      scratch in stage 11 (out of this stage's scope, which is integration/release/proof,
+      not GTM content), but nothing in stage 11's changes touches the starter-kit
+      registry, onboarding docs, or the tool surface those guides depend on (confirmed
+      by the mechanized consistency audit and the 12/20 tool-count contract test, both
+      passing).
 
 ## Known residual gaps (explicitly deferred or accepted, not silently dropped)
 
@@ -160,13 +175,29 @@ admin-visibility property. Forcing a fix through a locked file to avoid this
 disposition, or silently shipping without a test, would both have been worse
 outcomes than what happened here.
 
-Combined with a clean packaging/provenance/CI posture, a real load/concurrency
+Combined with a clean packaging/provenance posture on `main`, a real load/concurrency
 profile with zero errors, reproducible PostgreSQL migration with verified integrity,
 and a real live-n8n compatibility run, this branch is ready to be proposed as a
 release candidate. It is not a final release recommendation on its own — that
 requires the explicit, separate owner approval this report's own final section
-describes, and ideally resolution (or an owner's conscious sign-off to ship without
-resolution) of finding #16 and the in-flight T-67 work first. No other item on this
+describes, plus all of the following concrete conditions before moving from
+release-candidate to a final release:
+
+1. The branch is pushed and all required CI checks (CI, CodeQL, secret-scan) run
+   green against its actual pushed content — not the local gate substitute used in
+   this report, and not `main`'s history.
+2. The workflow-branch actor finding (#16) is either fixed, or explicitly and
+   consciously signed off as an accepted residual risk by a human decision-maker —
+   not left ambiguous or implicitly waved through by this report.
+3. The in-flight T-67 rate-limiting redaction work is either landed (with its own
+   verification) or explicitly deferred with its own tracking entry, rather than left
+   as an untracked loose end.
+
+To be explicit about something the rest of this report does not say outright: finding
+#16 should be treated as a blocker for a **final (GA) release**, even though it does
+not block this **release candidate**. The distinction matters — a release candidate
+can carry a named, tracked, tested residual risk; a GA release should not ship with a
+known cross-tenant disclosure, however narrow, still open. No other item on this
 branch is blocking.
 
 ## Explicitly NOT done in this stage
