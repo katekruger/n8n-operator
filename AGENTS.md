@@ -222,6 +222,13 @@ both stated in README.md's own status block and `docs/RELEASE_ROLLBACK.md`:
 2. A PyPI "trusted publisher" registered for this repo — a human, PyPI-account-holder
    action; `.github/workflows/release.yml`'s `pypi` job is `if: false` until then.
 
+**Tag naming**: `v1.0.0-rc1` and `v1.0.0-rc2` use a hyphen before `rc`; `v1.0.0rc3`
+drops it. PEP 440 normalizes both to the same version, but they don't necessarily
+sort identically in tooling that compares tags as plain strings. The final `v1.0.0`
+tag carries no `rc` suffix, so this specific ambiguity resolves itself then — if
+another candidate is cut first, use the hyphenated form (`v1.0.0-rc4`) to match the
+first two, not the third.
+
 **v2 is now layered on top of that v1 status.** v2 (organizations, RBAC, environments,
 team approvals, governed retry, structural diffs, metrics/audit query, alert hooks,
 external audit anchoring) is merged, stage-by-stage tested

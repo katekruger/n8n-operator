@@ -16,6 +16,10 @@ what was verified and when.</sub>
 **A governed MCP control plane for discovering, validating, executing, and debugging
 approved n8n workflows from Claude, ChatGPT, Codex, and compatible MCP clients.**
 
+**Pre-1.0, deliberately: `v1.0.0` waits on two maintainer-only actions (a real hosted
+OpenAI connector call, and PyPI trusted-publisher registration), not on unfinished
+engineering.** Full detail below.
+
 > **Status: v1 release candidate, public repository, pre-release GitHub tag —
 > deliberately not final, not abandoned.** All nine product phases are implemented
 > and the local release gate is green: registry, MCP server (stdio + Streamable
