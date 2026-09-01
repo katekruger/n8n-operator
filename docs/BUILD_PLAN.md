@@ -230,6 +230,7 @@ n8n-operator/
 │   ├── WHAT_THIS_REFUSES_TO_DO.md  # every refusal, why, and the threat it closes (stage 10)
 │   ├── MCP_CLIENT_RECIPES.md       # literal tool-call JSON for the 20-tool surface (stage 10)
 │   ├── STAGE_11_RELEASE_REPORT.md  # findings table, completion gate, go/no-go (stage 11)
+│   ├── REACHABILITY_REPORT.md      # subprocess reachability + live-vs-replay findings (post-11 closure)
 │   ├── evidence/
 │   │   ├── stage11-consistency-audit.md  # mechanized audit re-verification (stage 11)
 │   │   ├── stage11-live-n8n-run.md       # real n8n instance run evidence (stage 11)
