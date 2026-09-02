@@ -322,6 +322,14 @@ The last command enforces that the documentation set agrees with itself and with
 repository tree — state names, transition IDs, tool inventory, acceptance criteria,
 cross-document links, and the published file tree. It runs in CI and as a contract test.
 
+## See also
+
+Every project here shares one idea: a GTM system should refuse to act on data it cannot verify.
+
+[gtm-superconnector](https://github.com/katekruger/gtm-superconnector) — a Claude Code plugin that drives this control plane for go-to-market work, preview-only by default.
+
+[agent-audit](https://github.com/katekruger/agent-audit) — a portable record of what an agent proposed, what a human decided, and what executed. The convention behind the audit trail this project keeps.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
