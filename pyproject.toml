@@ -43,7 +43,7 @@ dependencies = [
   # External audit anchoring — Ed25519 signing (ADR-012 section 2, stage 09).
   # Previously only resolvable as pyjwt[crypto]'s transitive dependency; now
   # load-bearing for a security control, so it is an explicit direct dependency.
-  "cryptography>=43,<47",
+  "cryptography>=43,<51",
 ]
 
 [project.optional-dependencies]
